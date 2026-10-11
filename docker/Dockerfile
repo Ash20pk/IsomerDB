@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1
 # IsomerDB image: PostgreSQL 18 + Citus + DocumentDB (+ gateway) + pg_search + pgvector +
-# pg_trickle + the isomer extension. Citus, DocumentDB and pg_trickle are built from vendor/;
-# the rest are pinned packages. Build from the repo root:
+# pg_trickle + the isomer extension. Everything in extensions/ is built from source; the
+# rest are pinned packages (see NOTICE). Build from the repo root:
 #
 #   docker build -f docker/Dockerfile -t isomerdb:dev .
 
@@ -21,25 +21,25 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
 ENV PATH="/root/.cargo/bin:${PATH}"
 
-# ── Citus (vendor/citus) ──────────────────────────────────────────────────────
+# ── Citus (extensions/sharding) ───────────────────────────────────────────────
 FROM build-base AS citus
-COPY vendor/citus /src/citus
+COPY extensions/sharding /src/citus
 WORKDIR /src/citus
 RUN ./configure && make -j"$(nproc)" && make install && make install DESTDIR=/out
 
-# ── DocumentDB extensions (vendor/documentdb) ─────────────────────────────────
+# ── DocumentDB extensions (extensions/documents) ──────────────────────────────
 # Built on top of the Citus stage so pg_documentdb_distributed finds the Citus headers.
 FROM citus AS documentdb
-COPY vendor/documentdb/scripts /tmp/install_setup
+COPY extensions/documents/scripts /tmp/install_setup
 RUN export INSTALL_DEPENDENCIES_ROOT=/tmp/install_setup CLEAN_SETUP=1 && \
     MAKE_PROGRAM=cmake /tmp/install_setup/install_setup_libbson.sh && \
     /tmp/install_setup/install_setup_pcre2.sh && \
     /tmp/install_setup/install_setup_intel_decimal_math_lib.sh
-COPY vendor/documentdb /src/documentdb
+COPY extensions/documents /src/documentdb
 WORKDIR /src/documentdb
 RUN make -j"$(nproc)" && make install DESTDIR=/out
 
-# ── isomer_router (C planner hook) ─────────────────────────────────────────────
+# ── isomer_router (C planner hook) ────────────────────────────────────────────
 FROM build-base AS router
 COPY extensions/isomer_router /src/isomer_router
 WORKDIR /src/isomer_router
@@ -47,19 +47,19 @@ RUN make && make install DESTDIR=/out
 
 # ── DocumentDB gateway (MongoDB wire protocol, Rust) ──────────────────────────
 FROM build-base AS gateway
-COPY vendor/documentdb /src/documentdb
+COPY extensions/documents /src/documentdb
 WORKDIR /src/documentdb/pg_documentdb_gw
 RUN --mount=type=cache,target=/root/.cargo/registry \
     --mount=type=cache,target=/root/.cargo/git \
     cargo build --release && \
     install -D target/release/documentdb_gateway /out/usr/local/bin/documentdb_gateway
 
-# ── pg_trickle (vendor/pg_trickle) ────────────────────────────────────────────
+# ── pg_trickle (extensions/ivm) ───────────────────────────────────────────────
 FROM build-base AS pg_trickle
 ARG PG_MAJOR
 RUN cargo install --locked cargo-pgrx --version 0.18.0 && \
     cargo pgrx init --pg${PG_MAJOR} /usr/bin/pg_config
-COPY vendor/pg_trickle /src/pg_trickle
+COPY extensions/ivm /src/pg_trickle
 WORKDIR /src/pg_trickle
 RUN --mount=type=cache,target=/root/.cargo/registry \
     --mount=type=cache,target=/root/.cargo/git \
@@ -95,9 +95,10 @@ COPY docker/postgresql.isomer.conf /usr/share/postgresql/isomer.conf
 RUN printf "\ninclude = '/usr/share/postgresql/isomer.conf'\n" >> /usr/share/postgresql/postgresql.conf.sample
 COPY docker/initdb/ /docker-entrypoint-initdb.d/
 COPY docker/gateway.json /etc/isomerdb/gateway.json
-COPY vendor/citus/LICENSE /usr/share/doc/isomerdb/licenses/citus.LICENSE
-COPY vendor/documentdb/LICENSE /usr/share/doc/isomerdb/licenses/documentdb.LICENSE
-COPY vendor/pg_trickle/LICENSE /usr/share/doc/isomerdb/licenses/pg_trickle.LICENSE
+COPY NOTICE /usr/share/doc/isomerdb/NOTICE
+COPY extensions/sharding/LICENSE /usr/share/doc/isomerdb/licenses/citus.LICENSE
+COPY extensions/documents/LICENSE /usr/share/doc/isomerdb/licenses/documentdb.LICENSE
+COPY extensions/ivm/LICENSE /usr/share/doc/isomerdb/licenses/pg_trickle.LICENSE
 
 LABEL org.opencontainers.image.title="isomerdb" \
       org.opencontainers.image.description="IsomerDB base: PostgreSQL 18 + Citus + DocumentDB + pg_search + pgvector + pg_trickle"

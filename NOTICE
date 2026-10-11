@@ -1,0 +1,15 @@
+IsomerDB
+Copyright (c) 2026 Aswin Kumar <ash20pk@gmail.com>
+
+This product includes software developed by third parties:
+
+  extensions/sharding/    Citus 14.2.0          Copyright (c) Citus Data, Inc.              AGPL-3.0
+  extensions/documents/   DocumentDB 0.117-0    Copyright (c) Microsoft Corporation         MIT
+  extensions/ivm/         pg_trickle 0.108.3    Copyright (c) the pg_trickle authors        Apache-2.0
+  (image)                 pg_search 0.26.1      Copyright (c) ParadeDB, Inc.                AGPL-3.0
+  (image)                 PostgreSQL 18.6, pgvector, pg_cron    PostgreSQL License
+  (image)                 PostGIS                               GPL-2.0
+
+The directories above contain modifications by IsomerDB, marked "IsomerDB:" at each change.
+Full license texts and upstream notices are in each directory's LICENSE and NOTICE files, and in
+the image under /usr/share/doc/isomerdb/licenses/.

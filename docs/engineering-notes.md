@@ -2,6 +2,47 @@
 
 Things we learned building the stack that are not obvious from the upstream docs. Newest first.
 
+## Upstream code in `extensions/`
+
+Not dated: reference for anyone changing or updating `extensions/sharding`, `documents` or `ivm`.
+Public attribution is in the root `NOTICE` file.
+
+| Directory | Project | Version | Commit | Import | License |
+|---|---|---|---|---|---|
+| `extensions/sharding/` | [Citus](https://github.com/citusdata/citus) | v14.2.0 | `58702e722c6efbae45e3cade885b476e4fddc7e1` | `6366877` | AGPL-3.0 |
+| `extensions/documents/` | [DocumentDB](https://github.com/documentdb/documentdb) | v0.117-0 | `28cc012070ce798361ed265251ec159180b7889f` | `85f8a2e` | MIT |
+| `extensions/ivm/` | [pg_trickle](https://github.com/trickle-labs/pg-trickle) | v0.108.3 | `ce709f06327b4801f79fc48934bc96107b450907` | `51c92ee` | Apache-2.0 |
+
+DocumentDB v0.117-0 builds against Citus commit `fe25f68`, which v14.2.0 includes (41 commits
+ahead, 0 behind).
+
+### Our changes
+
+| Project | Change | Why |
+|---|---|---|
+| pg_trickle | CDC triggers are created `ENABLE ALWAYS` (`cdc/mod.rs`, `cdc/rebuild.rs`, `api/helpers.rs`) | Logical-replication apply workers only fire `ALWAYS`/`REPLICA` triggers, so stream tables over attached tables never updated |
+| pg_trickle | The DDL tracker treats `ENABLE [ALWAYS\|REPLICA] TRIGGER` as harmless (`hooks.rs`) | Otherwise enabling a trigger suspends every stream table on that source |
+| pg_trickle | The "logical replication target" warning only fires in statement-level CDC mode (`api/helpers.rs`) | With row-level CDC and `ALWAYS` triggers, replicated changes are captured |
+| DocumentDB gateway | New `isomer` module (`documentdb_gateway_core/src/isomer.rs`), called from `processor/process.rs` before each request | Reads with `readConcern.afterClusterTime` on an IsomerDB projection wait for it (`isomer.wait_for`); writes to projection collections are refused with code 166, as for a MongoDB view |
+
+All are marked `IsomerDB:` in the source. The pg_trickle changes are worth proposing upstream as an
+opt-in setting.
+
+### Rules
+
+1. **Each import is its own unmodified commit.** The directories have since moved (from
+   `vendor/<project>/`), so to see everything we have changed, diff across the move:
+   `git diff 51c92ee:vendor/pg_trickle HEAD:extensions/ivm` (import commits are in the table above).
+2. **Keep every upstream LICENSE and NOTICE file.** Never remove or edit them.
+3. **Mark our changes** with a short `IsomerDB:` comment at each change site.
+4. **AGPL boundary.** Changes inside `extensions/sharding` are AGPL-3.0 and must be published if we
+   offer them as a service. Keep IsomerDB's own code in `isomer/` and `isomer_router/`, talking to
+   the sharding layer through hooks and SQL rather than by editing it, unless there is no other
+   way. See PRD §13.
+5. **Updating to a new upstream version:** copy the new tag into a scratch checkout, commit it
+   unmodified as its own import commit on a branch, then re-apply our changes. Update the tables
+   above in the same change.
+
 ## 2026-10-11 — Kubernetes operator on kind
 
 `tests/operator.sh` passes on a local kind cluster (Kubernetes 1.36), with nothing spent on cloud
@@ -527,7 +568,7 @@ Things that bit us:
   pg_trickle defaults to statement-level, origin-only CDC triggers, so its stream tables silently
   went stale over attached tables (2m48s stale in our first test). Fixed with
   `pg_trickle.cdc_trigger_mode = 'row'` plus a patch that creates its triggers `ENABLE ALWAYS`
-  (see `vendor/README.md`).
+  (see "Upstream code in `extensions/`" above).
 - **Patching pg_trickle's trigger creation in the wrong place broke it.** Running `ALTER TABLE`
   before pg_trickle records the source in `pgt_change_tracking` sends its own DDL hook looking for
   a buffer under the wrong name. Its DDL tracker also suspends every stream table on a source for
@@ -588,8 +629,8 @@ What we found along the way:
   starts cleanly afterwards.
 - **No `rum` package exists for PG 18.** DocumentDB uses its own `pg_documentdb_extended_rum`, set by
   `documentdb.rum_library_load_option` and `documentdb.alternate_index_handler_name`.
-- **DocumentDB version choice.** We vendored the latest stable, v0.117-0. v1.0-RC2 was published
-  on 9 Oct 2026. Re-vendor before we start modifying the gateway, so our changes sit on 1.0.
+- **DocumentDB version choice.** We imported the latest stable, v0.117-0. v1.0-RC2 was published
+  on 9 Oct 2026. Re-import before we start modifying the gateway, so our changes sit on 1.0.
 - **Disk.** A cold build needs roughly 10–15 GB of Docker space (Rust toolchains plus three
   compiles). The first attempt failed because the Mac's disk was full, which left Docker's VM
   read-only until Docker Desktop was force-restarted.

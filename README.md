@@ -14,17 +14,19 @@ runs, with no migration.
 | [`docs/PRD.md`](docs/PRD.md) | Product requirements document |
 | [`docs/research/`](docs/research/) | Research behind the PRD's open questions: naming, DDL and read-your-writes tokens, embeddings and attach-mode providers, pricing / design partners / NFR targets |
 | [`docs/reference/system-design-draft-3.html`](docs/reference/system-design-draft-3.html) | The system design the PRD is based on (written under the earlier working name "Prism") |
-| [`vendor/`](vendor/) | Upstream code we modify: Citus, DocumentDB, pg_trickle. See [`vendor/README.md`](vendor/README.md) for versions, licenses and the rules for changing it |
-| [`docker/`](docker/) | Base image: Postgres 18 + Citus + DocumentDB + gateway + pg_search + pgvector + pg_trickle |
+| [`docker/`](docker/) | Base image: Postgres 18 with everything in `extensions/`, plus search and vector indexes |
 | [`extensions/isomer/`](extensions/isomer/) | The `isomer` Postgres extension: projections, attach mode, advisors |
 | [`extensions/isomer_router/`](extensions/isomer_router/) | C planner hook that routes keyed reads onto projections |
+| [`extensions/sharding/`](extensions/sharding/) | Distributed tables, shard placement and online rebalancing |
+| [`extensions/documents/`](extensions/documents/) | BSON document storage and the MongoDB wire protocol gateway |
+| [`extensions/ivm/`](extensions/ivm/) | Incremental view maintenance: change capture and stream tables that keep projections fresh |
 | [`services/embedder/`](services/embedder/) | Rust service that computes embeddings for vector projections |
 | [`operator/`](operator/) | Kubernetes operator (Go): `IsomerCluster` resources, online scale up/down with rebalance and drain. See [`operator/README.md`](operator/README.md) |
 | [`services/api/`](services/api/) | Rust HTTP API: projections by key, time travel, change feeds and live streams (SSE) |
 | [`tests/phase0.sh`](tests/phase0.sh) … [`phase3.sh`](tests/phase3.sh), [`native.sh`](tests/native.sh), [`multinode.sh`](tests/multinode.sh), [`routing.sh`](tests/routing.sh), [`history.sh`](tests/history.sh), [`operator.sh`](tests/operator.sh) | Acceptance tests: Phase 0 (attach, document and search projections), 1 (vector projections), 2 (primary mode: cutover, sharding, sync, read-your-writes, auditor), 3 (proposer, shard advisor, certificates, randomized concurrency) |
 | [`scripts/smoke.sh`](scripts/smoke.sh) | Checks every base component works in a running stack |
 | [`scripts/test-all.sh`](scripts/test-all.sh) | Every suite on fresh stacks, single-node then the three-node cluster |
-| [`docs/engineering-notes.md`](docs/engineering-notes.md) | What we learned building the stack (gateway auth, pg_trickle and Citus quirks) |
+| [`docs/engineering-notes.md`](docs/engineering-notes.md) | What we learned building the stack (gateway auth, change capture and sharding quirks) |
 
 ## Run locally
 
@@ -35,7 +37,7 @@ docker compose up --build -d     # Postgres on :5432, MongoDB wire gateway on :1
 docker compose --profile attach up -d   # adds a stand-in customer Postgres (:5433) and a mock embeddings API
 ./tests/phase0.sh && ./tests/phase1.sh && ./tests/phase2.sh && ./tests/phase3.sh && ./tests/native.sh && ./tests/routing.sh && ./tests/history.sh
 
-docker compose --profile cluster up -d  # adds two Citus worker nodes
+docker compose --profile cluster up -d  # adds two worker nodes
 ./tests/multinode.sh                    # joins them, rebalances online, tests across nodes
 
 ./scripts/test-all.sh                   # or all of it, on fresh stacks (destroys this project's volumes)
@@ -126,3 +128,7 @@ curl -N -H "Authorization: Bearer $KEY" localhost:8080/v1/projections/customer_p
 - MongoDB: `mongosh "mongodb://isomer:isomer@localhost:10260/?tls=true&tlsAllowInvalidCertificates=true"`
 
 These are local development credentials only.
+
+## License
+
+Third-party components and their licenses are listed in [`NOTICE`](NOTICE).
