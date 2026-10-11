@@ -13,6 +13,7 @@
 //!   ISOMER_LEASE_SECONDS  how long a claimed batch stays invisible to other workers (default 60)
 //!   <api_key_env>         per model, the variable named in isomer.embedding_models.api_key_env
 
+mod local;
 mod providers;
 mod ratelimit;
 

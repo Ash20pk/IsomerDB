@@ -45,6 +45,36 @@ opt-in setting.
    unmodified as its own import commit on a branch, then re-apply our changes. Update the tables
    above in the same change.
 
+## 2026-10-12 — Embeddings on the cluster's own CPU (FR-V1b)
+
+`tests/local_model.sh` passes. A vector projection can now use `model => 'bge-small-en-v1.5'`:
+the embedder computes it on its own CPU, with no API key, no network and no per-token cost. That
+covers the free tier, development, and air-gapped clusters, which until now had only
+`local-hash-64` (word hashing, no meaning).
+
+- **Model:** BAAI/bge-small-en-v1.5 (MIT, 384 dimensions, ~130 MB), one of the two the PRD names.
+  It is downloaded at a pinned revision during the image build, checked against SHA-256 sums, and
+  shipped at `/usr/share/isomer/models/bge-small-en-v1.5` with its license. `ISOMER_MODEL_DIR`
+  points the embedder at another directory of Hugging Face-layout models (`config.json`,
+  `tokenizer.json`, `model.safetensors`); register one with provider `'local'`.
+- **Runtime:** candle (pure Rust) and the `tokenizers` crate with its pure-Rust regex backend, so
+  the image gains no native libraries. Inference runs on a blocking thread so a batch doesn't stall
+  the async workers. The model loads once per process.
+- **Checked against the reference implementation:** our vectors match sentence-transformers' to
+  cosine > 0.9999 (the ignored unit test takes `ISOMER_REFERENCE_EMBEDDINGS`). The acceptance test
+  ranks five listings by meaning with queries that share no content word with them.
+
+Things that bit us:
+
+- **candle 0.11 needs Rust 1.95** on aarch64 (it uses NEON f16 intrinsics that 1.89 calls
+  unstable). The embedder now pins 1.95 in `rust-toolchain.toml` and its Dockerfile.
+- **BGE pools the [CLS] token, not the mean.** A reference built from just the three weight files
+  silently used mean pooling, because sentence-transformers reads pooling from `modules.json`;
+  the comparison needs the repo's `1_Pooling/config.json`.
+
+Limits: English only, 512 tokens per input (longer text is truncated), and throughput is whatever
+the embedder's CPUs give: scale the embedder out for large backfills.
+
 ## 2026-10-12 — Console and CLI (FR-O3)
 
 `tests/console.sh` passes. Operators get three things, all over the same admin API:
