@@ -101,6 +101,15 @@ expect "a reference-table change re-derives documents on every node" "GOLD" \
   "$(mongo_eval "print(db.getSiblingDB(\"mn\").mn_customer.findOne({_id: $k_gold}).tier)")"
 expect "and the whole projection equals recomputation" "0" "$($ISO -c "SELECT count(*) FROM isomer.verify('mn_customer')")"
 
+# A fresh session whose first statement is a multi-shard INSERT ... SELECT: the capture triggers on
+# the coordinator's own shards run while COPYs to the workers are open. Nothing may start a
+# subtransaction there (Citus would send SAVEPOINT down those busy connections).
+$ISO -c "INSERT INTO mn.customers (customer_id, name, tier) SELECT g, 'bulk ' || g, 'silver' FROM generate_series(5001, 5200) g"
+pass "a bulk insert from a fresh session into a table behind a projection succeeds"
+$ISO -c "SELECT isomer.wait_for(isomer.current_token(), 'mn_customer', '20 seconds')" >/dev/null
+expect "and every new row reaches the projection" "200" \
+  "$(mongo_eval 'print(db.getSiblingDB("mn").mn_customer.countDocuments({name: /^bulk /}))')"
+
 echo "== FR-P5 add a node online"
 if [ "$($ISO -c "SELECT count(*) FROM pg_dist_node WHERE nodename = 'worker2'")" = "0" ]; then
   contains "worker2 added and rebalancing" "worker2:5432 added" "$($ISO -c "SELECT isomer.add_node('worker2')")"

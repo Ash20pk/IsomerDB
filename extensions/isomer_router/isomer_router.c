@@ -87,6 +87,7 @@ static int64 shadow_matches = 0;
 static int64 routed_count = 0;
 
 static planner_hook_type prev_planner_hook = NULL;
+static int	exec_nesting = 0;		/* executor depth: > 0 inside another statement */
 
 /* read-your-writes on SQL reads */
 static char *read_after = NULL;
@@ -94,7 +95,6 @@ static int	read_after_timeout_ms = 5000;
 static ExecutorStart_hook_type prev_ExecutorStart = NULL;
 static ExecutorRun_hook_type prev_ExecutorRun = NULL;
 static ExecutorFinish_hook_type prev_ExecutorFinish = NULL;
-static int	exec_nesting = 0;
 static bool in_wait = false;
 
 typedef struct ProjectionRel
@@ -304,8 +304,15 @@ isomer_planner(Query *parse, const char *query_string, int cursorOptions, ParamL
 	Route	   *route;
 	int64		qid = parse->queryId;
 
-	if (routing_mode == ROUTING_OFF || in_router || parse->commandType != CMD_SELECT || qid == 0
-		|| !IsTransactionState() || IsInParallelMode())
+	/*
+	 * Only top-level statements are routed: routes are for application queries. Statements run
+	 * inside another (a trigger's, a function's) are planned as written. Loading routes there
+	 * would also open a subtransaction in the middle of the outer statement, which Citus mirrors
+	 * as a SAVEPOINT on every open worker connection, failing while those are busy (a multi-shard
+	 * COPY firing triggers on the coordinator's own shards).
+	 */
+	if (routing_mode == ROUTING_OFF || in_router || exec_nesting > 0 || parse->commandType != CMD_SELECT
+		|| qid == 0 || !IsTransactionState() || IsInParallelMode())
 		return next_planner(parse, query_string, cursorOptions, boundParams);
 
 	if (routes == NULL || TimestampDifferenceExceeds(routes_loaded_at, GetCurrentTimestamp(), 2000))
