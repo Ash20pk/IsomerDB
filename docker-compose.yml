@@ -1,0 +1,32 @@
+# Local single-node IsomerDB: Postgres on 5432, MongoDB wire gateway on 10260.
+#   docker compose up --build
+services:
+  db:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    image: isomerdb:dev
+    environment:
+      POSTGRES_PASSWORD: isomer
+      ISOMER_MONGO_USER: isomer
+      ISOMER_MONGO_PASSWORD: isomer
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      retries: 30
+
+  gateway:
+    image: isomerdb:dev
+    depends_on:
+      db:
+        condition: service_healthy
+    command: ["documentdb_gateway", "/etc/isomerdb/gateway.json"]
+    ports:
+      - "10260:10260"
+
+volumes:
+  pgdata:

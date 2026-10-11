@@ -1,0 +1,4 @@
+.git
+docs
+**/target
+**/.DS_Store
