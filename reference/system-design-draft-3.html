@@ -1,0 +1,865 @@
+<!doctype html><html><head><meta charset=utf8><meta name=viewport content="width=device-width,initial-scale=1,viewport-fit=cover"><style>:root{color-scheme:light;box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}html{scroll-padding-top:env(safe-area-inset-top,0px)}body{margin:0;padding:0;font:14px -apple-system,BlinkMacSystemFont,sans-serif;background:#fff;color:#000}img{max-width:100%}[hidden]:not([hidden=until-found i]){display:none!important}</style></head><body>
+<title>Prism System Design</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Familjen+Grotesk:wght@500;600;700&family=IBM+Plex+Sans:ital,wght@0,400;0,500;0,600;1,400&family=JetBrains+Mono:wght@400;500&display=swap">
+<style>
+/* Layout: a single reading column (~760px) with wide breakouts for diagrams and tables. Each read shape owns one hue, used consistently in every diagram. */
+:root {
+  --bg: #f5f7f8;
+  --surface: #ffffff;
+  --sunk: #eaeef0;
+  --fg: #172126;
+  --muted: #56656d;
+  --line: #d3dade;
+  --accent: #0d6e6e;
+  --accent-soft: #d8eeec;
+  --s-rel: #0d6e6e;   /* relational tables */
+  --s-doc: #b4610a;   /* document shapes */
+  --s-search: #2a5bc4;/* search shapes */
+  --s-cache: #b0335a; /* cache shapes */
+  --s-vec: #6b4fb8;   /* vector shapes */
+  --s-col: #4f6b1f;   /* analytics shapes */
+  --ok: #2f7d3b;
+  --warn: #a76a00;
+  --no: #b3362f;
+  --code-bg: #1b2429;
+  --code-fg: #dbe5e9;
+  --code-kw: #7fd1c6;
+  --code-str: #f0b97a;
+  --code-com: #7f9198;
+  --f-display: "Familjen Grotesk", "Helvetica Neue", Arial, sans-serif;
+  --f-body: "IBM Plex Sans", -apple-system, "Segoe UI", sans-serif;
+  --f-mono: "JetBrains Mono", ui-monospace, Menlo, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #0f1518; --surface: #161e22; --sunk: #1d272c; --fg: #e3eaed; --muted: #97a7ae; --line: #2c393f;
+    --accent: #5cc2b8; --accent-soft: #163634;
+    --s-rel: #5cc2b8; --s-doc: #f0a14e; --s-search: #7da2f2; --s-cache: #ef7fa2; --s-vec: #b29cf0; --s-col: #a6c76a;
+    --ok: #6cc77a; --warn: #e3ad4a; --no: #f07a72;
+    --code-bg: #0b1013; --code-fg: #dbe5e9;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #0f1518; --surface: #161e22; --sunk: #1d272c; --fg: #e3eaed; --muted: #97a7ae; --line: #2c393f;
+  --accent: #5cc2b8; --accent-soft: #163634;
+  --s-rel: #5cc2b8; --s-doc: #f0a14e; --s-search: #7da2f2; --s-cache: #ef7fa2; --s-vec: #b29cf0; --s-col: #a6c76a;
+  --ok: #6cc77a; --warn: #e3ad4a; --no: #f07a72;
+  --code-bg: #0b1013; --code-fg: #dbe5e9;
+  color-scheme: dark;
+}
+
+* { box-sizing: border-box; }
+body { background: var(--bg); color: var(--fg); font-family: var(--f-body); font-size: 16.5px; line-height: 1.62; }
+.wrap { max-width: 1080px; margin: 0 auto; padding-inline: 20px; padding-block: 48px 96px; }
+.col { max-width: 760px; }
+h1, h2, h3 { font-family: var(--f-display); text-wrap: balance; line-height: 1.15; margin: 0; }
+h1 { font-size: clamp(2.3rem, 6vw, 3.6rem); font-weight: 700; letter-spacing: -0.02em; }
+h2 { font-size: 1.85rem; font-weight: 600; letter-spacing: -0.01em; }
+h3 { font-size: 1.2rem; font-weight: 600; }
+p { margin: 0; }
+a { color: var(--accent); text-underline-offset: 2px; }
+a:focus-visible, button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+code { font-family: var(--f-mono); font-size: 0.86em; background: var(--sunk); padding: 0.1em 0.35em; border-radius: 4px; }
+.eyebrow { font-family: var(--f-mono); font-size: 0.74rem; letter-spacing: 0.12em; text-transform: uppercase; color: var(--muted); }
+.stack { display: flex; flex-direction: column; gap: 16px; }
+section { display: flex; flex-direction: column; gap: 20px; padding-top: 72px; }
+.lede { font-size: 1.2rem; color: var(--muted); max-width: 660px; }
+.muted { color: var(--muted); }
+.small { font-size: 0.86rem; }
+ul.plain { margin: 0; padding-left: 18px; display: flex; flex-direction: column; gap: 6px; }
+
+/* hero */
+header { display: flex; flex-direction: column; gap: 18px; }
+.prism-bar { display: flex; height: 6px; width: 220px; border-radius: 3px; overflow: hidden; }
+.prism-bar span { flex: 1; }
+.meta { display: flex; flex-wrap: wrap; gap: 8px 20px; font-size: 0.88rem; color: var(--muted); }
+
+nav.toc { display: flex; flex-wrap: wrap; gap: 6px 18px; font-size: 0.9rem; padding: 14px 0; border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); margin-top: 28px; }
+nav.toc a { color: var(--muted); text-decoration: none; }
+nav.toc a:hover { color: var(--accent); }
+
+/* changelog */
+.changes { background: var(--surface); border: 1px solid var(--line); border-radius: 10px; padding: 18px 22px; display: flex; flex-direction: column; gap: 10px; margin-top: 28px; }
+.changes ul { margin: 0; padding-left: 18px; display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 6px 28px; font-size: 0.92rem; }
+
+/* before / after */
+.ba { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 20px; }
+.panel { background: var(--surface); border: 1px solid var(--line); border-radius: 10px; padding: 22px; display: flex; flex-direction: column; gap: 14px; min-width: 0; }
+.panel h3 { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; flex-wrap: wrap; }
+.tag { font-family: var(--f-mono); font-size: 0.72rem; font-weight: 500; padding: 2px 8px; border-radius: 99px; border: 1px solid currentColor; white-space: nowrap; }
+.tag.no { color: var(--no); } .tag.ok { color: var(--ok); } .tag.warn { color: var(--warn); }
+.flow { display: flex; flex-direction: column; align-items: stretch; gap: 6px; font-size: 0.88rem; }
+.node { border: 1.5px solid var(--line); border-radius: 7px; padding: 7px 8px; background: var(--bg); text-align: center; min-width: 0; }
+.node b { font-weight: 600; }
+.node.rel { border-color: var(--s-rel); } .node.doc { border-color: var(--s-doc); } .node.search { border-color: var(--s-search); } .node.cache { border-color: var(--s-cache); } .node.vec { border-color: var(--s-vec); } .node.col { border-color: var(--s-col); }
+.node.pipe { border-style: dashed; color: var(--muted); }
+.arrow { text-align: center; color: var(--muted); line-height: 1; font-size: 0.9rem; }
+.row4 { display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; font-size: 0.82rem; }
+.inner { border: 1.5px solid var(--accent); border-radius: 9px; padding: 10px; display: flex; flex-direction: column; gap: 6px; }
+.inner-label { font-family: var(--f-mono); font-size: 0.7rem; color: var(--accent); letter-spacing: 0.06em; text-transform: uppercase; }
+.panel ul { margin: 0; padding-left: 18px; font-size: 0.9rem; color: var(--muted); display: flex; flex-direction: column; gap: 3px; }
+
+/* evidence */
+.stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 14px; }
+.stat { background: var(--surface); border: 1px solid var(--line); border-radius: 10px; padding: 18px; display: flex; flex-direction: column; gap: 6px; }
+.stat .num { font-family: var(--f-display); font-size: 1.9rem; font-weight: 700; letter-spacing: -0.02em; line-height: 1.1; font-variant-numeric: tabular-nums; }
+.stat p { font-size: 0.88rem; color: var(--muted); }
+.stat .src { font-family: var(--f-mono); font-size: 0.7rem; color: var(--muted); }
+.verdict-box { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 20px; }
+.verdict-box > div { display: flex; flex-direction: column; gap: 10px; min-width: 0; padding: 18px 20px; border-radius: 10px; border: 1px solid var(--line); background: var(--surface); }
+.verdict-box h3 { font-size: 1.05rem; }
+.verdict-box .yes h3 { color: var(--ok); } .verdict-box .not h3 { color: var(--warn); }
+
+/* code */
+pre { margin: 0; background: var(--code-bg); color: var(--code-fg); border-radius: 10px; padding: 18px 20px; overflow-x: auto; font-family: var(--f-mono); font-size: 0.84rem; line-height: 1.6; }
+pre .k { color: var(--code-kw); } pre .s { color: var(--code-str); } pre .c { color: var(--code-com); font-style: italic; }
+.code-label { font-family: var(--f-mono); font-size: 0.75rem; color: var(--muted); margin-bottom: -10px; }
+.shape-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 20px; }
+.shape-grid > div { display: flex; flex-direction: column; gap: 14px; min-width: 0; }
+
+/* shape catalog */
+.catalog { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 12px; }
+.cat { border-left: 4px solid; padding: 12px 14px; background: var(--surface); border-radius: 0 8px 8px 0; font-size: 0.9rem; display: flex; flex-direction: column; gap: 5px; }
+.cat b { font-family: var(--f-display); font-size: 1.02rem; }
+.cat .replaces { font-family: var(--f-mono); font-size: 0.72rem; color: var(--muted); }
+.cat .when { font-family: var(--f-mono); font-size: 0.7rem; align-self: flex-start; padding: 1px 7px; border-radius: 99px; background: var(--sunk); color: var(--muted); }
+
+/* modes */
+.modes { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 20px; }
+.mode-step { font-family: var(--f-mono); font-size: 0.72rem; color: var(--accent); letter-spacing: 0.08em; text-transform: uppercase; }
+
+/* architecture */
+.arch { background: var(--surface); border: 1px solid var(--line); border-radius: 12px; padding: 22px; overflow-x: auto; }
+.arch-grid { display: grid; grid-template-columns: minmax(0, 3fr) minmax(230px, 1.1fr); gap: 18px; min-width: 780px; }
+.layer { display: flex; flex-direction: column; gap: 6px; }
+.layer-name { font-family: var(--f-mono); font-size: 0.7rem; letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted); }
+.boxes { display: grid; gap: 8px; }
+.box { border: 1.5px solid var(--line); border-radius: 8px; padding: 9px 11px; font-size: 0.86rem; background: var(--bg); }
+.box b { display: block; font-weight: 600; font-size: 0.92rem; }
+.box .who { font-family: var(--f-mono); font-size: 0.7rem; color: var(--muted); }
+.box.new { border-color: var(--accent); background: var(--accent-soft); }
+.shards { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; }
+.shard { border: 1.5px solid var(--line); border-radius: 9px; padding: 9px; display: flex; flex-direction: column; gap: 5px; background: var(--bg); }
+.shard-title { font-family: var(--f-mono); font-size: 0.74rem; color: var(--muted); }
+.chip { font-size: 0.78rem; border-radius: 5px; padding: 3px 7px; border: 1px solid var(--line); background: var(--surface); }
+.chip.new { border-color: var(--accent); color: var(--accent); font-weight: 500; }
+.down { text-align: center; color: var(--muted); font-size: 0.8rem; font-family: var(--f-mono); }
+.side { display: flex; flex-direction: column; gap: 10px; }
+.key { display: flex; flex-wrap: wrap; gap: 14px; font-size: 0.82rem; color: var(--muted); margin-top: 14px; }
+.key span::before { content: ""; display: inline-block; width: 12px; height: 12px; border-radius: 3px; border: 1.5px solid var(--line); background: var(--bg); vertical-align: -2px; margin-right: 6px; }
+.key span.n::before { border-color: var(--accent); background: var(--accent-soft); }
+
+/* steps */
+ol.steps { list-style: none; counter-reset: s; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 14px; }
+ol.steps li { counter-increment: s; display: grid; grid-template-columns: 34px 1fr; gap: 12px; }
+ol.steps li::before { content: counter(s); font-family: var(--f-mono); font-size: 0.8rem; width: 28px; height: 28px; border-radius: 50%; border: 1.5px solid var(--accent); color: var(--accent); display: grid; place-items: center; margin-top: 1px; }
+ol.steps b { font-weight: 600; }
+.two { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 28px; }
+.two > div { display: flex; flex-direction: column; gap: 14px; min-width: 0; }
+
+/* tiers */
+.tiers { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 18px; }
+.tier { background: var(--surface); border: 1px solid var(--line); border-radius: 10px; padding: 20px; display: flex; flex-direction: column; gap: 10px; }
+.tier .freshness { font-family: var(--f-mono); font-size: 0.8rem; color: var(--accent); }
+
+/* tables */
+.tbl { overflow-x: auto; border: 1px solid var(--line); border-radius: 10px; background: var(--surface); }
+table { border-collapse: collapse; width: 100%; font-size: 0.89rem; min-width: 780px; }
+th, td { text-align: left; padding: 11px 14px; vertical-align: top; border-bottom: 1px solid var(--line); }
+th { font-family: var(--f-mono); font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.07em; color: var(--muted); font-weight: 500; background: var(--sunk); }
+tr:last-child td { border-bottom: none; }
+td b { font-weight: 600; }
+tr.pick td { background: var(--accent-soft); }
+.verdict { font-family: var(--f-mono); font-size: 0.74rem; font-weight: 500; white-space: nowrap; }
+.verdict.ok { color: var(--ok); } .verdict.warn { color: var(--warn); } .verdict.no { color: var(--no); }
+
+/* callout */
+.callout { border: 1.5px solid var(--accent); border-radius: 10px; padding: 20px 22px; background: var(--accent-soft); display: flex; flex-direction: column; gap: 10px; }
+.callout h3 { color: var(--accent); }
+
+/* use cases */
+.uses { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 14px; }
+.use { background: var(--surface); border: 1px solid var(--line); border-radius: 10px; padding: 18px; display: flex; flex-direction: column; gap: 8px; }
+.use .shapes-used { display: flex; flex-wrap: wrap; gap: 5px; margin-top: auto; padding-top: 6px; }
+.dot { font-family: var(--f-mono); font-size: 0.68rem; padding: 1px 7px; border-radius: 99px; border: 1px solid; }
+
+/* build vs reuse bar */
+.split { display: flex; height: 34px; border-radius: 8px; overflow: hidden; font-size: 0.78rem; font-family: var(--f-mono); }
+.split div { display: flex; align-items: center; padding: 0 10px; white-space: nowrap; overflow: hidden; }
+.split .reuse { background: var(--sunk); color: var(--muted); }
+.split .build { background: var(--accent); color: var(--bg); }
+
+/* phases */
+.phases { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 14px; }
+.phase { border-top: 3px solid var(--line); padding-top: 12px; display: flex; flex-direction: column; gap: 8px; }
+.phase.on { border-top-color: var(--accent); }
+.phase .when { font-family: var(--f-mono); font-size: 0.75rem; color: var(--muted); }
+.phase ul { margin: 0; padding-left: 18px; font-size: 0.9rem; display: flex; flex-direction: column; gap: 3px; }
+.phase .exit { font-size: 0.85rem; color: var(--muted); border-top: 1px dashed var(--line); padding-top: 8px; margin-top: auto; }
+
+/* risks */
+.risks { display: flex; flex-direction: column; border-top: 1px solid var(--line); }
+.risk { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.4fr); gap: 20px; padding: 14px 0; border-bottom: 1px solid var(--line); font-size: 0.93rem; }
+.risk b { font-weight: 600; }
+@media (max-width: 640px) { .risk { grid-template-columns: 1fr; gap: 6px; } .row4 { grid-template-columns: 1fr 1fr; } }
+
+.sources { font-size: 0.86rem; color: var(--muted); display: flex; flex-direction: column; gap: 4px; padding-left: 18px; margin: 0; }
+footer { margin-top: 72px; padding-top: 18px; border-top: 1px solid var(--line); font-size: 0.85rem; color: var(--muted); }
+</style>
+
+<div class="wrap">
+
+<header class="col">
+  <div class="prism-bar" aria-hidden="true"><span style="background:var(--s-rel)"></span><span style="background:var(--s-doc)"></span><span style="background:var(--s-search)"></span><span style="background:var(--s-cache)"></span><span style="background:var(--s-vec)"></span><span style="background:var(--s-col)"></span></div>
+  <div class="eyebrow">System design · draft 3 · working name</div>
+  <h1>Prism</h1>
+  <p class="lede">One database. Write once, read in any shape. SQL tables stay the single source of truth; documents, search, cache, vectors and analytics are declared views the database shards, keeps consistent, and can prove correct. Start by attaching to the Postgres you already run, with no migration.</p>
+  <div class="meta"><span>October 2026</span><span>Base: Postgres 18 + Citus + DocumentDB + pg_trickle</span><span>Core language: Rust</span></div>
+</header>
+
+<div class="changes col">
+  <div class="eyebrow">What changed since draft 2</div>
+  <ul>
+    <li><b>Two signature capabilities</b>: proven shapes (a correctness certificate plus a live auditor) and automatic shapes (the database proposes its own read models).</li>
+    <li><b>Research grounding</b>: Enzyme, DBSP, Vodka, Tailwind and MVGPT applied to specific components.</li>
+    <li><b>Per-read freshness</b>: a read reports what data it saw, not a cluster-wide lag number.</li>
+    <li><b>Auditor and proposer</b> added to the architecture, beside the shape engine.</li>
+    <li><b>Research agenda</b>: two open problems we would publish on.</li>
+    <li><b>Later ideas</b> kept on the roadmap: time travel, edge shapes, shapes as API.</li>
+  </ul>
+</div>
+
+<nav class="toc" aria-label="Contents">
+  <a href="#problem">Problem</a><a href="#evidence">Is it real</a><a href="#shapes">Shapes</a><a href="#remarkable">Signature</a><a href="#adoption">Attach, then move</a><a href="#architecture">Architecture</a><a href="#paths">Request flow</a><a href="#freshness">Freshness</a><a href="#sharding">Sharding</a><a href="#landscape">Landscape</a><a href="#base">Base</a><a href="#languages">Languages</a><a href="#uses">Where it fits</a><a href="#research">Research</a><a href="#roadmap">Roadmap</a><a href="#risks">Risks</a>
+</nav>
+
+<!-- PROBLEM -->
+<section id="problem">
+  <div class="col stack">
+    <div class="eyebrow">The problem</div>
+    <h2>Every growing product ends up keeping the same data in several places</h2>
+    <p>Teams start on Postgres. As reads get heavy they add MongoDB for nested documents, Elasticsearch for search, Redis for hot keys and, more recently, a vector store for embeddings. Each new store needs a sync pipeline, and each pipeline is a place where data goes missing or stale without anyone noticing.</p>
+  </div>
+  <div class="ba">
+    <div class="panel">
+      <h3>Today <span class="tag no">5 systems · 4 sync jobs</span></h3>
+      <div class="flow">
+        <div class="node">Application writes</div>
+        <div class="arrow">↓</div>
+        <div class="node rel"><b>Postgres</b> · source of truth</div>
+        <div class="arrow">↓ WAL</div>
+        <div class="node pipe">Debezium → Kafka → custom consumers and workers</div>
+        <div class="arrow">↓ ↓ ↓ ↓</div>
+        <div class="row4">
+          <div class="node doc"><b>MongoDB</b></div>
+          <div class="node search"><b>Elastic</b></div>
+          <div class="node cache"><b>Redis</b></div>
+          <div class="node vec"><b>Vectors</b></div>
+        </div>
+      </div>
+      <ul>
+        <li>Lag between stores is unknown until a customer reports it</li>
+        <li>A schema change means editing every store and every pipeline</li>
+        <li>No transaction spans the stores, so reading your own write breaks</li>
+      </ul>
+    </div>
+    <div class="panel">
+      <h3>With Prism <span class="tag ok">1 system · 0 sync jobs</span></h3>
+      <div class="flow">
+        <div class="node">Application writes (SQL)</div>
+        <div class="arrow">↓</div>
+        <div class="inner">
+          <span class="inner-label">Prism cluster · one log, one backup</span>
+          <div class="node rel"><b>Tables</b> · source of truth</div>
+          <div class="arrow">↓ maintained by the database</div>
+          <div class="row4">
+            <div class="node doc"><b>Document</b></div>
+            <div class="node search"><b>Search</b></div>
+            <div class="node cache"><b>Cache</b></div>
+            <div class="node vec"><b>Vector</b></div>
+          </div>
+        </div>
+        <div class="arrow">↑ read through SQL or any MongoDB driver</div>
+      </div>
+      <ul>
+        <li>Freshness is a declared, monitored property of each shape</li>
+        <li>A schema change happens once; shapes recompile from it</li>
+        <li>A write returns a token; reads can wait until shapes catch up</li>
+      </ul>
+    </div>
+  </div>
+</section>
+
+<!-- EVIDENCE -->
+<section id="evidence">
+  <div class="col stack">
+    <div class="eyebrow">Is this a problem now · researched October 2026</div>
+    <h2>Yes, for teams past their first datastore</h2>
+    <p>Both SQL and document databases are growing at the same time, which means mixed stacks are the norm rather than a phase. The pain is real but concentrated: it lands on teams that have already added a second store, not on teams still running one Postgres.</p>
+  </div>
+  <div class="stats">
+    <div class="stat"><span class="num">+30%</span><p>MongoDB revenue growth year over year, to $771.8M in the quarter ending July 2026. Its fastest growth in several years, while Postgres grows too.</p><span class="src">MongoDB Q2 FY2027</span></div>
+    <div class="stat"><span class="num">$1B · $250M</span><p>Databricks bought Neon; Snowflake bought Crunchy Data. Postgres infrastructure is where data platforms are spending.</p><span class="src">2025 acquisitions</span></div>
+    <div class="stat"><span class="num">~10.5B</span><p>Supabase's reported valuation in June 2026, followed by a $150M round and the Turso acquisition on 2 October.</p><span class="src">Press reports</span></div>
+    <div class="stat"><span class="num">70–80%</span><p>Share of new databases created by AI agents at Supabase and Neon, as each company reports it. New apps are being spun up faster than ever.</p><span class="src">Vendor-reported</span></div>
+  </div>
+  <div class="verdict-box">
+    <div class="yes">
+      <h3>Who feels it</h3>
+      <ul class="plain small">
+        <li>Teams already running Postgres plus MongoDB, Elastic or a vector store, with a CDC pipeline between them</li>
+        <li>Products whose read patterns (nested documents, search, feeds) diverge from how data is written</li>
+        <li>Anyone who has debugged "the search results don't match the database" in production</li>
+      </ul>
+    </div>
+    <div class="not">
+      <h3>Who does not, yet</h3>
+      <ul class="plain small">
+        <li>Small teams on a single Postgres using JSONB, built-in search and pgvector. The "just use Postgres" movement already serves them.</li>
+        <li>Teams using Redis for what Redis is uniquely good at, beyond simple caching</li>
+        <li>The only survey data found (a 2025 Stifel poll of 25 MongoDB customers) says Postgres is unlikely to displace MongoDB, because they serve different workloads. That supports a product that serves both.</li>
+      </ul>
+    </div>
+  </div>
+</section>
+
+<!-- SHAPES -->
+<section id="shapes">
+  <div class="col stack">
+    <div class="eyebrow">The core idea</div>
+    <h2>A shape is a view the database keeps up to date for you</h2>
+    <p>You model data once, normalized, in tables. A <b>shape</b> declares another form the same data should be readable in. Prism builds it, shards it alongside its source rows, and updates it incrementally on every write, touching only the rows that changed.</p>
+  </div>
+  <div class="catalog">
+    <div class="cat" style="border-color:var(--s-doc)"><b>Document</b>Nested JSON per key, readable as a MongoDB collection.<span class="replaces">replaces: MongoDB read models</span><span class="when">Phase 0</span></div>
+    <div class="cat" style="border-color:var(--s-search)"><b>Search</b>BM25 full-text index over joined fields.<span class="replaces">replaces: Elasticsearch sync</span><span class="when">Phase 0</span></div>
+    <div class="cat" style="border-color:var(--s-vec)"><b>Vector</b>Embeddings regenerated only for rows whose source text changed.<span class="replaces">replaces: embedding pipelines</span><span class="when">Phase 1</span></div>
+    <div class="cat" style="border-color:var(--s-cache)"><b>Cache</b>Precomputed key → value for hot reads and counters.<span class="replaces">replaces: Redis cache-aside</span><span class="when">Phase 2</span></div>
+    <div class="cat" style="border-color:var(--s-col)"><b>Analytics</b>Columnar mirror for dashboards and heavy aggregates.<span class="replaces">replaces: ETL to a warehouse</span><span class="when">Later</span></div>
+    <div class="cat" style="border-color:var(--line)"><b>Live and event</b>Shape changes streamed to apps, or to other services as events.<span class="replaces">replaces: client sync, internal Kafka</span><span class="when">Later</span></div>
+  </div>
+  <div class="shape-grid">
+    <div>
+      <div class="code-label">1 · Model once (plain SQL, sharded by customer)</div>
+<pre><span class="k">CREATE TABLE</span> customers   (id bigint <span class="k">PRIMARY KEY</span>, name text, tier text);
+<span class="k">CREATE TABLE</span> orders      (id bigint, customer_id bigint,
+                          placed_at timestamptz, status text);
+<span class="k">CREATE TABLE</span> order_items (order_id bigint, customer_id bigint,
+                          sku text, qty int, price numeric);
+<span class="k">CREATE TABLE</span> products    (sku text <span class="k">PRIMARY KEY</span>, title text,
+                          description text);   <span class="c">-- reference table</span>
+
+<span class="k">SELECT</span> prism.distribute(<span class="s">'customers'</span>, <span class="s">'orders'</span>, <span class="s">'order_items'</span>,
+                       by =&gt; <span class="s">'customer_id'</span>);</pre>
+      <div class="code-label">2 · Declare shapes (proposed syntax)</div>
+<pre><span class="k">CREATE SHAPE</span> customer_profile <span class="k">AS DOCUMENT</span>
+  <span class="k">KEY</span> c.id
+  <span class="k">FROM</span> customers c
+  <span class="k">NEST</span> orders o <span class="k">ON</span> o.customer_id = c.id
+    <span class="k">NEST</span> order_items i <span class="k">ON</span> i.order_id = o.id
+  <span class="k">FRESHNESS</span> sync;          <span class="c">-- same shard, same transaction</span>
+
+<span class="k">CREATE SHAPE</span> order_search <span class="k">AS SEARCH</span>
+  <span class="k">FROM</span> orders o <span class="k">JOIN</span> customers c <span class="k">ON</span> c.id = o.customer_id
+  <span class="k">INDEX</span> (c.name, o.status, o.placed_at)
+  <span class="k">FRESHNESS</span> bounded <span class="s">'2s'</span>;
+
+<span class="k">CREATE SHAPE</span> product_vectors <span class="k">AS VECTOR</span>
+  <span class="k">FROM</span> products p
+  <span class="k">EMBED</span> (p.title || <span class="s">' '</span> || p.description)
+  <span class="k">USING</span> <span class="s">'any-embedding-model'</span>
+  <span class="k">FRESHNESS</span> bounded <span class="s">'30s'</span>;  <span class="c">-- re-embeds changed rows only</span></pre>
+    </div>
+    <div>
+      <div class="code-label">3 · Read in any shape</div>
+<pre><span class="c">// Any MongoDB driver, unchanged application code</span>
+db.customer_profile.findOne({ _id: <span class="s">42</span> })
+
+<span class="c">// → one document from one shard, no joins at read time</span>
+{
+  _id: <span class="s">42</span>, name: <span class="s">"Asha Rao"</span>, tier: <span class="s">"gold"</span>,
+  orders: [
+    { id: <span class="s">9001</span>, status: <span class="s">"shipped"</span>,
+      items: [ { sku: <span class="s">"KB-01"</span>, qty: <span class="s">1</span>, price: <span class="s">89.00</span> } ] }
+  ]
+}</pre>
+<pre><span class="c">-- Same data from SQL: GROUP BY and JOIN still work on tables</span>
+<span class="k">SELECT</span> c.tier, <span class="k">sum</span>(i.qty * i.price) <span class="k">AS</span> revenue
+<span class="k">FROM</span> customers c
+<span class="k">JOIN</span> order_items i <span class="k">ON</span> i.customer_id = c.id
+<span class="k">GROUP BY</span> c.tier;
+
+<span class="c">-- Search shape, BM25-ranked</span>
+<span class="k">SELECT</span> * <span class="k">FROM</span> order_search <span class="k">WHERE</span> order_search @@@ <span class="s">'asha shipped'</span>;
+
+<span class="c">-- Vector shape: "similar products", always current</span>
+<span class="k">SELECT</span> sku <span class="k">FROM</span> product_vectors
+<span class="k">ORDER BY</span> embedding &lt;=&gt; prism.embed(<span class="s">'quiet mechanical keyboard'</span>)
+<span class="k">LIMIT</span> <span class="s">10</span>;</pre>
+      <p class="small muted">The team never writes a sync job. Adding a field to <code>orders</code> flows into every shape that selects it, and editing a product description re-embeds that one product.</p>
+    </div>
+  </div>
+</section>
+
+<!-- REMARKABLE -->
+<section id="remarkable">
+  <div class="col stack">
+    <div class="eyebrow">What makes it remarkable</div>
+    <h2>Shapes the database builds itself, and proves are right</h2>
+    <p>Draft 2 was a sound assembly. These two capabilities are what turn it into something no competitor can copy quickly. They reinforce each other: the auditor that proves shapes correct is what makes automatically created shapes safe to trust.</p>
+  </div>
+  <div class="two">
+    <div class="panel">
+      <span class="mode-step">Signature one</span>
+      <h3>Proven shapes</h3>
+      <p>Every incremental-view system says it keeps data consistent. None can show it. Prism makes correctness visible at three levels.</p>
+      <ol class="steps">
+        <li><span><b>A certificate at compile time.</b> The shape compiler derives the incremental form of the query using DBSP's rules, which guarantee the incremental result equals recomputation from scratch. The certificate names the rules used and the assumptions (co-location, freshness tier) it relies on. A shape that cannot be certified is rejected with a reason.</span></li>
+        <li><span><b>A live auditor in production.</b> A background process samples shape rows, recomputes them from the tables and diffs. The console shows the running count: <i>drift 0 rows · 4.1M checks · 30 days</i>. Any non-zero result pages on-call and pins the offending input.</span></li>
+        <li><span><b>Public Jepsen results</b> for every release, kept on the website permanently.</span></li>
+      </ol>
+      <p class="small muted">Why it sells: database buyers are rightly paranoid. "We can show you" ends the consistency conversation.</p>
+    </div>
+    <div class="panel">
+      <span class="mode-step">Signature two</span>
+      <h3>Automatic shapes</h3>
+      <p>Nobody should have to notice that a query would be faster as a shape. The database notices.</p>
+      <ol class="steps">
+        <li><span><b>Watch.</b> The proposer reads the query log and groups repeated join-and-nest patterns, the ones an application runs thousands of times a day.</span></li>
+        <li><span><b>Propose.</b> For each pattern it drafts a shape, estimates its write cost and read speedup from the cost model, and shows both. Accept with one click, or set a policy that auto-accepts below a cost threshold.</span></li>
+        <li><span><b>Route only when it wins.</b> The planner rewrites a query onto a shape only when a learned model predicts a speedup for that query, and falls back to the tables otherwise. The shape is never on the wrong side of a trade.</span></li>
+      </ol>
+      <p class="small muted">Why it sells: for apps built quickly, often by agents, nobody is hand-tuning anything. A database that tunes its own read models is the difference between "works in demo" and "works at scale".</p>
+    </div>
+  </div>
+  <div class="col stack">
+    <h3>Three more, once the engine exists</h3>
+    <ul class="plain">
+      <li><b>Time travel.</b> Shapes derive from a log, so <code>customer_profile AS OF '2026-10-07 14:02'</code> rebuilds the document as the tables were then. Debug a ticket or audit a ledger view across documents, search and vectors with one clause.</li>
+      <li><b>Edge shapes.</b> A shape is already a precomputed, keyed document. Replicating it to edge locations is cheap, and the same freshness token lets an edge read wait for a specific write. Worldwide low-latency reads without a new system.</li>
+      <li><b>Shapes as API.</b> A keyed shape with auth rules declared beside it is an endpoint: <code>GET /shapes/customer_profile/42</code>. For many apps this removes the backend-for-frontend layer.</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ADOPTION -->
+<section id="adoption">
+  <div class="col stack">
+    <div class="eyebrow">Adoption without migration</div>
+    <h2>Attach to the Postgres you already run, then move writes when ready</h2>
+    <p>Asking a team to move its primary database is the slowest sale in infrastructure. Prism starts as a follower instead. Attach is the on-ramp, not the destination: the product only fully pays off once writes move over, but the customer chooses when.</p>
+  </div>
+  <div class="modes">
+    <div class="panel">
+      <span class="mode-step">Step one · Attach</span>
+      <h3>Prism follows your database</h3>
+      <div class="flow">
+        <div class="node rel"><b>Your existing Postgres</b> · keeps all writes</div>
+        <div class="arrow">↓ logical replication (read-only for Prism)</div>
+        <div class="inner">
+          <span class="inner-label">Prism cluster</span>
+          <div class="row4">
+            <div class="node doc">Doc</div><div class="node search">Search</div><div class="node vec">Vector</div><div class="node cache">Cache</div>
+          </div>
+        </div>
+      </div>
+      <ul>
+        <li>No application changes for writes; reads move one endpoint at a time</li>
+        <li>Retires MongoDB read models, Elastic sync and embedding jobs first</li>
+        <li>All shapes run as <code>bounded</code>, since writes happen elsewhere</li>
+      </ul>
+    </div>
+    <div class="panel">
+      <span class="mode-step">Step two · Primary</span>
+      <h3>Prism becomes the database</h3>
+      <div class="flow">
+        <div class="node">Application writes (SQL)</div>
+        <div class="arrow">↓ one cutover, using the replica Prism already holds</div>
+        <div class="inner">
+          <span class="inner-label">Prism cluster · sharded</span>
+          <div class="node rel"><b>Tables</b></div>
+          <div class="row4">
+            <div class="node doc">Doc</div><div class="node search">Search</div><div class="node vec">Vector</div><div class="node cache">Cache</div>
+          </div>
+        </div>
+      </div>
+      <ul>
+        <li>Unlocks <code>sync</code> shapes, read-your-writes and built-in sharding</li>
+        <li>Cutover is short because the data is already in Prism</li>
+        <li>The old Postgres can stay as a fallback for a period</li>
+      </ul>
+    </div>
+  </div>
+</section>
+
+<!-- ARCHITECTURE -->
+<section id="architecture">
+  <div class="col stack">
+    <div class="eyebrow">Architecture</div>
+    <h2>Mostly assembled from proven open source, with a new shape layer on top</h2>
+    <p>About three quarters of the running system already exists elsewhere. What we build is what makes it one product: the shape compiler, cross-shard maintenance, freshness tokens, attach ingest, the shard advisor and the managed control plane.</p>
+  </div>
+  <div class="arch">
+    <div class="arch-grid">
+      <div>
+        <div class="layer">
+          <span class="layer-name">Clients</span>
+          <div class="boxes" style="grid-template-columns:repeat(3,1fr)">
+            <div class="box"><b>Postgres drivers</b><span class="who">psql · Prisma · Drizzle · any ORM</span></div>
+            <div class="box"><b>MongoDB drivers</b><span class="who">Node · Python · Go · Java</span></div>
+            <div class="box"><b>Console and CLI</b><span class="who">TypeScript</span></div>
+          </div>
+        </div>
+        <div class="down">↓</div>
+        <div class="layer">
+          <span class="layer-name">Gateways</span>
+          <div class="boxes" style="grid-template-columns:1fr 1fr">
+            <div class="box"><b>Postgres wire</b><span class="who">Citus coordinator · PgBouncer</span></div>
+            <div class="box"><b>MongoDB wire</b><span class="who">DocumentDB gateway (Rust) + shape routing</span></div>
+          </div>
+        </div>
+        <div class="down">↓</div>
+        <div class="layer">
+          <span class="layer-name">Coordinator</span>
+          <div class="boxes" style="grid-template-columns:1.3fr 1fr">
+            <div class="box"><b>Citus distributed planner</b><span class="who">routes by shard key · pushes down co-located joins</span></div>
+            <div class="box new"><b>prism_planner</b><span class="who">routes to a shape only when predicted to win · freshness tokens</span></div>
+          </div>
+        </div>
+        <div class="down">↓ ↓ ↓</div>
+        <div class="layer">
+          <span class="layer-name">Shard nodes · N of them, each a full Postgres 18</span>
+          <div class="shards">
+            <div class="shard"><span class="shard-title">shard 1 · customers 0–33%</span>
+              <span class="chip">Citus worker</span>
+              <span class="chip">DocumentDB · BSON + indexes</span>
+              <span class="chip">pg_search · BM25</span>
+              <span class="chip">pgvector · HNSW</span>
+              <span class="chip new">prism_ext on pg_trickle · sync shapes</span>
+            </div>
+            <div class="shard"><span class="shard-title">shard 2 · customers 33–66%</span>
+              <span class="chip">Citus worker</span>
+              <span class="chip">DocumentDB · BSON + indexes</span>
+              <span class="chip">pg_search · BM25</span>
+              <span class="chip">pgvector · HNSW</span>
+              <span class="chip new">prism_ext on pg_trickle · sync shapes</span>
+            </div>
+            <div class="shard"><span class="shard-title">shard 3 · customers 66–100%</span>
+              <span class="chip">Citus worker</span>
+              <span class="chip">DocumentDB · BSON + indexes</span>
+              <span class="chip">pg_search · BM25</span>
+              <span class="chip">pgvector · HNSW</span>
+              <span class="chip new">prism_ext on pg_trickle · sync shapes</span>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div class="side">
+        <span class="layer-name">Beside the data path</span>
+        <div class="box new"><b>Attach ingest</b><span class="who">Rust</span><br>Follows an external Postgres through logical replication and lands rows as sharded tables. Also performs the final cutover to primary.</div>
+        <div class="box new"><b>Shape engine</b><span class="who">Rust · DBSP</span><br>Maintains shapes that need rows from more than one shard, and runs embedding workers for vector shapes. Picks a maintenance strategy per shape from a cost model. Writes results back as ordinary sharded tables.</div>
+        <div class="box new"><b>Auditor</b><span class="who">Rust</span><br>Samples shape rows, recomputes from tables, diffs. Publishes the drift counter and pages on any mismatch.</div>
+        <div class="box new"><b>Proposer</b><span class="who">Rust + model</span><br>Mines the query log for repeated read patterns and drafts shapes with estimated cost and benefit.</div>
+        <div class="down">↕ logical replication</div>
+        <div class="box new"><b>Shard advisor</b><span class="who">Rust</span><br>Watches real join patterns. Recommends shard keys and reference tables, and rebalances online.</div>
+        <div class="box new"><b>Control plane</b><span class="who">Go · operator on CloudNativePG</span><br>Provisioning, failover, backups, upgrades, metering. The managed cloud we sell.</div>
+      </div>
+    </div>
+    <div class="key"><span>Existing open source we reuse</span><span class="n">New Prism component</span></div>
+  </div>
+</section>
+
+<!-- PATHS -->
+<section id="paths">
+  <div class="col stack">
+    <div class="eyebrow">How a request flows · primary mode</div>
+    <h2>Write path and read path</h2>
+  </div>
+  <div class="two">
+    <div>
+      <h3>Write: <code>INSERT INTO orders …</code></h3>
+      <ol class="steps">
+        <li><span><b>Route.</b> The coordinator hashes <code>customer_id</code> and sends the write to the shard that owns that customer.</span></li>
+        <li><span><b>Sync shapes update in the same transaction.</b> <code>prism_ext</code> recomputes only the affected document in <code>customer_profile</code>. Its rows live on the same shard, so there is no network hop.</span></li>
+        <li><span><b>Commit.</b> The client gets back a write token: the commit position (LSN) on that shard.</span></li>
+        <li><span><b>Bounded shapes update right after.</b> The shape engine reads the change from logical replication, computes the delta for <code>order_search</code>, and writes it to the shape's shards. The lag target is set per shape.</span></li>
+      </ol>
+    </div>
+    <div>
+      <h3>Read: <code>findOne({ _id: 42 })</code></h3>
+      <ol class="steps">
+        <li><span><b>Gateway.</b> The MongoDB wire gateway maps the collection name to the shape <code>customer_profile</code>.</span></li>
+        <li><span><b>Route by key.</b> <code>_id</code> is the shape key, which is the shard key, so the read goes to exactly one shard.</span></li>
+        <li><span><b>Freshness check (optional).</b> If the client passed a write token, the shard waits until that position has reached the shape, or returns a clear "not yet" error after a timeout.</span></li>
+        <li><span><b>Return.</b> One prebuilt BSON document. No joins at read time, which is where the speed of NoSQL comes from.</span></li>
+      </ol>
+    </div>
+  </div>
+</section>
+
+<!-- FRESHNESS -->
+<section id="freshness">
+  <div class="col stack">
+    <div class="eyebrow">Consistency model</div>
+    <h2>Two freshness tiers, chosen per shape</h2>
+    <p>Keeping every shape perfectly consistent across shards would make every write a distributed transaction, and writes would crawl. Each shape declares what it needs, and the shape compiler rejects a declaration it cannot honor.</p>
+  </div>
+  <div class="tiers">
+    <div class="tier">
+      <span class="freshness">FRESHNESS sync</span>
+      <h3>Same transaction, same shard</h3>
+      <p>The shape updates inside the writing transaction. Readers never see a shape that disagrees with its tables.</p>
+      <p class="small muted"><b>Allowed when</b> every source table is co-located on the shape key, or is a small reference table copied to every shard, and Prism is the primary. The compiler checks this.</p>
+      <p class="small muted"><b>Cost:</b> slightly slower writes, since each write also does its shape work.</p>
+    </div>
+    <div class="tier">
+      <span class="freshness">FRESHNESS bounded '2s'</span>
+      <h3>Asynchronous, with a stated lag budget</h3>
+      <p>The shape engine maintains it from the replication stream. Lag is measured continuously and alerts fire when the budget is broken.</p>
+      <p class="small muted"><b>Used for</b> shapes that join across shard keys, global aggregates, search over the whole dataset, vector shapes (embedding calls take time), and everything in attach mode.</p>
+      <p class="small muted"><b>Read your writes:</b> pass the write token and the read waits for it. In SQL: <code>SET prism.read_after = '…'</code>.</p>
+    </div>
+  </div>
+  <div class="col stack">
+    <h3>Freshness is reported per read, not per cluster</h3>
+    <p>A cluster-wide "lag: 800ms" number says little about whether <i>this</i> result is current. Following the Vodka work on HTAP freshness, every shape read can return the log position its rows were derived from, so a client or the auditor can state exactly what data a result reflects. The dashboard rolls those up by shape, and alerts fire on the budget each shape declared.</p>
+  </div>
+</section>
+
+<!-- SHARDING -->
+<section id="sharding">
+  <div class="col stack">
+    <div class="eyebrow">Built-in sharding</div>
+    <h2>Shard by entity, keep joins local, let the advisor catch mistakes</h2>
+    <p>Joins and shards only conflict when the rows being joined live on different machines. Prism takes the approach Citus and Spanner both proved: pick one entity key (customer, tenant, account) and co-locate everything that hangs off it. Most joins then never leave a shard, and SQL keeps working the way people expect.</p>
+  </div>
+  <div class="two">
+    <div>
+      <h3>What the cluster does automatically</h3>
+      <ul class="plain">
+        <li><b>Co-location.</b> Tables sharing a distribution key land on the same shards, so joins and sync shapes on that key run locally.</li>
+        <li><b>Reference tables.</b> Small lookup tables (countries, plans, products) are copied to every shard, so joining them is always local.</li>
+        <li><b>Online rebalancing.</b> Shards move between nodes without downtime when nodes are added or a tenant gets hot.</li>
+        <li><b>Scatter-gather for the rest.</b> A cross-shard <code>GROUP BY</code> runs in parallel on every shard and merges. Correct, just slower than a local query.</li>
+      </ul>
+    </div>
+    <div>
+      <h3>What the shard advisor adds</h3>
+      <p>Choosing the wrong shard key is the most expensive mistake in a sharded database. The advisor reads <code>pg_stat_statements</code> and the shape catalog, and reports:</p>
+      <ul class="plain">
+        <li>hot queries that cross shards, and the key that would have kept them local</li>
+        <li>tables small enough to become reference tables</li>
+        <li>shapes that could move from <code>bounded</code> to <code>sync</code> if a table were co-located</li>
+        <li>a one-click online reshard plan when a better key is clear</li>
+      </ul>
+    </div>
+  </div>
+</section>
+
+<!-- LANDSCAPE -->
+<section id="landscape">
+  <div class="col stack">
+    <div class="eyebrow">Competitive landscape</div>
+    <h2>Each piece exists somewhere. Nobody ships the combination.</h2>
+    <p>Incremental views alone are a crowded feature: several open source projects and startups keep derived tables fresh. Prism's case rests on putting four things in one product that no competitor combines.</p>
+  </div>
+  <div class="callout col">
+    <h3>The combination we sell</h3>
+    <ul class="plain">
+      <li><b>Relational source of truth</b> with full SQL, joins and <code>GROUP BY</code></li>
+      <li><b>MongoDB wire compatibility</b>, so document-style apps connect unchanged</li>
+      <li><b>Shapes maintained across shards</b>, with per-shape freshness and read-your-writes</li>
+      <li><b>Attach mode</b>, so adoption starts without a migration</li>
+    </ul>
+  </div>
+  <div class="tbl">
+    <table>
+      <thead><tr><th>Who</th><th>What they do well</th><th>Where they stop</th><th>Relation to Prism</th></tr></thead>
+      <tbody>
+        <tr><td><b>pg_trickle</b></td><td>In-transaction incremental views in Postgres 18; Rust, DBSP-inspired; Apache 2.0</td><td>Single node, pre-1.0, no document or MongoDB layer</td><td>Building block for sync shapes</td></tr>
+        <tr><td><b>Epsio · ReadySet · Feldera</b></td><td>Incremental views or query caching alongside an existing database</td><td>Separate engine; no sharded storage; no document API</td><td>Adjacent; Feldera's DBSP is a building block</td></tr>
+        <tr><td><b>RisingWave · Materialize</b></td><td>Streaming SQL with strong incremental views</td><td>A second system with its own storage, which is the problem we remove</td><td>Alternative approach</td></tr>
+        <tr><td><b>ElectricSQL · Zero</b></td><td>Sync Postgres data to client apps; Zero reached 1.0 in June 2026</td><td>Client sync only; separate service in front of Postgres</td><td>Overlaps our later "live" shapes. Electric also uses the word "shapes".</td></tr>
+        <tr><td><b>MongoDB Atlas</b></td><td>Documents with built-in search and vector search in one service</td><td>No relational source of truth; joins and aggregates are weaker than SQL</td><td>Main competitor for the "one platform" story</td></tr>
+        <tr><td><b>Supabase · Neon</b></td><td>Developer-loved managed Postgres, branching, fast provisioning</td><td>Single-node Postgres; derived data is left to the developer</td><td>Where customers start; attach mode follows them</td></tr>
+        <tr><td><b>Azure</b> (DocumentDB, Cosmos DB vCore, HorizonDB)</td><td>Owns Citus and DocumentDB; can bundle the same parts</td><td>No shape abstraction today</td><td>Largest strategic risk; see Risks</td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<!-- BASE -->
+<section id="base">
+  <div class="col stack">
+    <div class="eyebrow">Choosing the base</div>
+    <h2>Pick: Postgres 18 + Citus + DocumentDB, with pg_trickle for sync shapes</h2>
+    <p><b>DocumentDB</b> is Microsoft's MongoDB-compatible Postgres extension, moved to the Linux Foundation in August 2025 under the MIT license. It adds BSON types, document indexes and a Rust gateway that speaks the MongoDB wire protocol, and it ships a distributed mode that shards collections across Citus. That gives us SQL, documents and sharding as working parts today. <b>pg_trickle</b> gives us a head start on in-transaction shape maintenance.</p>
+  </div>
+  <div class="tbl">
+    <table>
+      <thead><tr><th>Candidate</th><th>License</th><th>Status</th><th>Fit for Prism</th><th>Verdict</th></tr></thead>
+      <tbody>
+        <tr class="pick"><td><b>Postgres 18 + Citus 14</b></td><td>PostgreSQL · AGPL-3.0 (Citus)</td><td>Production for years; 14.2 supports PG 18</td><td>Proven sharding, co-location, reference tables, online rebalancing. Extension, not a fork.</td><td><span class="verdict ok">Base</span></td></tr>
+        <tr class="pick"><td><b>DocumentDB</b></td><td>MIT · Linux Foundation</td><td>Active; distributed mode over Citus</td><td>MongoDB wire protocol and BSON on Postgres.</td><td><span class="verdict ok">Base</span></td></tr>
+        <tr class="pick"><td><b>pg_trickle</b></td><td>Apache 2.0</td><td>Pre-1.0, frequent releases; targets PG 18</td><td>In-transaction incremental views with joins, aggregates and recursive CTEs. Starting point for sync shapes; we add sharding awareness and the shape DDL.</td><td><span class="verdict ok">Start from</span></td></tr>
+        <tr class="pick"><td><b>ParadeDB pg_search</b></td><td>AGPL-3.0 · commercial available</td><td>0.25.0 stable, July 2026</td><td>BM25 search on Citus distributed tables.</td><td><span class="verdict ok">Include</span></td></tr>
+        <tr class="pick"><td><b>Feldera DBSP</b></td><td>MIT (open-source edition)</td><td>Open-sourced; Rust</td><td>Incremental computation with cost proportional to the change. Core of the cross-shard shape engine.</td><td><span class="verdict ok">Embed</span></td></tr>
+        <tr><td><b>YugabyteDB</b></td><td>Apache 2.0 (managed binaries: Polyform)</td><td>Production</td><td>Natively distributed, but its storage layer cannot run DocumentDB or pg_search. We would own a large C++ fork.</td><td><span class="verdict warn">Runner-up</span></td></tr>
+        <tr><td><b>Multigres</b> (Supabase)</td><td>Apache 2.0 · Go</td><td>v0.1 alpha, June 2026; sharding not shipped</td><td>Vitess-style sharding for Postgres. The most likely replacement for Citus later.</td><td><span class="verdict warn">Watch</span></td></tr>
+        <tr><td><b>Neki</b> (PlanetScale)</td><td>Open source "when ready"</td><td>Announced, unreleased</td><td>Sharded Postgres from the Vitess team. No code yet.</td><td><span class="verdict warn">Watch</span></td></tr>
+        <tr><td><b>pgai vectorizer</b></td><td>PostgreSQL</td><td>Archived by Timescale in 2026</td><td>Was the main way to keep embeddings in sync inside Postgres. Its retirement leaves the gap vector shapes fill.</td><td><span class="verdict no">Gone</span></td></tr>
+        <tr><td><b>CockroachDB</b></td><td>Proprietary since 2024</td><td>Production</td><td>License rules it out.</td><td><span class="verdict no">No</span></td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<!-- LANGUAGES -->
+<section id="languages">
+  <div class="col stack">
+    <div class="eyebrow">Languages</div>
+    <h2>Rust for the data path, Go for operations, TypeScript for people</h2>
+    <p>The choice follows the code we inherit. DBSP, pg_trickle and the DocumentDB gateway are already Rust, and Rust Postgres extensions are mature through <code>pgrx</code>. The Kubernetes operator world, including CloudNativePG and Multigres, is Go.</p>
+  </div>
+  <div class="tbl">
+    <table>
+      <thead><tr><th>Component</th><th>Language</th><th>Why</th></tr></thead>
+      <tbody>
+        <tr><td><b>Shape engine</b> and embedding workers</td><td>Rust</td><td>DBSP is a Rust library. No garbage-collector pauses on the hot path; memory safety in long-running stateful code.</td></tr>
+        <tr><td><b>prism_ext</b> (sync shapes, shape DDL, catalog)</td><td>Rust via pgrx, extending pg_trickle</td><td>Same language as the project we start from. C only at the boundary with Citus.</td></tr>
+        <tr><td><b>prism_planner</b></td><td>C, inside Citus planner hooks</td><td>Has to live where Citus plans queries. Kept as small as possible.</td></tr>
+        <tr><td><b>Attach ingest</b></td><td>Rust</td><td>Logical replication decoding is throughput-bound and shares code with the shape engine.</td></tr>
+        <tr><td><b>MongoDB gateway changes</b></td><td>Rust</td><td>Extends the DocumentDB gateway to map collections to shapes and carry write tokens.</td></tr>
+        <tr><td><b>Control plane and operator</b></td><td>Go</td><td>Built on CloudNativePG. Best ecosystem for Kubernetes controllers.</td></tr>
+        <tr><td><b>Console, CLI, docs</b></td><td>TypeScript</td><td>Fast iteration on the parts customers see.</td></tr>
+        <tr><td><b>Correctness testing</b></td><td>Jepsen (Clojure) + Rust property tests and deterministic simulation</td><td>The test suite is the product's credibility. It cannot only be tests written alongside the code they check.</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <div class="col stack">
+    <h3>What we build versus reuse</h3>
+    <div class="split" role="img" aria-label="Roughly 75 percent reused open source, 25 percent new code">
+      <div class="reuse" style="flex:3">Reused: Postgres, Citus, DocumentDB, pg_trickle, pg_search, pgvector, DBSP, CloudNativePG</div>
+      <div class="build" style="flex:1">New: shapes, attach, cloud</div>
+    </div>
+    <p class="small muted">Rough share of the running system by code volume. The new quarter is the product's value.</p>
+  </div>
+</section>
+
+<!-- USES -->
+<section id="uses">
+  <div class="col stack">
+    <div class="eyebrow">Where it fits</div>
+    <h2>Products whose reads look nothing like their writes</h2>
+    <p>Prism earns its place wherever data is written in normalized form but read as documents, results lists or recommendations. A few typical cases:</p>
+  </div>
+  <div class="uses">
+    <div class="use"><h3>Commerce and marketplaces</h3><p class="small">Orders and inventory stay relational for accounting; storefronts read product documents, catalog search and "similar items" from the same tables.</p><div class="shapes-used"><span class="dot" style="color:var(--s-doc)">document</span><span class="dot" style="color:var(--s-search)">search</span><span class="dot" style="color:var(--s-vec)">vector</span></div></div>
+    <div class="use"><h3>Multi-tenant SaaS</h3><p class="small">Shard by tenant so every tenant's joins stay local. Per-tenant dashboards and activity feeds read as precomputed shapes, and hot tenants move between nodes online.</p><div class="shapes-used"><span class="dot" style="color:var(--s-cache)">cache</span><span class="dot" style="color:var(--s-col)">analytics</span><span class="dot" style="color:var(--s-doc)">document</span></div></div>
+    <div class="use"><h3>Fintech and ledgers</h3><p class="small">The ledger stays strictly relational and transactional. Statements, balances and customer views are shapes that never drift from the ledger, with read-your-writes after every payment.</p><div class="shapes-used"><span class="dot" style="color:var(--s-doc)">document</span><span class="dot" style="color:var(--s-cache)">cache</span></div></div>
+    <div class="use"><h3>AI features in existing apps</h3><p class="small">Retrieval and assistants need embeddings and per-user context that match the database right now. Vector and document shapes keep both current, without a separate embedding pipeline or vector store.</p><div class="shapes-used"><span class="dot" style="color:var(--s-vec)">vector</span><span class="dot" style="color:var(--s-doc)">document</span><span class="dot" style="color:var(--s-search)">search</span></div></div>
+  </div>
+</section>
+
+<!-- RESEARCH -->
+<section id="research">
+  <div class="col stack">
+    <div class="eyebrow">Research grounding · reviewed October 2026</div>
+    <h2>Recent papers, and the component each one shapes</h2>
+    <p>Each design choice above borrows from published work where it can. The table names the paper, the idea taken, and where it lands in Prism.</p>
+  </div>
+  <div class="tbl">
+    <table>
+      <thead><tr><th>Paper</th><th>Idea we take</th><th>Where it lands</th></tr></thead>
+      <tbody>
+        <tr><td><b>DBSP</b> · VLDB 2023 best paper</td><td>A mechanical rule that turns any query into its incremental form, with a formal argument that the result equals recomputation.</td><td>Shape engine; the basis of the compile-time certificate.</td></tr>
+        <tr><td><b>Enzyme</b> · Databricks, SIGMOD 2026</td><td>Incremental maintenance that treats AI and non-deterministic function calls as part of the view, and picks a maintenance strategy per view from a cost model built on plan info and past runs.</td><td>Vector shapes (embedding calls as view functions); per-shape strategy selection behind the <code>sync</code>/<code>bounded</code> tiers.</td></tr>
+        <tr><td><b>Vodka</b> · VLDB 2025</td><td>Measure freshness against the data a query actually touched, with fine-grained versioning, not against query start time.</td><td>Per-read freshness reporting; the auditor's definition of "current".</td></tr>
+        <tr><td><b>Tailwind</b> · Kraska, Marcus, Yu, 2026</td><td>A non-invasive planner that rewrites a query onto an accelerator only when a learned model predicts a win, else falls back.</td><td>Automatic shapes: routing a query to a shape only when it is predicted to be faster.</td></tr>
+        <tr><td><b>MVGPT</b> · Alibaba, ICDE 2026</td><td>A fine-tuned model that forecasts which materialized views a workload will need, deployed in production.</td><td>The proposer: evidence it works, and a reference design.</td></tr>
+        <tr><td><b>AMAZe</b> · 2026</td><td>A zero-shot multi-agent index advisor: plan, select, combine, revise, reflect.</td><td>Shard advisor structure.</td></tr>
+        <tr><td><b>Drift-Adapter</b> · 2025</td><td>Upgrading an embedding model without re-encoding the whole corpus.</td><td>Vector shapes: model upgrades as a supported operation.</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <div class="callout col">
+    <h3>Two open problems we would publish on</h3>
+    <ul class="plain">
+      <li><b>Verified incremental view maintenance.</b> Formal verification in Rust (Verus, Lean pipelines) has reached kernels and cryptography but not database engines. A machine-checked proof that the shape engine's incremental form matches recomputation would be a first, and is what turns the certificate from "derived by rules" into "proven".</li>
+      <li><b>Learned co-location.</b> No recent work automates shard-key selection from real workloads. The shard advisor's recommendations, with the outcomes of accepted reshards, are the dataset such a paper needs.</li>
+    </ul>
+    <p class="small">Publishing is also hiring: the engineers who can build this read these venues.</p>
+  </div>
+</section>
+
+<!-- ROADMAP -->
+<section id="roadmap">
+  <div class="col stack">
+    <div class="eyebrow">Roadmap</div>
+    <h2>Lead with attach mode, earn trust, then become the primary</h2>
+    <p>Each phase gives a customer something usable, and each exit test decides whether the next phase starts. Timings are rough estimates for a small team.</p>
+  </div>
+  <div class="phases">
+    <div class="phase on"><span class="when">Phase 0 · ~2 months</span><h3>Attach</h3>
+      <ul><li>One image: PG 18 + Citus + DocumentDB + pg_search + pgvector</li><li>Attach ingest from an existing Postgres</li><li>Bounded document and search shapes</li><li>Shapes readable through the MongoDB gateway</li></ul>
+      <p class="exit">Exit: a design partner switches off one MongoDB read model or Elastic sync job.</p></div>
+    <div class="phase"><span class="when">Phase 1 · ~2 months</span><h3>Vector shapes</h3>
+      <ul><li><code>CREATE SHAPE … AS VECTOR</code></li><li>Re-embed changed rows only, with cost tracking</li><li>Lag dashboards and alerts per shape</li></ul>
+      <p class="exit">Exit: a partner retires an embedding pipeline or a separate vector store.</p></div>
+    <div class="phase"><span class="when">Phase 2 · ~3 months</span><h3>Primary mode</h3>
+      <ul><li>Cutover from attach to primary</li><li>Sync shapes on pg_trickle, sharding-aware</li><li>Write tokens and per-read freshness; cache shapes</li><li>Auditor with the public drift counter</li></ul>
+      <p class="exit">Exit: a partner moves production writes onto Prism.</p></div>
+    <div class="phase"><span class="when">Phase 3 · ~3 months</span><h3>Scale and cloud</h3>
+      <ul><li>Cross-shard shapes on DBSP, with certificates</li><li>Proposer and predicted-benefit routing</li><li>Shard advisor and online reshard</li><li>Managed cloud beta; first Jepsen report</li></ul>
+      <p class="exit">Exit: paying customers on the managed cloud.</p></div>
+  </div>
+  <p class="col small muted">After phase 3: time travel, edge shapes, shapes as API, analytics shapes (columnar mirror), live shapes for client sync, event shapes for services, and the verified-IVM research track.</p>
+</section>
+
+<!-- RISKS -->
+<section id="risks">
+  <div class="col stack">
+    <div class="eyebrow">Risks</div>
+    <h2>What could sink this, and what we do about it</h2>
+  </div>
+  <div class="risks col">
+    <div class="risk"><b>Microsoft controls Citus and DocumentDB</b><span>Azure already runs Cosmos DB for MongoDB vCore on DocumentDB, and can bundle the same parts. Keep sharding behind our own interface, contribute upstream so we are not a passive consumer, and track Multigres as a Citus replacement. Our moat is the shape layer and attach mode, which Azure does not have.</span></div>
+    <div class="risk"><b>Incremental views are a crowded feature</b><span>pg_trickle, Epsio, Feldera and others keep views fresh. Never sell shapes alone; sell the combination of SQL source of truth, MongoDB compatibility, cross-shard shapes and attach mode.</span></div>
+    <div class="risk"><b>Data correctness bugs in shape maintenance</b><span>A wrong shape is silent data loss from the customer's point of view. The auditor, certificates and public Jepsen results exist for this reason. Fund them before general availability, not after.</span></div>
+    <div class="risk"><b>Automatic shapes that cost more than they save</b><span>A proposer that creates shapes nobody reads adds write cost for nothing. Every proposal shows estimated cost and benefit, auto-accept is off by default, and unused shapes are flagged for removal after a quiet period.</span></div>
+    <div class="risk"><b>Attach mode makes us look like another sync tool</b><span>Price and message attach as the first step of the database, not a product on its own. Every attach customer gets a cutover plan from the first week.</span></div>
+    <div class="risk"><b>AGPL on Citus and pg_search</b><span>Offering modified AGPL components as a service means publishing those modifications. That fits open core if our new code stays separate. Confirm with a lawyer; ParadeDB's commercial license is a fallback.</span></div>
+    <div class="risk"><b>MongoDB compatibility gaps</b><span>DocumentDB does not cover every MongoDB operator. Publish a compatibility matrix, and position shapes as the main read path rather than a full drop-in Mongo replacement.</span></div>
+    <div class="risk"><b>The word "shapes" is taken</b><span>ElectricSQL uses it for client sync. Decide early whether to keep it, or use a distinct term in public copy.</span></div>
+    <div class="risk"><b>Write amplification from too many shapes</b><span>Every shape adds work to writes. Show per-shape write and embedding cost in the console, and let teams downgrade a shape from sync to bounded with one statement.</span></div>
+  </div>
+</section>
+
+<section id="sources">
+  <div class="col stack">
+    <div class="eyebrow">Sources</div>
+    <ol class="sources">
+      <li><a href="https://investors.mongodb.com/news-releases/news-release-details/mongodb-inc-announces-second-quarter-fiscal-2027-financial">MongoDB Q2 FY2027 results</a> · <a href="https://seekingalpha.com/news/4430445-mongodb-remains-on-track-for-growth-despite-postgresql-competition-stifel">Stifel survey on MongoDB and Postgres</a></li>
+      <li><a href="https://www.techtarget.com/searchdatamanagement/news/366623864/Databricks-adds-Postgres-database-with-1B-Neon-acquisition">Databricks acquires Neon</a> · <a href="https://saastr.com/snowflake-buys-crunchy-data-for-250m-databricks-buys-neon-for-1b-the-new-ai-database-battle">Snowflake acquires Crunchy Data</a> · <a href="https://runtimewire.com/article/supabase-raises-150m-acquires-turso">Supabase raises $150M, acquires Turso</a></li>
+      <li><a href="https://sacra.com/chat/h/62900b14-253b-4477-9519-9fe588f23288/">Neon agent-provisioned databases</a> · <a href="https://sacra.com/chat/h/3dd9be4c-d2c0-4dcb-a149-2de1a3982600/">Supabase as AI backend</a></li>
+      <li><a href="https://www.tigerdata.com/blog/its-2026-just-use-postgres">It's 2026, Just Use Postgres</a> · <a href="https://news.ycombinator.com/item?id=46905555">Hacker News discussion</a></li>
+      <li><a href="https://tacnode.io/post/polyglot-persistence-and-the-retrieval-gap">Polyglot persistence and inconsistent reads</a> · <a href="https://dev.to/tim_derzhavets/building-a-polyglot-persistence-layer-when-one-database-isnt-enough-ibm">Building a polyglot persistence layer</a></li>
+      <li><a href="https://www.prnewswire.com/news-releases/linux-foundation-welcomes-documentdb-to-advance-open-developer-first-nosql-innovation-302534121.html">DocumentDB joins the Linux Foundation</a> · <a href="https://doc.pigsty.io/ext/e/documentdb_distributed">documentdb_distributed</a></li>
+      <li><a href="https://github.com/citusdata/citus">Citus</a> · <a href="https://docs.paradedb.com/deploy/citus">ParadeDB on Citus</a> · <a href="https://master.pgxn.org/dist/pg_search/0.25.0/META.json">pg_search 0.25.0</a></li>
+      <li><a href="https://pgxn.org/dist/pg_trickle/">pg_trickle</a> · <a href="https://pgxn.org/dist/pg_trickle/0.36.0/blog/pgvector-tooling-landscape.html">pg_trickle on pgvector tooling</a></li>
+      <li><a href="https://www.feldera.com/product">Feldera</a> · <a href="https://www.epsio.io/incremental-materialized-views">Epsio</a> · <a href="https://risingwave.com/blog/risingwave-vs-materialize-comparison/">RisingWave vs Materialize</a></li>
+      <li><a href="https://www.infoq.com/news/2026/06/zero-version-1/">Zero 1.0</a> · <a href="https://kanopylabs.com/blog/tanstack-db-vs-electricsql-vs-zero-sync">ElectricSQL vs Zero</a></li>
+      <li><a href="https://github.com/timescale/pgai/blob/main/docs/vectorizer/overview.md">pgai vectorizer (archived)</a> · <a href="https://motherduck.com/blog/pg-mooncake-columnstore">pg_mooncake columnstore</a></li>
+      <li><a href="https://arxiv.org/pdf/2203.16684">DBSP</a> · <a href="https://www.databricks.com/blog/databricks-sigmod-2026">Enzyme (Databricks at SIGMOD 2026)</a> · <a href="https://www.vldb.org/pvldb/vol19/p481-hu.pdf">Vodka</a> · <a href="https://arxiv.org/abs/2604.28079">Tailwind</a> · <a href="https://dbgroup.cs.tsinghua.edu.cn/ligl/papers/ICDE26-MVGPT.pdf">MVGPT</a> · <a href="https://arxiv.org/html/2508.16044v2">AMAZe</a> · <a href="https://arxiv.org/html/2509.23471v1">Drift-Adapter</a> · <a href="https://arxiv.org/abs/2605.30106">Rust-to-Lean verification pipeline</a></li>
+      <li><a href="https://docs.yugabyte.com/preview/legal/">YugabyteDB legal</a> · <a href="https://supabase.com/blog/multigres-vitess-for-postgres.md">Multigres</a> · <a href="https://planetscale.com/blog/announcing-neki">Neki</a> · <a href="https://techcommunity.microsoft.com/blog/adforpostgresql/whats-new-with-postgres-at-microsoft-2026-edition/4526963">Postgres at Microsoft, 2026</a></li>
+    </ol>
+  </div>
+</section>
+
+<footer>Prism is a working name; check trademarks before using it publicly. The <code>CREATE SHAPE</code> syntax is a proposal, not an existing feature of any listed project. Market figures are as reported by the companies or press cited.</footer>
+</div>
+
+</body></html>
