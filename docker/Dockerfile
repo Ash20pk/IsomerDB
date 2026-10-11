@@ -39,6 +39,12 @@ COPY vendor/documentdb /src/documentdb
 WORKDIR /src/documentdb
 RUN make -j"$(nproc)" && make install DESTDIR=/out
 
+# ── isomer_router (C planner hook) ─────────────────────────────────────────────
+FROM build-base AS router
+COPY extensions/isomer_router /src/isomer_router
+WORKDIR /src/isomer_router
+RUN make && make install DESTDIR=/out
+
 # ── DocumentDB gateway (MongoDB wire protocol, Rust) ──────────────────────────
 FROM build-base AS gateway
 COPY vendor/documentdb /src/documentdb
@@ -81,6 +87,7 @@ COPY --from=citus /out/ /
 COPY --from=documentdb /out/ /
 COPY --from=pg_trickle /out/ /
 COPY --from=gateway /out/ /
+COPY --from=router /out/ /
 
 COPY extensions/isomer/isomer.control extensions/isomer/isomer--*.sql /usr/share/postgresql/${PG_MAJOR}/extension/
 

@@ -2,6 +2,55 @@
 
 Things we learned building the stack that are not obvious from the upstream docs. Newest first.
 
+## 2026-10-11 — Query routing (FR-M4)
+
+`tests/routing.sh` passes (12 checks). An application's unchanged prepared statement (a keyed join
+over a 300k-row table without an index) is proposed, routed, and from then on planned as one
+index lookup on a sync cache projection. Results are identical on 51 keys, inserts and updates
+show up on the next read, and a read takes 0.85 ms against 7.09 ms on the tables. Routing `off`,
+`shadow` mode and a disabled route all fall back to the tables.
+
+- **`isomer_router` is a small C library preloaded right after Citus**, with a `planner_hook`.
+  - For a `SELECT` whose query id (the same id `pg_stat_statements` and the proposer use) has an
+    enabled route, it parses the route's replacement SQL and analyses it with the original's
+    parameter types.
+  - It checks that the visible output columns have the same count and types, then hands the
+    replacement to the next planner (Citus).
+  - Routes are cached per backend and reloaded every 2 seconds.
+  - `isomer.routing` = `on` / `off` / `shadow`, and `isomer.routing_min_speedup` sets the bar.
+- **`isomer.route_proposal(id)`**:
+  1. Takes the parameter type from a `PREPARE`, and the output columns from a probe view with
+     `$1` replaced by a typed `NULL`.
+  2. Creates a **sync** cache projection holding each key's rows as a jsonb array, plus the
+     replacement `SELECT x.cols FROM cache CROSS JOIN LATERAL jsonb_to_recordset(...) WHERE key = $1`.
+  3. Enables the route only if the replacement returns the same multiset of rows on sample keys
+     (including keys with no rows) and its measured speedup clears the bar. This one measured
+     19.9×.
+- **Routes target sync projections only**, so a routed read sees exactly what the tables hold.
+
+Limits:
+
+- **No `ORDER BY`.** Row order inside the jsonb array isn't the query's order.
+- **No duplicate output column names**, which would collide as jsonb keys.
+- **One parameter**, the key.
+- **"Predicted to win" is a measured speedup at route time**, not a learned model that keeps
+  adapting (the PRD cites Tailwind for that).
+- **Creating the route's view logs a Citus warning** ("view … has dependency to table … not in
+  Citus' metadata"). It is harmless: both are local by design.
+
+### Read-your-writes across nodes: the two-phase commit gap
+
+`multinode.sh` failed now and then at "a write to a key on worker1 is read back after wait_for",
+while `pending` and every `node_queue` were already empty. The drain writes the document on the
+node holding the collection's shard and deletes the queued key on the coordinator, both in one
+distributed transaction. Citus commits the coordinator's side first and then sends
+`COMMIT PREPARED` to the workers. In between, the queue is empty but the document update is not yet
+visible on the worker. `wait_for` saw the empty queue and returned too early. In multi-node mode it
+now takes a snapshot of the prepared-transaction gids (`pg_prepared_xacts` on the coordinator and
+on every worker) once the queues are clear. It returns only when none of those gids is still
+prepared, and fails closed with IS001 at the timeout. This had nothing to do with the router; the
+router only changed the timing enough to expose it. After the fix: 4 out of 4 clean multi-node runs, with the router loaded.
+
 ## 2026-10-11 — Multi-node clusters (FR-P5, FR-P6 for key-maintained projections)
 
 `tests/multinode.sh` passes (19 checks) on a coordinator plus two Citus workers, both fresh and on a

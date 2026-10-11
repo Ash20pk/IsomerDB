@@ -16,7 +16,7 @@ CREATE EXTENSION IF NOT EXISTS documentdb_extended_rum;
 CREATE EXTENSION IF NOT EXISTS pg_search;
 CREATE EXTENSION IF NOT EXISTS vector;
 CREATE EXTENSION IF NOT EXISTS pg_trickle CASCADE;
-GRANT USAGE ON SCHEMA documentdb_core, documentdb_api_catalog TO PUBLIC;
+GRANT USAGE ON SCHEMA documentdb_core, documentdb_api_catalog, documentdb_api, documentdb_api_internal TO PUBLIC;
 CREATE EXTENSION IF NOT EXISTS dblink;
 CREATE EXTENSION IF NOT EXISTS pg_stat_statements;
 -- Workers run IsomerDB's capture triggers on their shards and queue keys locally; the
@@ -39,9 +39,11 @@ SELECT citus_set_coordinator_host('localhost', 5432);
 SELECT citus_set_node_property('localhost', 5432, 'shouldhaveshards', true);
 SELECT documentdb_api_distributed.initialize_cluster();
 
--- DocumentDB's distributed planner hook resolves its own schemas on every Citus query, so any
--- role querying a sharded table needs USAGE on them (objects inside keep their own privileges).
-GRANT USAGE ON SCHEMA documentdb_core, documentdb_api_catalog TO PUBLIC;
+-- DocumentDB's planner hooks resolve its own schemas for every query (sharded tables, and any
+-- set-returning function in FROM, even generate_series), so every role needs USAGE on them.
+-- Objects inside keep their own privileges: DocumentDB has no SECURITY DEFINER functions, so this
+-- gives no access to its data.
+GRANT USAGE ON SCHEMA documentdb_core, documentdb_api_catalog, documentdb_api, documentdb_api_internal TO PUBLIC;
 
 CREATE EXTENSION IF NOT EXISTS dblink;
 CREATE EXTENSION IF NOT EXISTS pg_stat_statements;

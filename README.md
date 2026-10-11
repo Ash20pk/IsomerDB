@@ -16,9 +16,10 @@ runs, with no migration.
 | [`docs/reference/system-design-draft-3.html`](docs/reference/system-design-draft-3.html) | The system design the PRD is based on (written under the earlier working name "Prism") |
 | [`vendor/`](vendor/) | Upstream code we modify: Citus, DocumentDB, pg_trickle. See [`vendor/README.md`](vendor/README.md) for versions, licenses and the rules for changing it |
 | [`docker/`](docker/) | Base image: Postgres 18 + Citus + DocumentDB + gateway + pg_search + pgvector + pg_trickle |
-| [`extensions/isomer/`](extensions/isomer/) | The `isomer` Postgres extension: projections and attach mode |
+| [`extensions/isomer/`](extensions/isomer/) | The `isomer` Postgres extension: projections, attach mode, advisors |
+| [`extensions/isomer_router/`](extensions/isomer_router/) | C planner hook that routes keyed reads onto projections |
 | [`services/embedder/`](services/embedder/) | Rust service that computes embeddings for vector projections |
-| [`tests/phase0.sh`](tests/phase0.sh) … [`phase3.sh`](tests/phase3.sh), [`native.sh`](tests/native.sh), [`multinode.sh`](tests/multinode.sh) | Acceptance tests: Phase 0 (attach, document and search projections), 1 (vector projections), 2 (primary mode: cutover, sharding, sync, read-your-writes, auditor), 3 (proposer, shard advisor, certificates, randomized concurrency) |
+| [`tests/phase0.sh`](tests/phase0.sh) … [`phase3.sh`](tests/phase3.sh), [`native.sh`](tests/native.sh), [`multinode.sh`](tests/multinode.sh), [`routing.sh`](tests/routing.sh) | Acceptance tests: Phase 0 (attach, document and search projections), 1 (vector projections), 2 (primary mode: cutover, sharding, sync, read-your-writes, auditor), 3 (proposer, shard advisor, certificates, randomized concurrency) |
 | [`scripts/smoke.sh`](scripts/smoke.sh) | Checks every base component works in a running stack |
 | [`docs/engineering-notes.md`](docs/engineering-notes.md) | What we learned building the stack (gateway auth, pg_trickle and Citus quirks) |
 
@@ -29,7 +30,7 @@ docker compose up --build -d     # Postgres on :5432, MongoDB wire gateway on :1
 ./scripts/smoke.sh
 
 docker compose --profile attach up -d   # adds a stand-in customer Postgres (:5433) and a mock embeddings API
-./tests/phase0.sh && ./tests/phase1.sh && ./tests/phase2.sh && ./tests/phase3.sh && ./tests/native.sh
+./tests/phase0.sh && ./tests/phase1.sh && ./tests/phase2.sh && ./tests/phase3.sh && ./tests/native.sh && ./tests/routing.sh
 
 docker compose --profile cluster up -d  # adds two Citus worker nodes
 ./tests/multinode.sh                    # joins them, rebalances online, tests across nodes
@@ -89,6 +90,9 @@ SELECT * FROM isomer.alerts;
 -- Let the database suggest projections and shard keys from real traffic
 SELECT isomer.propose();  SELECT * FROM isomer.proposals;  SELECT isomer.accept_proposal(1);
 SELECT * FROM isomer.shard_advice();
+
+-- Route a slow keyed read onto a projection: the application's SQL doesn't change
+SELECT isomer.route_proposal(1);   -- verified on sample keys, enabled only if measurably faster
 SELECT * FROM isomer.attachment_status();
 ```
 
