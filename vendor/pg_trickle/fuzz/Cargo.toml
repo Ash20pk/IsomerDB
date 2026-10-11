@@ -1,0 +1,95 @@
+[package]
+name = "pg_trickle_fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+# Keep fuzz crate out of the parent workspace
+[workspace]
+
+[package.metadata]
+cargo-fuzz = true
+
+[[bin]]
+name = "api_guard_fuzz"
+path = "fuzz_targets/api_guard_fuzz.rs"
+test = false
+doc = false
+
+# FUZZ-1 (v0.26.0): Cron parser fuzz target.
+[[bin]]
+name = "cron_fuzz"
+path = "fuzz_targets/cron_fuzz.rs"
+test = false
+doc = false
+
+# FUZZ-2 (v0.26.0): GUC string→enum coercion fuzz target.
+[[bin]]
+name = "guc_fuzz"
+path = "fuzz_targets/guc_fuzz.rs"
+test = false
+doc = false
+
+# FUZZ-3 (v0.26.0): CDC trigger payload fuzz target.
+[[bin]]
+name = "cdc_trigger_fuzz"
+path = "fuzz_targets/cdc_trigger_fuzz.rs"
+test = false
+doc = false
+
+# FUZZ-4 (v0.39.0): WAL/SQLSTATE error classifier fuzz target (O39-12).
+[[bin]]
+name = "error_classifier_fuzz"
+path = "fuzz_targets/error_classifier_fuzz.rs"
+test = false
+doc = false
+
+# FUZZ-5 (v0.39.0): DAG/merge SQL / snapshot column-list fuzz target (O39-12).
+[[bin]]
+name = "dag_fuzz"
+path = "fuzz_targets/dag_fuzz.rs"
+test = false
+doc = false
+
+# FUZZ-6 (v0.44.0 / A45-9): sql_builder + parser typed facade fuzz target.
+[[bin]]
+name = "sql_builder_fuzz"
+path = "fuzz_targets/sql_builder_fuzz.rs"
+test = false
+doc = false
+
+# FUZZ-7 (v0.49.0): TEST-10-03 — Merge SQL construction pipeline fuzz target.
+[[bin]]
+name = "merge_sql_fuzz"
+path = "fuzz_targets/merge_sql_fuzz.rs"
+test = false
+doc = false
+
+# FUZZ-8 (v0.49.0): TEST-10-03 — Row identity schema fuzz target.
+[[bin]]
+name = "row_id_fuzz"
+path = "fuzz_targets/row_id_fuzz.rs"
+test = false
+doc = false
+
+# FUZZ-9 (v0.80.0): P-5 — DVM snapshot fingerprint classifier stability.
+[[bin]]
+name = "snapshot_fingerprint_fuzz"
+path = "fuzz_targets/snapshot_fingerprint_fuzz.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "wal_decoder_fuzz"
+path = "fuzz_targets/wal_decoder_fuzz.rs"
+test = false
+doc = false
+
+[dependencies]
+libfuzzer-sys = "0.4"
+pg_trickle = { path = "..", features = [] }
+
+[profile.release]
+opt-level = 3
+debug = true
+overflow-checks = true

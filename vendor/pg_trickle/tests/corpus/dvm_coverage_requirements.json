@@ -1,0 +1,43 @@
+{
+  "format_version": 1,
+  "release": "0.87.14",
+  "required_mandatory_cases": 18,
+  "pairwise_dimensions": {
+    "physical_width": ["minimal", "wide"],
+    "logical_width": ["all", "narrow"],
+    "nullable_key": ["non_null", "nullable"],
+    "aliases": ["plain", "definition_and_reference"]
+  },
+  "generated_coverage": {
+    "total_pairs": 24,
+    "covered_pairs": 24,
+    "uncovered_pairs": []
+  },
+  "semantic_coverage": {
+    "snapshot_plans": ["exact_per_leaf", "exact_combined", "post_change_correction", "unsupported"],
+    "changed_leaf_buckets": ["1", "2", "all"],
+    "group_lifecycle_transitions": ["empty_to_nonempty", "nonempty_to_empty", "winner_change", "nonempty_to_nonempty"],
+    "outer_join_transitions": ["matched_to_unmatched", "unmatched_to_matched"],
+    "require_p0_pairwise": true
+  },
+  "mandatory_cases": [
+    "chained_left_aggregate_ctes",
+    "simultaneous_two_aggregate_leaves",
+    "mixed_algebraic_rescan",
+    "two_rescan_families",
+    "existing_multigroup_min_winner",
+    "existing_multigroup_max_winner",
+    "singleton_empty_repopulate",
+    "nullable_group_key_transition",
+    "cte_definition_reference_aliases",
+    "nested_join_subtree",
+    "full_join_simultaneous_changes",
+    "inner_join_duplicate_matches",
+    "join_and_aggregate_same_cycle",
+    "three_aggregate_leaves",
+    "four_level_left_deep_join",
+    "wide_source_narrow_projection",
+    "inline_subquery_equivalent",
+    "batching_history_equivalent"
+  ]
+}

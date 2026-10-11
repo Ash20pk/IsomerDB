@@ -1,0 +1,89 @@
+# =============================================================================
+# Multi-stage build: compiles pg_trickle from source, then produces a
+# scratch-based extension image for CNPG Image Volume Extensions.
+#
+# The final image contains ONLY the .so, .control, and .sql files — no
+# PostgreSQL server, no OS, no shell.
+#
+# Usage (from project root):
+#   docker build -t pg_trickle-ext:latest -f cnpg/Dockerfile.ext-build .
+#
+# See: https://cloudnative-pg.io/docs/1.28/imagevolume_extensions/
+# =============================================================================
+
+# ── Stage 1: Build the extension ────────────────────────────────────────────
+FROM postgres:18.6 AS builder
+
+# Install build dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        curl \
+        build-essential \
+        libreadline-dev \
+        zlib1g-dev \
+        pkg-config \
+        libssl-dev \
+        libclang-dev \
+        clang \
+        postgresql-server-dev-18 \
+        ca-certificates \
+        git \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Rust toolchain (stable)
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+    | sh -s -- -y --default-toolchain stable
+ENV PATH="/root/.cargo/bin:${PATH}"
+
+# Install cargo-pgrx (must match the version in Cargo.toml)
+RUN cargo install --locked cargo-pgrx --version 0.18.0
+
+# Initialize pgrx for PG 18 using the system pg_config
+RUN cargo pgrx init --pg18 /usr/bin/pg_config
+
+# ── Dependency caching layer ────────────────────────────────────────────────
+WORKDIR /build
+COPY Cargo.toml Cargo.lock ./
+
+RUN mkdir -p src/bin src/dvm/operators benches && \
+    echo '#![allow(warnings)] fn main() {}' > src/bin/pgrx_embed.rs && \
+    echo '#![allow(warnings)]' > src/lib.rs && \
+    echo '' > src/dvm/mod.rs && \
+    echo '' > src/dvm/operators/mod.rs && \
+    echo '' > src/ivm.rs && \
+    echo 'fn main() {}' > benches/refresh_bench.rs && \
+    echo 'fn main() {}' > benches/diff_operators.rs && \
+    echo 'fn main() {}' > benches/scheduler_bench.rs && \
+    echo 'fn main() {}' > benches/pgvector_bench.rs && \
+    cargo fetch --locked
+
+# ── Build the real extension ────────────────────────────────────────────────
+COPY src/ src/
+COPY verification/ verification/
+COPY pg_trickle.control ./
+
+RUN cargo pgrx package --pg-config /usr/bin/pg_config
+
+# Verify artifacts
+RUN echo "=== Package artifacts ===" && \
+    find target/release/pg_trickle-pg18 -type f && \
+    echo "========================="
+
+# ── Stage 2: Scratch extension image ───────────────────────────────────────
+FROM scratch
+
+# Copy extension shared library
+COPY --from=builder \
+    /build/target/release/pg_trickle-pg18/usr/lib/postgresql/18/lib/ \
+    /lib/
+
+# Copy extension control + SQL migration files
+COPY --from=builder \
+    /build/target/release/pg_trickle-pg18/usr/share/postgresql/18/extension/ \
+    /share/extension/
+
+COPY sql/pg_trickle--*--*.sql /share/extension/
+
+# OCI image labels
+LABEL org.opencontainers.image.title="pg_trickle-ext" \
+      org.opencontainers.image.description="pg_trickle extension for CloudNativePG Image Volume Extensions" \
+      org.opencontainers.image.licenses="Apache-2.0"

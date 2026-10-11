@@ -1,0 +1,68 @@
+# =============================================================================
+# Lint Workflow — Fast fmt + clippy gate on every push/PR
+#
+# This is the only automatic workflow that runs on code changes.
+# Full builds are available via the manual Build or CI workflows.
+# =============================================================================
+name: Lint
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - '**/*.md'
+      - 'docs/**'
+      - 'LICENSE'
+      - '.gitignore'
+      - 'PLAN*.md'
+      - 'REPORT*.md'
+      - 'adrs/**'
+      - 'plans/**'
+      - 'coverage/**'
+      - 'cnpg/**'
+  pull_request:
+    branches: [main]
+    paths-ignore:
+      - '**/*.md'
+      - 'docs/**'
+      - 'LICENSE'
+      - '.gitignore'
+      - 'PLAN*.md'
+      - 'REPORT*.md'
+      - 'adrs/**'
+      - 'plans/**'
+      - 'coverage/**'
+      - 'cnpg/**'
+      - 'scripts/**'
+      - '.github/workflows/**'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  PG_VERSION: "18"
+
+jobs:
+  lint:
+    name: Lint (fmt + clippy)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Setup pgrx environment
+        uses: ./.github/actions/setup-pgrx
+
+      - name: Check formatting
+        run: cargo fmt -- --check
+
+      - name: Run clippy
+        run: cargo clippy --all-targets --features pg18 -- -D warnings
+
+      - name: Check dynamic SQL builders
+        run: bash scripts/check_sql_builder.sh
+
+      - name: Check fuzz inventory
+        run: python3 scripts/check_fuzz_targets.py

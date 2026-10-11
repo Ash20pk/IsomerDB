@@ -1,0 +1,203 @@
+name: Setup pgrx build environment
+description: >
+  Install Rust toolchain, cargo-pgrx 0.18.0, and PostgreSQL 18 build support.
+  Works on Linux, macOS, and Windows runners with either system-managed or
+  pgrx-managed PostgreSQL.
+
+inputs:
+  rust-toolchain:
+    description: Rust toolchain version
+    default: stable
+  pg-version:
+    description: PostgreSQL major version
+    default: "18"
+  pg-install-mode:
+    description: PostgreSQL provisioning mode for pgrx (`system` or `download`)
+    default: system
+
+runs:
+  using: composite
+  steps:
+    # ── Rust toolchain ────────────────────────────────────────────────────
+    # On Windows runners, spurious BASH_FUNC_* environment variables are
+    # occasionally injected by prior steps, causing dtolnay/rust-toolchain
+    # to abort with "bash function injection" errors.
+    # See https://github.com/actions/partner-runner-images/issues/169
+    - name: Remove spurious BASH_FUNC_ env vars (Windows)
+      if: runner.os == 'Windows'
+      shell: pwsh
+      run: |
+        $removed = @()
+        Get-ChildItem -Path Env: | Where-Object { $_.Name -like 'BASH_FUNC_*' } | ForEach-Object {
+          [Environment]::SetEnvironmentVariable($_.Name, $null, [EnvironmentVariableTarget]::Process)
+          $removed += $_.Name
+        }
+        if ($removed.Count -gt 0) {
+          Write-Host "Removed BASH_FUNC_ env vars: $($removed -join ', ')"
+        } else {
+          Write-Host "No BASH_FUNC_ env vars found"
+        }
+
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@master
+      with:
+        toolchain: ${{ inputs.rust-toolchain }}
+        components: clippy, rustfmt
+
+    - name: Install cargo-nextest
+      uses: taiki-e/install-action@nextest
+
+    # ── Caching ───────────────────────────────────────────────────────────
+    # Note: Swatinem/rust-cache@v2 is NOT used here because it references
+    # the 'matrix' context internally, which is unavailable in composite
+    # actions and causes GitHub Actions workflow validation to fail.
+    - name: Cache cargo registry
+      uses: actions/cache@v5
+      with:
+        path: |
+          ~/.cargo/registry/index
+          ~/.cargo/registry/cache
+          ~/.cargo/git/db
+        key: v1-cargo-registry-${{ runner.os }}-${{ env.ImageOS || 'unknown' }}-${{ hashFiles('**/Cargo.lock') }}
+        restore-keys: |
+          v1-cargo-registry-${{ runner.os }}-${{ env.ImageOS || 'unknown' }}-
+          v1-cargo-registry-${{ runner.os }}-
+
+    - name: Cache cargo build artifacts
+      uses: actions/cache@v5
+      with:
+        path: target
+        # v3: drop restore-keys fallback. Restoring a stale oversized cache
+        # from a different branch/commit (via the fallback prefix match) was
+        # causing 40+ minute hangs because the target/ dir reaches 30 GB+.
+        # On a cache miss we now compile fresh (15-20 min) rather than
+        # spending longer downloading an irrelevant stale cache.
+        key: v3-cargo-build-pgrx0.18-${{ runner.os }}-${{ runner.arch }}-${{ env.ImageOS || 'unknown' }}-${{ hashFiles('**/Cargo.lock') }}
+
+    - name: Cache cargo-pgrx binary
+      id: cache-cargo-pgrx
+      uses: actions/cache@v5
+      with:
+        path: |
+          ~/.cargo/bin/cargo-pgrx
+          ~/.cargo/bin/cargo-pgrx.exe
+          ~/.cargo/.crates2.json
+          ~/.cargo/.crates.toml
+        key: v3-cargo-pgrx-bin-0.18.0-${{ runner.os }}-${{ runner.arch }}-${{ env.ImageOS || 'unknown' }}
+        # Aggressive fallback to avoid 20-25 min recompilation on runner image updates.
+        # GitHub GHA runner images update periodically (e.g. ubuntu-20.04 → ubuntu-24.04),
+        # which changes env.ImageOS and breaks the exact cache key.
+        # 
+        # cargo-pgrx is a statically-linked CLI tool, so binaries are forward-compatible
+        # across runner image updates on the same OS/architecture. We restore in order:
+        # 1. Same OS+arch, any ImageOS (primary fallback for runner image updates)
+        # 2. Same OS+arch, any version of cargo-pgrx (fallback if pgrx upgrades)
+        # 3. Same OS only (broadest fallback, works for amd64→arm64 in theory but less ideal)
+        restore-keys: |
+          v3-cargo-pgrx-bin-0.18.0-${{ runner.os }}-${{ runner.arch }}-
+          v3-cargo-pgrx-bin-${{ runner.os }}-${{ runner.arch }}-
+          v3-cargo-pgrx-bin-${{ runner.os }}-
+
+    - name: Cache pgrx home directory (~/.pgrx)
+      id: cache-pgrx-home
+      uses: actions/cache@v5
+      with:
+        path: ~/.pgrx
+        key: pgrx-home-${{ runner.os }}-${{ runner.arch }}-${{ env.ImageOS || 'unknown' }}-pg${{ inputs.pg-version }}-${{ inputs.pg-install-mode }}-pgrx0.18.0
+        # Fallback to any runner image version (survives ubuntu-latest image updates)
+        restore-keys: |
+          pgrx-home-${{ runner.os }}-${{ runner.arch }}-${{ env.ImageOS || 'unknown' }}-pg${{ inputs.pg-version }}-${{ inputs.pg-install-mode }}-
+          pgrx-home-${{ runner.os }}-${{ runner.arch }}-pg${{ inputs.pg-version }}-${{ inputs.pg-install-mode }}-
+
+    # ── PostgreSQL headers (Linux) ────────────────────────────────────────
+    - name: Install PostgreSQL ${{ inputs.pg-version }} (Linux)
+      if: runner.os == 'Linux' && inputs.pg-install-mode == 'system'
+      shell: bash
+      run: |
+        # Remove Microsoft APT sources that intermittently return 403 on
+        # GitHub-hosted ubuntu-latest runners, causing apt-get update to fail.
+        sudo rm -f /etc/apt/sources.list.d/microsoft-prod.* \
+                   /etc/apt/sources.list.d/azure-cli.*
+        sudo apt-get update -qq
+        sudo apt-get install -y -qq curl ca-certificates gnupg lsb-release >/dev/null
+
+        # Add PGDG repository
+        sudo install -d /usr/share/postgresql-common/pgdg
+        sudo curl -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc \
+          --fail -sS https://www.postgresql.org/media/keys/ACCC4CF8.asc
+        echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] \
+          https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" \
+          | sudo tee /etc/apt/sources.list.d/pgdg.list >/dev/null
+
+        sudo apt-get update -qq
+        sudo apt-get install -y -qq \
+          postgresql-${{ inputs.pg-version }} \
+          postgresql-server-dev-${{ inputs.pg-version }} >/dev/null
+
+        # Make pg_config available on PATH
+        echo "/usr/lib/postgresql/${{ inputs.pg-version }}/bin" >> "$GITHUB_PATH"
+
+    - name: Install PostgreSQL source build dependencies (Linux)
+      if: runner.os == 'Linux' && inputs.pg-install-mode == 'download'
+      shell: bash
+      run: |
+        # Remove Microsoft APT sources that intermittently return 403 on
+        # GitHub-hosted ubuntu-latest runners, causing apt-get update to fail.
+        sudo rm -f /etc/apt/sources.list.d/microsoft-prod.* \
+                   /etc/apt/sources.list.d/azure-cli.*
+        sudo apt-get update -qq
+        sudo apt-get install -y -qq \
+          bison \
+          flex \
+          libreadline-dev \
+          zlib1g-dev >/dev/null
+
+    # ── PostgreSQL headers (macOS) ────────────────────────────────────────
+    - name: Install PostgreSQL ${{ inputs.pg-version }} (macOS)
+      if: runner.os == 'macOS' && inputs.pg-install-mode == 'system'
+      shell: bash
+      run: |
+        brew install --quiet postgresql@${{ inputs.pg-version }} || true
+        PG_PREFIX="$(brew --prefix postgresql@${{ inputs.pg-version }})"
+        echo "${PG_PREFIX}/bin" >> "$GITHUB_PATH"
+
+    # ── PostgreSQL headers (Windows) ──────────────────────────────────────
+    # Windows: no system pg_config needed — pgrx init uses 'download' mode
+    # which compiles PostgreSQL from source inside ~/.pgrx (cached above).
+
+    # ── cargo-pgrx ────────────────────────────────────────────────────────
+    - name: Ensure cargo-pgrx is available
+      shell: bash
+      run: |
+        if command -v cargo-pgrx >/dev/null 2>&1; then
+          cargo pgrx --version
+          exit 0
+        fi
+
+        cargo install --locked cargo-pgrx --version 0.18.0
+        cargo pgrx --version
+
+    # ── pgrx init ─────────────────────────────────────────────────────────
+    - name: Initialize pgrx for PostgreSQL ${{ inputs.pg-version }}
+      if: steps.cache-pgrx-home.outputs.cache-hit != 'true'
+      shell: bash
+      run: |
+        if [ "${{ runner.os }}" = "Windows" ] || [ "${{ inputs.pg-install-mode }}" = "download" ]; then
+          # Windows and download mode use a pgrx-managed PostgreSQL install.
+          cargo pgrx init --pg${{ inputs.pg-version }} download
+        else
+          PG_CONFIG_PATH="$(which pg_config 2>/dev/null || echo pg_config)"
+          echo "Using pg_config at: ${PG_CONFIG_PATH}"
+          "${PG_CONFIG_PATH}" --version
+          cargo pgrx init --pg${{ inputs.pg-version }} "${PG_CONFIG_PATH}"
+        fi
+
+    - name: Add configured PostgreSQL binaries to PATH
+      shell: bash
+      run: |
+        PGRX_PREFIX="$(cargo pgrx info path pg${{ inputs.pg-version }})"
+        echo "${PGRX_PREFIX}/bin" >> "$GITHUB_PATH"
+
+    - name: Verify pgrx environment
+      shell: bash
+      run: cargo pgrx info path pg${{ inputs.pg-version }}

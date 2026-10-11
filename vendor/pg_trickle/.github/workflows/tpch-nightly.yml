@@ -1,0 +1,85 @@
+# =============================================================================
+# TPC-H Nightly — TEST-10: correctness at SF-1 and SF-10
+#
+# Separated from ci.yml because these jobs can take up to ~3 hours each and
+# must not block PRs or push-to-main gating.  They run daily and on manual
+# dispatch, matching the pattern established by stability-tests.yml.
+#
+#   SF-1  (150K orders, 3 cycles): timeout 180 min — all 15 tests
+#   SF-10 (1.5M orders, 2 cycles): timeout 120 min — differential_correctness only
+#
+# SF-10 runs only test_tpch_differential_correctness because:
+#   - 22 TPC-H queries × 2 cycles at 1.5M orders totals ~36 min per test function
+#   - Running all 15 tests would require ~8.7 hours — far beyond any sane timeout
+#   - SF-1 already covers all 15 tests for broad correctness coverage
+#   - SF-10 adds scale-factor coverage: hash collisions, sort spill, plan changes
+#
+# Per-test hard limit: nextest slow-timeout 90 min (terminate-after=1) prevents
+# any single test from hanging indefinitely (e.g., WAL/disk exhaustion during
+# initial materialisation of 6M-lineitem queries).
+# =============================================================================
+name: TPC-H Nightly
+
+on:
+  schedule:
+    - cron: '0 5 * * *'  # Daily 05:00 UTC (after ci.yml at 03:00)
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  NEXTEST_PROFILE: ci
+  PG_VERSION: "18"
+
+jobs:
+  # ── TEST-10: TPC-H nightly at SF-1 and SF-10 ─────────────────────────
+  # Runs TPC-H correctness tests at higher scale factors to catch issues
+  # that only manifest with larger datasets (hash collisions, sort spill,
+  # parallel execution). SF-10 also serves as a performance soak test.
+  tpch-nightly:
+    name: TPC-H nightly (${{ matrix.scale }})
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ matrix.timeout_minutes }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - scale: "SF-1"
+            tpch_scale: "1.0"
+            tpch_cycles: "3"
+            timeout_minutes: 180
+            # SF-1: run all 15 tests — full breadth coverage
+            filter_expr: ""
+          - scale: "SF-10"
+            tpch_scale: "10.0"
+            tpch_cycles: "2"
+            timeout_minutes: 120
+            # SF-10: run only differential correctness — scale coverage without
+            # the 8.7-hour workload of all 15 tests.  SF-1 covers the rest.
+            filter_expr: "test(test_tpch_differential_correctness)"
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Setup pgrx environment
+        uses: ./.github/actions/setup-pgrx
+
+      - name: Build E2E Docker image
+        run: ./tests/build_e2e_image.sh
+
+      - name: Run TPC-H at ${{ matrix.scale }}
+        env:
+          TPCH_SCALE: ${{ matrix.tpch_scale }}
+          TPCH_CYCLES: ${{ matrix.tpch_cycles }}
+          TPCH_FILTER: ${{ matrix.filter_expr }}
+        run: |
+          if [ -n "${TPCH_FILTER}" ]; then
+            cargo nextest run --profile ci --test e2e_tpch_tests \
+              --run-ignored all --no-capture \
+              -E "${TPCH_FILTER}"
+          else
+            cargo nextest run --profile ci --test e2e_tpch_tests \
+              --run-ignored all --no-capture
+          fi

@@ -1,0 +1,803 @@
+# =============================================================================
+# Release Workflow — Build release artifacts, publish GitHub Release,
+# and push extension image for CNPG Image Volume Extensions to GHCR.
+#
+# Triggered by a version tag (v*) or a manual candidate qualification run.
+# =============================================================================
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      qualification_only:
+        description: Build and qualify this candidate, retain evidence, and skip all publication jobs.
+        required: false
+        default: false
+        type: boolean
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false  # never cancel a release in progress
+
+env:
+  CARGO_TERM_COLOR: always
+  PG_VERSION: "18"
+  POSTGRESQL_VERSION: "18.6"
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository_owner }}/pg_trickle-ext
+
+permissions:
+  contents: write   # create GitHub Releases
+  packages: write   # push to GHCR
+
+jobs:
+  # ── Pre-flight version checks ────────────────────────────────────────────
+  # Verify that all version references (archive SQL, upgrade script, CI
+  # targets, justfile defaults, test fallbacks) match the Cargo.toml version
+  # before spending time on the multi-platform build matrix.
+  preflight:
+    name: Version sync check
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Check version references are in sync
+        env:
+          QUALIFICATION_ONLY: ${{ inputs.qualification_only }}
+        run: |
+          if [[ "$QUALIFICATION_ONLY" == "true" && "$GITHUB_REF_TYPE" == "tag" ]]; then
+            echo "Qualification-only runs must use a branch ref, not a tag."
+            exit 1
+          fi
+          EXPECTED_TAG="$GITHUB_REF_NAME"
+          if [[ "$QUALIFICATION_ONLY" == "true" ]]; then
+            VERSION="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n1)"
+            EXPECTED_TAG="v${VERSION}"
+          fi
+          ./scripts/check_version_sync.sh --expected-tag "$EXPECTED_TAG"
+
+      - name: Setup pgrx environment (for the DVM release gate's build-dependent checks)
+        uses: ./.github/actions/setup-pgrx
+
+      - name: COR-20 machine-enforced DVM correctness release gate
+        # No --database: this only runs the gate's no-Docker steps
+        # (fmt-check, composition-matrix, coverage-floors, corpus-retention,
+        # shrink-selftest, structural negative-control validation). The
+        # live-database steps (corpus-replay, metamorphic-checks, live
+        # negative-control detection) already ran as part of the PR and
+        # deep-tier gates before this tag was pushed.
+        run: python3 scripts/dvm_release_gate.py
+
+      - name: ROWID-17 machine-enforced V2 release gate
+        run: python3 scripts/row_id_v2_release_gate.py
+
+      - name: v0.89 window-state release gate
+        run: python3 scripts/v0_89_release_gate.py
+
+      - name: v0.90 freshness-controller release gate
+        run: python3 scripts/v0_90_release_gate.py
+
+      - name: v0.96 defaults and diagnosis release gate
+        run: python3 scripts/v0_96_release_gate.py
+
+      - name: v0.98 qualification contract gate
+        run: python3 scripts/v0_98_qualification_gate.py
+
+      - name: v0.103 durable WAL receipt release gate
+        if: github.ref_name == 'v0.103.0'
+        run: python3 scripts/v0_103_release_gate.py
+
+      - name: v0.104 contracts and conformance release gate
+        if: github.ref_name == 'v0.104.0'
+        run: python3 scripts/v0_104_release_gate.py
+
+      - name: v0.105.0 qualification contract release gate
+        if: github.ref_name == 'v0.105.0'
+        run: python3 scripts/v0_105_0_release_gate.py
+
+      - name: v0.105.1 runtime qualification release gate
+        if: github.ref_name == 'v0.105.1'
+        run: python3 scripts/v0_105_1_release_gate.py
+
+      - name: v0.105.2 package and field qualification release gate
+        if: github.ref_name == 'v0.105.2'
+        run: python3 scripts/v0_105_2_release_gate.py
+
+      - name: v0.105.3 DVM and publication qualification release gate
+        if: github.ref_name == 'v0.105.3'
+        run: python3 scripts/v0_105_3_release_gate.py
+
+      - name: v0.107.0 verified support and operator procedures release gate
+        if: github.ref_name == 'v0.107.0'
+        run: python3 scripts/v0_107_0_release_gate.py
+
+      - name: v0.108.0 Graph and Delta conformance release gate
+        if: github.ref_name == 'v0.108.0'
+        run: python3 scripts/v0_108_0_release_gate.py
+
+      - name: v0.108.1 IMMEDIATE cascade consistency release gate
+        if: github.ref_name == 'v0.108.1'
+        run: python3 scripts/v0_108_1_release_gate.py
+
+      - name: v0.108.2 row identity upgrade release gate
+        if: github.ref_name == 'v0.108.2'
+        run: python3 scripts/v0_108_2_release_gate.py
+
+      - name: v0.108.3 projected identity repair release gate
+        if: github.ref_name == 'v0.108.3'
+        run: python3 scripts/v0_108_3_release_gate.py
+
+      - name: v0.108.3 projected identity repair release gate
+        if: github.ref_name == 'v0.108.3'
+        run: python3 scripts/v0_108_3_release_gate.py
+
+      - name: Validate monitoring contract
+        run: python3 scripts/check_monitoring_contract.py
+
+  # ── Build release artifacts for each platform ───────────────────────────
+  build-release:
+    name: Build (${{ matrix.artifact_suffix }})
+    needs: [preflight]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    continue-on-error: ${{ matrix.os == 'windows-2022' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            artifact_suffix: linux-amd64
+            archive_ext: tar.gz
+          - os: ubuntu-24.04-arm
+            artifact_suffix: linux-arm64
+            archive_ext: tar.gz
+          - os: macos-14
+            artifact_suffix: macos-arm64
+            archive_ext: tar.gz
+          - os: windows-2022
+            artifact_suffix: windows-amd64
+            archive_ext: zip
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Setup pgrx environment
+        uses: ./.github/actions/setup-pgrx
+
+      - name: Extract version from tag
+        id: version
+        shell: bash
+        env:
+          QUALIFICATION_ONLY: ${{ inputs.qualification_only }}
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          if [[ "$QUALIFICATION_ONLY" == "true" ]]; then
+            VERSION="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n1)"
+          fi
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "Release version: ${VERSION}"
+
+      - name: Build extension package
+        shell: bash
+        run: |
+          # Use pgrx-managed pg_config to avoid picking up Strawberry Perl's PG11
+          # pg_config on Windows (which appears first on PATH).
+          # 'cargo pgrx info path pg18' returns the installation prefix dir;
+          # the pg_config binary lives under bin/ inside that directory.
+          PG_CONFIG_PATH="$(cargo pgrx info path pg18)/bin/pg_config"
+          cargo pgrx package --pg-config "${PG_CONFIG_PATH}"
+
+
+      - name: Create archive (tar.gz)
+        if: matrix.archive_ext == 'tar.gz'
+        shell: bash
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          ARCHIVE_NAME="pg_trickle-${VERSION}-pg${PG_VERSION}-${{ matrix.artifact_suffix }}"
+          mkdir -p "dist/${ARCHIVE_NAME}/lib" "dist/${ARCHIVE_NAME}/extension"
+
+          # Find pgrx package output
+          PKG_DIR=$(find target/release -maxdepth 1 -name 'pg_trickle-pg*' -type d | head -1)
+          if [[ -z "$PKG_DIR" ]]; then
+            echo "ERROR: cannot find pgrx package output"
+            exit 1
+          fi
+
+          # Copy shared library
+          find "${PKG_DIR}" -name '*.so' -o -name '*.dylib' | while read f; do
+            cp "$f" "dist/${ARCHIVE_NAME}/lib/"
+          done
+
+          # Copy extension control + SQL files
+          find "${PKG_DIR}" -name '*.control' -o -name '*.sql' | while read f; do
+            cp "$f" "dist/${ARCHIVE_NAME}/extension/"
+          done
+
+          # Copy docs
+          cp README.md LICENSE INSTALL.md "dist/${ARCHIVE_NAME}/" 2>/dev/null || true
+
+          test -z "${RUSTFLAGS:-}"
+          printf '{"candidate_commit":"%s","build_kind":"exact-release","feature_scope":"default-release","build_provenance":{"workflow":"release.yml","cargo_profile":"release","instrumentation":"none"}}\n' \
+            "$GITHUB_SHA" > "dist/${ARCHIVE_NAME}/release-candidate.json"
+
+          cd dist
+          tar czf "${ARCHIVE_NAME}.tar.gz" "${ARCHIVE_NAME}"
+          echo "Archive: ${ARCHIVE_NAME}.tar.gz ($(du -h "${ARCHIVE_NAME}.tar.gz" | cut -f1))"
+
+      - name: Archive full SQL for future upgrade diffs
+        if: matrix.archive_ext == 'tar.gz' && matrix.artifact_suffix == 'linux-amd64'
+        shell: bash
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          PKG_DIR=$(find target/release -maxdepth 1 -name 'pg_trickle-pg*' -type d | head -1)
+          FULL_SQL=$(find "${PKG_DIR}" -name "pg_trickle--${VERSION}.sql" | head -1)
+          if [[ -n "$FULL_SQL" ]]; then
+            mkdir -p sql/archive
+            cp "$FULL_SQL" "sql/archive/pg_trickle--${VERSION}.sql"
+            echo "Archived: sql/archive/pg_trickle--${VERSION}.sql"
+          else
+            echo "WARNING: Full install SQL not found for archiving"
+          fi
+
+      - name: Upload SQL archive artifact
+        if: matrix.archive_ext == 'tar.gz' && matrix.artifact_suffix == 'linux-amd64'
+        uses: actions/upload-artifact@v7
+        with:
+          name: sql-archive
+          path: sql/archive/pg_trickle--*.sql
+          retention-days: 90
+          if-no-files-found: ignore
+
+      - name: Validate packaged version surfaces
+        if: matrix.archive_ext == 'tar.gz' && matrix.artifact_suffix == 'linux-amd64'
+        shell: bash
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          PKG_DIR=$(find target/release -maxdepth 1 -name 'pg_trickle-pg*' -type d | head -1)
+          ARCHIVE_PATH="dist/pg_trickle-${VERSION}-pg${PG_VERSION}-${{ matrix.artifact_suffix }}.tar.gz"
+          ./scripts/check_version_sync.sh --package-dir "$PKG_DIR" --archive "$ARCHIVE_PATH"
+
+      - name: Create archive (zip)
+        if: matrix.archive_ext == 'zip'
+        shell: pwsh
+        run: |
+          $version = "${{ steps.version.outputs.version }}"
+          $archiveName = "pg_trickle-${version}-pg${{ env.PG_VERSION }}-${{ matrix.artifact_suffix }}"
+          New-Item -ItemType Directory -Path "dist\${archiveName}\lib" -Force
+          New-Item -ItemType Directory -Path "dist\${archiveName}\extension" -Force
+
+          $pkgDir = Get-ChildItem -Path "target\release" -Directory -Filter "pg_trickle-pg*" | Select-Object -First 1
+          if (-not $pkgDir) {
+            Write-Error "Cannot find pgrx package output"
+            exit 1
+          }
+
+          # Copy DLL
+          Get-ChildItem -Path $pkgDir.FullName -Recurse -Filter "*.dll" | ForEach-Object {
+            Copy-Item $_.FullName "dist\${archiveName}\lib\"
+          }
+
+          # Copy control + SQL
+          Get-ChildItem -Path $pkgDir.FullName -Recurse -Include "*.control","*.sql" | ForEach-Object {
+            Copy-Item $_.FullName "dist\${archiveName}\extension\"
+          }
+
+          # Copy docs
+          Copy-Item README.md, LICENSE, INSTALL.md "dist\${archiveName}\" -ErrorAction SilentlyContinue
+
+          if ($env:RUSTFLAGS) { throw "release builds must not set RUSTFLAGS" }
+          '{"candidate_commit":"${{ github.sha }}","build_kind":"exact-release","feature_scope":"default-release","build_provenance":{"workflow":"release.yml","cargo_profile":"release","instrumentation":"none"}}' |
+            Set-Content -Path "dist\${archiveName}\release-candidate.json" -NoNewline
+
+          Compress-Archive -Path "dist\${archiveName}" -DestinationPath "dist\${archiveName}.zip"
+          Write-Host "Archive: ${archiveName}.zip"
+
+      - name: Upload release artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-${{ matrix.artifact_suffix }}
+          path: dist/*.${{ matrix.archive_ext }}
+          retention-days: 30
+          if-no-files-found: error
+
+  # ── Smoke-test the Linux release artifact ───────────────────────────────
+  test-release:
+    name: Test release artifact
+    needs: build-release
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Download Linux artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: release-linux-amd64
+          path: dist/
+
+      - name: Extract artifact
+        run: |
+          cd dist
+          tar xzf *.tar.gz
+          # Rename to fixed path so Dockerfile.ext can reference it
+          mv pg_trickle-*-linux-amd64 artifact
+          ls -la artifact/lib/ artifact/extension/
+
+      - name: Extract version from tag
+        id: version
+        env:
+          QUALIFICATION_ONLY: ${{ inputs.qualification_only }}
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          if [[ "$QUALIFICATION_ONLY" == "true" ]]; then
+            VERSION="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n1)"
+          fi
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Build extension image
+        run: |
+          docker build \
+            --build-arg REPO_URL=${{ github.server_url }}/${{ github.repository }} \
+            --build-arg VERSION=${{ steps.version.outputs.version }} \
+            -t pg_trickle-ext:test \
+            -f cnpg/Dockerfile.ext \
+            dist/
+
+      - name: Verify extension image layout
+        run: |
+          # The extension image is scratch-based (no shell, no PostgreSQL).
+          # Verify the file layout matches the CNPG Image Volume spec:
+          #   /lib/pg_trickle.so
+          #   /share/extension/pg_trickle.control
+          #   /share/extension/pg_trickle--<ver>.sql
+          ID=$(docker create pg_trickle-ext:test true)
+          mkdir -p /tmp/ext-verify
+          docker cp "$ID:/lib/" /tmp/ext-verify/lib/
+          docker cp "$ID:/share/" /tmp/ext-verify/share/
+          docker rm "$ID"
+
+          echo "=== Extension image contents ==="
+          find /tmp/ext-verify -type f
+          echo "==============================="
+
+          # Verify required files exist
+          test -f /tmp/ext-verify/lib/pg_trickle.so
+          test -f /tmp/ext-verify/share/extension/pg_trickle.control
+          ls /tmp/ext-verify/share/extension/pg_trickle--*.sql
+
+          # Verify image size is reasonable (< 50 MB)
+          SIZE=$(docker image inspect pg_trickle-ext:test --format='{{.Size}}')
+          echo "Image size: ${SIZE} bytes"
+          if [[ "$SIZE" -gt 52428800 ]]; then
+            echo "WARNING: Extension image is larger than expected (> 50 MB)"
+          fi
+
+          echo "Extension image layout verified!"
+
+      - name: SQL smoke test (composite image)
+        run: |
+          # Build a temporary composite image to verify the extension
+          # actually works with PostgreSQL. This image is NOT shipped.
+          cat > /tmp/Dockerfile.smoke <<'DOCKERFILE'
+          FROM pg_trickle-ext:test AS ext
+          FROM postgres:18.6
+          COPY --from=ext /lib/ /usr/lib/postgresql/18/lib/
+          COPY --from=ext /share/extension/ /usr/share/postgresql/18/extension/
+          DOCKERFILE
+
+          docker build -t pg_trickle_smoketest -f /tmp/Dockerfile.smoke .
+
+          docker run -d --name smoketest \
+            -e POSTGRES_PASSWORD=test \
+            -e POSTGRES_HOST_AUTH_METHOD=trust \
+            -p 5432:5432 \
+            pg_trickle_smoketest \
+            postgres -c "shared_preload_libraries=pg_trickle"
+
+          echo "Waiting for PostgreSQL..."
+          ready_streak=0
+          for i in $(seq 1 30); do
+            if docker exec smoketest pg_isready -U postgres 2>/dev/null; then
+              ready_streak=$((ready_streak + 1))
+              if [[ "$ready_streak" -ge 3 ]]; then
+                break
+              fi
+            else
+              ready_streak=0
+            fi
+            sleep 1
+          done
+
+          if [[ "$ready_streak" -lt 3 ]]; then
+            echo "ERROR: PostgreSQL did not become ready"
+            docker logs smoketest
+            exit 1
+          fi
+
+          docker exec smoketest psql -U postgres -c "CREATE EXTENSION pg_trickle;"
+          docker exec smoketest psql -U postgres -c \
+            "SELECT extname, extversion FROM pg_extension WHERE extname = 'pg_trickle';"
+          docker exec smoketest psql -U postgres -c "SHOW pg_trickle.enabled;"
+          docker exec smoketest psql -U postgres -c "SELECT * FROM pgtrickle.pgt_status();"
+
+          docker exec smoketest psql -v ON_ERROR_STOP=1 -U postgres -c \
+            "CREATE TABLE release_smoke_src (id integer PRIMARY KEY, value text);"
+          docker exec smoketest psql -v ON_ERROR_STOP=1 -U postgres -c \
+            "SELECT pgtrickle.create_stream_table('release_smoke', 'SELECT id, value FROM release_smoke_src', schedule => '1h', refresh_mode => 'FULL');"
+          docker exec smoketest psql -v ON_ERROR_STOP=1 -U postgres -c \
+            "INSERT INTO release_smoke_src VALUES (1, 'smoke');"
+          docker exec smoketest psql -v ON_ERROR_STOP=1 -U postgres -c \
+            "SELECT pgtrickle.refresh_stream_table('release_smoke');"
+          docker exec smoketest psql -v ON_ERROR_STOP=1 -U postgres -tAc \
+            "SELECT count(*) FROM release_smoke;" | grep -qx 1
+
+          echo "Release smoke test passed!"
+
+      - name: Cleanup
+        if: always()
+        run: docker rm -f smoketest 2>/dev/null || true
+
+  # ── Publish GitHub Release ──────────────────────────────────────────────
+  qualification:
+    name: Packaged release qualification
+    needs: [build-release, test-release]
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Setup pgrx environment
+        uses: ./.github/actions/setup-pgrx
+
+      - name: Download release packages
+        uses: actions/download-artifact@v8
+        with:
+          pattern: release-*
+          path: dist/
+
+      - name: Build candidate PostgreSQL image for live workloads
+        run: |
+          ARCHIVE="$(find dist/release-linux-amd64 -maxdepth 1 -name '*.tar.gz' -print -quit)"
+          test -n "$ARCHIVE"
+          mkdir -p candidate
+          tar xzf "$ARCHIVE" -C candidate --strip-components=1
+          test -f candidate/extension/pg_trickle.control
+          test -f candidate/lib/pg_trickle.so
+          docker build -t pg_trickle_release_candidate:local \
+            -f tests/Dockerfile.release-e2e .
+
+      - name: Run contract suites against the exact Linux package
+        id: qualify
+        env:
+          QUALIFICATION_ONLY: ${{ inputs.qualification_only }}
+        run: |
+          set +e
+          mkdir -p qualification-logs/logs qualification-logs/results qualification-logs/raw
+          ARCHIVE="$(find dist/release-linux-amd64 -maxdepth 1 -name '*.tar.gz' -print -quit)"
+          VERSION="${GITHUB_REF_NAME#v}"
+          if [[ "$QUALIFICATION_ONLY" == "true" ]]; then
+            VERSION="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n1)"
+          fi
+          QUALIFICATION="tests/release/v${VERSION}-qualification.json"
+          mapfile -t SUITES < <(python3 -c 'import json, sys; print("\n".join(s["id"] for s in json.load(open(sys.argv[1]))["required_suites"]))' "$QUALIFICATION")
+          FAILED=0
+          for suite in "${SUITES[@]}"; do
+            echo "=== Qualification suite: ${suite} ==="
+            python3 scripts/run_release_suite.py \
+              --qualification "$QUALIFICATION" \
+              --suite "$suite" \
+              --artifact "$ARCHIVE" \
+              --candidate-commit "$GITHUB_SHA" \
+              --log "qualification-logs/logs/${suite}.log" \
+              --result "qualification-logs/results/${suite}.json"
+            if [[ $? -ne 0 ]]; then
+              FAILED=1
+            fi
+          done
+          echo "failed=${FAILED}" >> "$GITHUB_OUTPUT"
+          exit 0
+
+      - name: Run separate unsafe-boundary ASan qualification
+        id: unsafe-asan
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          mkdir -p qualification-logs/unsafe-asan
+          docker build --platform=linux/amd64 \
+            -f tests/Dockerfile.e2e-asan \
+            -t pg_trickle_e2e_asan:contract . 2>&1 | \
+            tee qualification-logs/unsafe-asan/image-build.log
+          PGS_E2E_IMAGE=pg_trickle_e2e_asan:contract \
+            cargo test --test e2e_unsafe_boundary_tests \
+              --features pg18,e2e-unsafe-test-hooks -- --test-threads=1 --nocapture 2>&1 | \
+            tee qualification-logs/unsafe-asan/workloads.log
+
+      - name: Require every declared instrumented case to pass
+        if: always()
+        run: >
+          python3 scripts/v0_108_3_release_gate.py
+          --unsafe-asan-log qualification-logs/unsafe-asan/workloads.log
+
+      - name: Write candidate-bound release evidence
+        if: always()
+        env:
+          QUALIFICATION_ONLY: ${{ inputs.qualification_only }}
+        run: |
+          suite_args=()
+          for result in qualification-logs/results/*.json; do
+            [[ -f "$result" && "$result" != *.installation.json ]] && suite_args+=(--suite-result "$result")
+          done
+          VERSION="${GITHUB_REF_NAME#v}"
+          if [[ "$QUALIFICATION_ONLY" == "true" ]]; then
+            VERSION="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n1)"
+          fi
+          QUALIFICATION="tests/release/v${VERSION}-qualification.json"
+          python3 scripts/release_evidence.py \
+            --output qualification-logs/RELEASE-EVIDENCE.json \
+            --version "${VERSION}" \
+            --candidate-commit "$GITHUB_SHA" \
+            --qualification "$QUALIFICATION" \
+            --capability-manifest docs/capability-manifest.json \
+            --artifact dist/release-*/* \
+            "${suite_args[@]}"
+
+      - name: Retain qualification logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: qualification-evidence
+          path: qualification-logs/
+          retention-days: 30
+          if-no-files-found: error
+
+      - name: Require all qualification suites to pass
+        if: always()
+        run: |
+          if [[ "${{ steps.qualify.outputs.failed }}" != "0" || "${{ steps.unsafe-asan.outcome }}" != "success" ]]; then
+            echo "One or more package or separate instrumented qualification suites failed."
+            exit 1
+          fi
+
+  publish-release:
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.qualification_only != true }}
+    name: Publish GitHub Release
+    needs: [build-release, test-release, qualification]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Download all release artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: artifacts/
+          pattern: release-*
+
+      - name: Download qualification evidence
+        uses: actions/download-artifact@v8
+        with:
+          name: qualification-evidence
+          path: qualification-logs/
+
+      - name: Collect release files
+        run: |
+          python3 scripts/stage_release_assets.py \
+            --evidence-dir qualification-logs \
+            --artifact-dir artifacts \
+            --output-dir release-files
+          echo "Release files:"
+          ls -lh release-files/
+
+      - name: Write release evidence manifest
+        run: |
+          suite_args=()
+          for result in qualification-logs/results/*.json; do
+            [[ -f "$result" && "$result" != *.installation.json ]] && suite_args+=(--suite-result "$result")
+          done
+          QUALIFICATION="tests/release/v${GITHUB_REF_NAME#v}-qualification.json"
+          python3 scripts/release_evidence.py \
+            --output release-files/RELEASE-EVIDENCE.json \
+            --version "${GITHUB_REF_NAME#v}" \
+            --candidate-commit "$GITHUB_SHA" \
+            --qualification "$QUALIFICATION" \
+            --capability-manifest docs/capability-manifest.json \
+            --artifact release-files/pg_trickle-*.tar.gz release-files/pg_trickle-*.zip \
+            "${suite_args[@]}"
+
+      - name: Generate checksums
+        run: |
+          cd release-files
+          sha256sum * > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Extract changelog for this version
+        id: changelog
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          # Extract text between this version's header and the next version header
+          NOTES=$(awk -v ver="$VERSION" '
+            /^## \[/ { if (found) exit; if (index($0, ver)) { found=1; next } }
+            found { print }
+          ' CHANGELOG.md)
+          # Write to step output (multi-line safe)
+          {
+            echo "notes<<EOF"
+            echo "$NOTES"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v3.0.3
+        with:
+          body: ${{ steps.changelog.outputs.notes }}
+          files: |
+            release-files/*
+          draft: false
+          prerelease: ${{ contains(github.ref_name, '-rc') || contains(github.ref_name, '-beta') || contains(github.ref_name, '-alpha') }}
+
+  # ── Publish extension image to GHCR (per-arch, parallel) ──────────────
+  # Builds each arch extension image (scratch-based) from the pre-built
+  # .so artifact — no Rust recompilation. For CNPG Image Volume Extensions.
+  # amd64 and arm64 run in parallel, then a manifest is merged.
+  publish-docker-arch:
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.qualification_only != true }}
+    name: Docker image (${{ matrix.arch }})
+    needs: [build-release, test-release, qualification]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: linux/amd64
+            runner: ubuntu-latest
+            artifact_suffix: linux-amd64
+            platform_tag: amd64
+          - arch: linux/arm64
+            runner: ubuntu-24.04-arm
+            artifact_suffix: linux-arm64
+            platform_tag: arm64
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Download ${{ matrix.artifact_suffix }} artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: release-${{ matrix.artifact_suffix }}
+          path: dist/
+
+      - name: Extract artifact
+        run: |
+          cd dist && tar xzf *.tar.gz
+          # Rename extracted dir to a fixed path for Dockerfile.ext
+          mv pg_trickle-*-${{ matrix.artifact_suffix }} artifact
+          ls -la artifact/lib/ artifact/extension/
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Extract version from tag
+        id: version
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push ${{ matrix.arch }} image
+        uses: docker/build-push-action@v7
+        with:
+          context: dist/
+          file: cnpg/Dockerfile.ext
+          push: true
+          platforms: ${{ matrix.arch }}
+          build-args: |
+            REPO_URL=${{ github.server_url }}/${{ github.repository }}
+            VERSION=${{ steps.version.outputs.version }}
+          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.version }}-${{ matrix.platform_tag }}
+          labels: |
+            org.opencontainers.image.title=pg_trickle-ext
+            org.opencontainers.image.description=pg_trickle extension for CloudNativePG Image Volume Extensions
+            org.opencontainers.image.licenses=Apache-2.0
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # ── Merge per-arch extension images into a single multi-arch manifest ──
+  publish-docker:
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.qualification_only != true }}
+    name: Publish Docker manifest
+    needs: publish-docker-arch
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Extract version from tag
+        id: version
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Create and push multi-arch manifest
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}"
+
+          # Create versioned manifest (e.g. 0.1.0)
+          docker buildx imagetools create \
+            --tag "${IMAGE}:${VERSION}" \
+            "${IMAGE}:${VERSION}-amd64" \
+            "${IMAGE}:${VERSION}-arm64"
+
+          # Also tag major.minor (e.g. 0.1)
+          MINOR="$(echo "${VERSION}" | cut -d. -f1-2)"
+          docker buildx imagetools create \
+            --tag "${IMAGE}:${MINOR}" \
+            "${IMAGE}:${VERSION}-amd64" \
+            "${IMAGE}:${VERSION}-arm64"
+
+          # Tag latest for non-prerelease
+          if [[ "${GITHUB_REF_NAME}" != *"-"* ]]; then
+            docker buildx imagetools create \
+              --tag "${IMAGE}:latest" \
+              "${IMAGE}:${VERSION}-amd64" \
+              "${IMAGE}:${VERSION}-arm64"
+          fi
+
+          echo "Multi-arch manifest created for ${IMAGE}:${VERSION}"
+          docker buildx imagetools inspect "${IMAGE}:${VERSION}"
+
+  # A skipped qualification job does not necessarily make the workflow itself
+  # fail. Make the workflow conclusion fail closed so workflow_run publishers
+  # cannot mistake skipped release gates for a successful release.
+  publication-result:
+    name: Require every release stage to succeed
+    if: always()
+    needs: [build-release, test-release, qualification, publish-release, publish-docker-arch, publish-docker]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Reject failed or skipped release stages
+        env:
+          BUILD: ${{ needs.build-release.result }}
+          SMOKE: ${{ needs.test-release.result }}
+          QUALIFICATION: ${{ needs.qualification.result }}
+          GITHUB_RELEASE: ${{ needs.publish-release.result }}
+          CNPG_IMAGES: ${{ needs.publish-docker-arch.result }}
+          CNPG_MANIFEST: ${{ needs.publish-docker.result }}
+          QUALIFICATION_ONLY: ${{ inputs.qualification_only }}
+        run: |
+          if [[ "$QUALIFICATION_ONLY" == "true" ]]; then
+            for stage in "$BUILD" "$SMOKE" "$QUALIFICATION"; do
+              if [[ "$stage" != "success" ]]; then
+                echo "Qualification-only stage ended as $stage."
+                exit 1
+              fi
+            done
+            for stage in "$GITHUB_RELEASE" "$CNPG_IMAGES" "$CNPG_MANIFEST"; do
+              if [[ "$stage" != "skipped" ]]; then
+                echo "Publication stage ended as $stage during qualification-only run."
+                exit 1
+              fi
+            done
+            echo "Candidate qualification passed; publication jobs were skipped."
+            exit 0
+          fi
+          for stage in "$BUILD" "$SMOKE" "$QUALIFICATION" "$GITHUB_RELEASE" "$CNPG_IMAGES" "$CNPG_MANIFEST"; do
+            if [[ "$stage" != "success" ]]; then
+              echo "Release stage ended as $stage; release workflow must not be successful."
+              exit 1
+            fi
+          done

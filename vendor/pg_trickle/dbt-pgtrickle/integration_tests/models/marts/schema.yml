@@ -1,0 +1,145 @@
+version: 2
+
+models:
+  - name: order_totals
+    description: "Aggregated order totals per customer (stream table)"
+    tests:
+      - dbt_pgtrickle.stream_table_healthy:
+          warn_seconds: 600
+    columns:
+      - name: customer_id
+        description: "Customer identifier"
+        tests:
+          - not_null
+          - unique
+      - name: total_amount
+        description: "Sum of all order amounts"
+        tests:
+          - not_null
+      - name: order_count
+        description: "Number of orders"
+        tests:
+          - not_null
+
+  - name: order_extremes
+    description: "Min/max order amounts per customer (stream table, FULL refresh)"
+    tests:
+      - dbt_pgtrickle.stream_table_healthy:
+          warn_seconds: 600
+    columns:
+      - name: customer_id
+        description: "Customer identifier"
+        tests:
+          - not_null
+          - unique
+      - name: max_amount
+        description: "Maximum order amount"
+        tests:
+          - not_null
+      - name: min_amount
+        description: "Minimum order amount"
+        tests:
+          - not_null
+
+  - name: customer_stats
+    description: "Customer statistics (stream table, used for alter flow testing)"
+    tests:
+      - dbt_pgtrickle.stream_table_healthy:
+          warn_seconds: 600
+    columns:
+      - name: customer_id
+        description: "Customer identifier"
+        tests:
+          - not_null
+          - unique
+      - name: total_amount
+        description: "Sum of all order amounts"
+        tests:
+          - not_null
+      - name: order_count
+        description: "Number of orders"
+        tests:
+          - not_null
+
+  - name: order_totals_partitioned
+    description: "Order totals with RANGE partitioning on customer_id (DBT-1 test)"
+    tests:
+      - dbt_pgtrickle.stream_table_healthy:
+          warn_seconds: 600
+    columns:
+      - name: customer_id
+        description: "Customer identifier"
+        tests:
+          - not_null
+      - name: total_amount
+        description: "Sum of all order amounts"
+        tests:
+          - not_null
+      - name: order_count
+        description: "Number of orders"
+        tests:
+          - not_null
+
+  - name: order_totals_fused
+    description: "Order totals with fuse circuit-breaker configured (DBT-2 test)"
+    tests:
+      - dbt_pgtrickle.stream_table_healthy:
+          warn_seconds: 600
+    columns:
+      - name: customer_id
+        description: "Customer identifier"
+        tests:
+          - not_null
+          - unique
+      - name: total_amount
+        description: "Sum of all order amounts"
+        tests:
+          - not_null
+      - name: order_count
+        description: "Number of orders"
+        tests:
+          - not_null
+
+  - name: order_totals_auto
+    description: "Order totals using AUTO refresh mode (TEST-7 regression coverage)"
+    tests:
+      - dbt_pgtrickle.stream_table_healthy:
+          warn_seconds: 600
+    columns:
+      - name: customer_id
+        description: "Customer identifier"
+        tests:
+          - not_null
+          - unique
+      - name: total_amount
+        description: "Sum of all order amounts"
+        tests:
+          - not_null
+      - name: order_count
+        description: "Number of orders"
+        tests:
+          - not_null
+
+  - name: order_totals_compat
+    description: >
+      T-5 (v0.79.0): dbt adapter compatibility matrix model.
+      Used to exercise create, alter, drop, and rebuild flows against the
+      dbt adapter.  Initial schedule is '1m'; the test script changes it to
+      '3m' to exercise the ALTER path, then restores it.
+    tests:
+      - dbt_pgtrickle.stream_table_healthy:
+          warn_seconds: 600
+    columns:
+      - name: customer_id
+        description: "Customer identifier"
+        tests:
+          - not_null
+          - unique
+      - name: total_amount
+        description: "Sum of all order amounts"
+        tests:
+          - not_null
+      - name: order_count
+        description: "Number of orders"
+        tests:
+          - not_null

@@ -1,0 +1,98 @@
+name: docs
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'docs/**'
+      - 'book.toml'
+      - 'INSTALL.md'
+      - 'CHANGELOG.md'
+      - 'ROADMAP.md'
+  workflow_dispatch:
+
+# Only one deployment at a time; cancel in-progress runs on new pushes
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pages:    write
+  id-token: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install mdBook
+        env:
+          MDBOOK_VERSION: "0.4.44"
+        run: |
+          curl -sSL \
+            "https://github.com/rust-lang/mdBook/releases/download/v${MDBOOK_VERSION}/mdbook-v${MDBOOK_VERSION}-x86_64-unknown-linux-gnu.tar.gz" \
+            | tar -xz -C ~/.cargo/bin
+
+      - name: Stage files outside docs/ into docs/ for mdBook
+        run: |
+          cp ESSENCE.md docs/ESSENCE.md
+          cp -r blog docs/blog
+
+      - name: Build documentation
+        run: mdbook build
+
+      - name: Build blog posts as standalone pages
+        run: |
+          mkdir -p /tmp/blog-build/src
+          cp docs/blog/*.md /tmp/blog-build/src/
+          # Generate SUMMARY.md for blog sub-book
+          python3 - << 'PYEOF'
+          import os
+          src = '/tmp/blog-build/src'
+          files = sorted(f for f in os.listdir(src)
+                         if f.endswith('.md') and f not in ('README.md', 'SUMMARY.md'))
+          lines = ['# Summary\n', '\n', '[Blog Index](README.md)\n', '\n']
+          for f in files:
+              title = f  # fallback to filename
+              with open(os.path.join(src, f)) as fp:
+                  for line in fp:
+                      stripped = line.strip()
+                      if stripped.startswith('# '):
+                          title = stripped.lstrip('# ').strip()
+                          break
+              lines.append(f'- [{title}]({f})\n')
+          with open(os.path.join(src, 'SUMMARY.md'), 'w') as fp:
+              fp.writelines(lines)
+          PYEOF
+          cat > /tmp/blog-build/book.toml << 'EOF'
+          [book]
+          src = "src"
+          language = "en"
+          [output.html]
+          site-url = "/pg-trickle/blog/"
+          default-theme = "navy"
+          EOF
+          mdbook build /tmp/blog-build
+          # Merge blog output into the main book output under blog/
+          cp -r /tmp/blog-build/book/. book/blog/
+
+      - name: Configure GitHub Pages
+        uses: actions/configure-pages@v6
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v5
+        with:
+          path: book
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v5

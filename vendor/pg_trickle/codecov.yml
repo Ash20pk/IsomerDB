@@ -1,0 +1,49 @@
+# Codecov configuration
+# https://docs.codecov.com/docs/codecov-yaml
+#
+# pg_trickle is a pgrx extension. Functions annotated #[pg_extern] and all SPI/
+# trigger/WAL/background-worker code execute inside the PostgreSQL server
+# process and cannot be instrumented by cargo-llvm-cov. Coverage is collected
+# from unit tests only (src/dvm/**, src/dag.rs, src/hash.rs, etc.).
+#
+# Consequence: overall project coverage will appear low (~25–35%) for
+# structural reasons unrelated to test quality. We therefore:
+#   - Never fail CI on overall project coverage
+#   - Enforce patch coverage only on the pure-Rust DVM engine and the
+#     pure-logic helpers extracted in v0.60.0 (COR-3, QUAL-3, CI-3).
+
+coverage:
+  status:
+    project:
+      default:
+        informational: true        # never fail CI on overall %
+    patch:
+      dvm-engine:
+        target: 70%
+        paths:
+          - "src/dvm/**"
+          - "src/dag.rs"
+          - "src/hash.rs"
+      # CI-3: Per-module thresholds for pure-logic helpers added in v0.60.0.
+      # These modules now have unit tests for their pure (non-SPI) functions.
+      cdc-pure:
+        target: 50%
+        paths:
+          - "src/cdc/**"
+      hooks:
+        target: 40%
+        paths:
+          - "src/hooks.rs"
+      wal-decoder:
+        target: 40%
+        paths:
+          - "src/wal_decoder.rs"
+
+# Exclude uninstrumentable pgrx boundary modules and non-source paths
+ignore:
+  - "src/api.rs"
+  - "src/scheduler.rs"
+  - "src/shmem.rs"
+  - "src/bin/**"
+  - "tests/**"
+  - "benches/**"

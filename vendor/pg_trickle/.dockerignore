@@ -1,0 +1,39 @@
+target/
+.git/
+.github/
+
+# Docs and generated site
+book/
+docs/
+plans/
+
+# Local/editor/devcontainer metadata
+.devcontainer/
+.vscode/
+.idea/
+
+# Project subtrees not needed for extension build images
+dbt-pgtrickle/
+cnpg/
+tests/*
+scripts/
+
+# Misc large/noisy files
+*.log
+*.tmp
+*.swp
+*.swo
+
+# Keep the specific Dockerfiles used by builds
+!tests/Dockerfile.e2e
+!tests/Dockerfile.e2e-asan
+!tests/fixtures/
+!tests/fixtures/asan_probe.c
+!tests/fixtures/asan_pg18_leak.supp
+!tests/fixtures/initdb-asan-wrapper.sh
+!tests/Dockerfile.e2e-base-lite
+!tests/pg_tide.control
+!tests/pg_tide--0.46.0.sql
+!tests/pg_tide--0.54.0.sql
+!tests/pg_tide--0.53.0.sql
+!cnpg/Dockerfile.ext-build

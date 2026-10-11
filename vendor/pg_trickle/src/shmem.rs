@@ -1,0 +1,2659 @@
+//! Shared memory structures for scheduler↔backend coordination.
+//!
+//! The scheduler background worker and user sessions communicate via shared
+//! memory using lightweight locks (`PgLwLock`) and atomic variables (`PgAtomic`).
+
+use pgrx::prelude::*;
+use pgrx::{PGRXSharedMemory, PgAtomic, PgLwLock, pg_shmem_init};
+use std::sync::atomic::AtomicU64;
+
+/// C2-1 / DEF-4: Maximum number of pgt_ids the invalidation ring buffer can hold.
+///
+/// This is the **compile-time maximum** allocated in shared memory. The effective
+/// capacity is controlled at preload-time by the `pg_trickle.invalidation_ring_capacity`
+/// GUC (default 1,024, range 1–4,096). Increasing the GUC above the default allows
+/// clusters with many concurrent DDL events to avoid full DAG rebuilds.
+///
+/// When more DDL changes arrive between scheduler ticks than the effective capacity,
+/// the overflow flag is set and the scheduler falls back to a full O(V+E) DAG
+/// rebuild. Raised to 4,096 max in v0.55.0 to support larger DDL-burst environments.
+const INVALIDATION_RING_MAX_CAPACITY: usize = 4096;
+
+/// Shared state visible to both the scheduler and user backends.
+///
+/// SCAL-3 (v0.25.0): This struct now holds only DAG-related fields.
+/// Scheduler metadata and tick watermarks have been split into dedicated
+/// `SchedulerMetaState` and `TickWatermarkState` structs to reduce lock
+/// contention.  Read-only paths (e.g., `dag_version` reads) use
+/// `PGS_STATE.share()` without blocking concurrent readers.
+#[derive(Copy, Clone)]
+pub struct PgTrickleSharedState {
+    /// Incremented when the DAG changes (create/alter/drop ST).
+    pub dag_version: u64,
+
+    // ── C2-1: Invalidation ring buffer ───────────────────────────────
+    /// Bounded ring buffer of pgt_ids that need DAG re-evaluation.
+    /// DDL hooks push affected pgt_ids here; the scheduler drains them.
+    inv_ring: [i64; INVALIDATION_RING_MAX_CAPACITY],
+    /// Number of valid entries in the ring buffer (0..=effective_capacity).
+    inv_count: u16,
+    /// When true, more DDL events arrived than the ring can hold.
+    /// The scheduler must do a full O(V+E) DAG rebuild.
+    inv_overflow: bool,
+}
+
+impl Default for PgTrickleSharedState {
+    fn default() -> Self {
+        Self {
+            dag_version: 0,
+            inv_ring: [0; INVALIDATION_RING_MAX_CAPACITY],
+            inv_count: 0,
+            inv_overflow: false,
+        }
+    }
+}
+
+// SAFETY: PgTrickleSharedState is Copy + Clone + Default and contains only
+// primitive types, making it safe for shared memory access under PgLwLock.
+unsafe impl PGRXSharedMemory for PgTrickleSharedState {}
+
+/// SCAL-3 (v0.25.0): Scheduler metadata — split from `PgTrickleSharedState`
+/// to reduce lock contention on the DAG lock path.
+///
+/// Protected by `SCHEDULER_META_STATE` lightweight lock.
+#[derive(Copy, Clone, Default)]
+pub struct SchedulerMetaState {
+    /// PID of the scheduler background worker (0 if not running).
+    pub scheduler_pid: i32,
+    /// Whether the scheduler is currently running.
+    pub scheduler_running: bool,
+    /// Unix timestamp (seconds) of the scheduler's last wake cycle.
+    pub last_scheduler_wake: i64,
+}
+
+// SAFETY: SchedulerMetaState is Copy + Clone + Default with only primitive types.
+unsafe impl PGRXSharedMemory for SchedulerMetaState {}
+
+/// Maximum number of database schedulers tracked in shared memory.
+///
+/// The launcher supports at least this many databases without falling back to
+/// cluster-global state. A full registry is a typed startup failure.
+pub const MAX_DATABASE_SCHEDULERS: usize = 64;
+
+/// Fixed-capacity database key used by scheduler shared state.
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+pub struct DatabaseKey(pub u32);
+
+/// Database-local scheduler state. OID zero denotes an unused slot.
+#[derive(Debug, Copy, Clone, Default)]
+pub struct DatabaseSchedulerSlot {
+    pub database_oid: u32,
+    pub scheduler_pid: i32,
+    pub running: bool,
+    pub last_wake_epoch_secs: i64,
+    pub drain_seen_epoch: u64,
+    pub inline_pgt_id: i64,
+    pub queue_depth: u32,
+    pub last_tick_oldest_xmin: u64,
+    pub last_tick_safe_lsn_u64: u64,
+}
+
+/// Fixed-capacity database scheduler registry.
+#[derive(Debug, Copy, Clone)]
+pub struct DatabaseSchedulerRegistry {
+    pub slots: [DatabaseSchedulerSlot; MAX_DATABASE_SCHEDULERS],
+    pub count: u16,
+}
+
+impl Default for DatabaseSchedulerRegistry {
+    fn default() -> Self {
+        Self {
+            slots: [DatabaseSchedulerSlot::default(); MAX_DATABASE_SCHEDULERS],
+            count: 0,
+        }
+    }
+}
+
+// SAFETY: The registry contains only fixed-size primitive fields.
+unsafe impl PGRXSharedMemory for DatabaseSchedulerRegistry {}
+
+/// Database-scoped scheduler registry.
+// SAFETY: PgLwLock::new requires a static CStr name.
+pub static DATABASE_SCHEDULER_REGISTRY: PgLwLock<DatabaseSchedulerRegistry> =
+    unsafe { PgLwLock::new(c"pg_trickle_database_schedulers") };
+
+/// Find a database slot without taking a lock. Used by pure tests and callers
+/// that already hold the registry lock.
+pub fn database_slot_index(
+    registry: &DatabaseSchedulerRegistry,
+    database_oid: u32,
+) -> Option<usize> {
+    registry
+        .slots
+        .iter()
+        .position(|slot| slot.database_oid == database_oid && database_oid != 0)
+}
+
+/// Insert or refresh a database scheduler slot.
+///
+/// Existing slots are refreshed in place. A full registry returns `false`
+/// without overwriting a live scheduler.
+pub fn register_database_scheduler(database_oid: u32, scheduler_pid: i32) -> bool {
+    if !is_shmem_available() || database_oid == 0 {
+        return false;
+    }
+    let mut registry = DATABASE_SCHEDULER_REGISTRY.exclusive();
+    if let Some(index) = database_slot_index(&registry, database_oid) {
+        let slot = &mut registry.slots[index];
+        slot.scheduler_pid = scheduler_pid;
+        slot.running = true;
+        return true;
+    }
+    let Some(index) = registry
+        .slots
+        .iter()
+        .position(|slot| slot.database_oid == 0)
+    else {
+        return false;
+    };
+    registry.slots[index] = DatabaseSchedulerSlot {
+        database_oid,
+        scheduler_pid,
+        running: true,
+        ..Default::default()
+    };
+    registry.count = registry.count.saturating_add(1);
+    true
+}
+
+/// Clear a database scheduler slot without changing another database's state.
+pub fn unregister_database_scheduler(database_oid: u32, scheduler_pid: i32) {
+    if !is_shmem_available() {
+        return;
+    }
+    let mut registry = DATABASE_SCHEDULER_REGISTRY.exclusive();
+    if let Some(index) = database_slot_index(&registry, database_oid) {
+        let slot = &mut registry.slots[index];
+        if scheduler_pid == 0 || slot.scheduler_pid == scheduler_pid {
+            *slot = DatabaseSchedulerSlot::default();
+            registry.count = registry.count.saturating_sub(1);
+        }
+    }
+}
+
+/// Update one database scheduler slot, preserving all other databases.
+pub fn update_database_scheduler<F>(database_oid: u32, update: F)
+where
+    F: FnOnce(&mut DatabaseSchedulerSlot),
+{
+    if !is_shmem_available() {
+        return;
+    }
+    let mut registry = DATABASE_SCHEDULER_REGISTRY.exclusive();
+    if let Some(index) = database_slot_index(&registry, database_oid) {
+        update(&mut registry.slots[index]);
+    }
+}
+
+/// Snapshot database scheduler slots for diagnostics and drain completion.
+pub fn database_scheduler_slots() -> Vec<DatabaseSchedulerSlot> {
+    if !is_shmem_available() {
+        return Vec::new();
+    }
+    let registry = DATABASE_SCHEDULER_REGISTRY.share();
+    registry
+        .slots
+        .iter()
+        .copied()
+        .filter(|slot| slot.database_oid != 0)
+        .collect()
+}
+
+/// SCAL-3 (v0.25.0): Tick watermark state — split from `PgTrickleSharedState`
+/// to allow the coordinator to update watermarks without taking the DAG
+/// exclusive lock.
+///
+/// Protected by `TICK_WATERMARK_STATE` lightweight lock.
+#[derive(Copy, Clone, Default)]
+pub struct TickWatermarkState {
+    /// The oldest `backend_xmin` (including 2PC) seen at the previous
+    /// scheduler tick. Used by the xmin holdback algorithm to detect
+    /// long-running transactions that span a tick boundary.
+    ///
+    /// 0 means "not yet recorded" (first tick or holdback disabled).
+    pub last_tick_oldest_xmin: u64,
+
+    /// The safe frontier LSN upper bound computed at the last scheduler tick,
+    /// stored as a raw u64 (see `version::lsn_to_u64` / `version::u64_to_lsn`).
+    ///
+    /// Dynamic refresh workers read this value and use it (capped with their
+    /// own current write_lsn) as their tick watermark. 0 means unset.
+    pub last_tick_safe_lsn_u64: u64,
+}
+
+// SAFETY: TickWatermarkState is Copy + Clone + Default with only primitive types.
+unsafe impl PGRXSharedMemory for TickWatermarkState {}
+
+/// Lightweight-lock–protected DAG and invalidation shared state.
+// SAFETY: PgLwLock::new requires a static CStr name for the lock.
+pub static PGS_STATE: PgLwLock<PgTrickleSharedState> =
+    unsafe { PgLwLock::new(c"pg_trickle_state") };
+
+/// SCAL-3 (v0.25.0): Dedicated lock for scheduler metadata (PID, status,
+/// last-wake).  Split from `PGS_STATE` to allow monitoring reads without
+/// blocking DAG operations.
+// SAFETY: PgLwLock::new requires a static CStr name for the lock.
+pub static SCHEDULER_META_STATE: PgLwLock<SchedulerMetaState> =
+    unsafe { PgLwLock::new(c"pg_trickle_scheduler_meta") };
+
+/// SCAL-3 (v0.25.0): Dedicated lock for tick watermark state (xmin, safe LSN).
+/// Split from `PGS_STATE` so the coordinator can update watermarks without
+/// contending with DAG invalidation writes.
+// SAFETY: PgLwLock::new requires a static CStr name for the lock.
+pub static TICK_WATERMARK_STATE: PgLwLock<TickWatermarkState> =
+    unsafe { PgLwLock::new(c"pg_trickle_tick_watermark") };
+
+/// Atomic signal for DAG rebuild. Backends increment this when creating,
+/// altering, or dropping stream tables. The scheduler compares its local
+/// version to detect changes.
+// SAFETY: PgAtomic::new requires a static CStr name.
+pub static DAG_REBUILD_SIGNAL: PgAtomic<AtomicU64> =
+    unsafe { PgAtomic::new(c"pg_trickle_dag_signal") };
+
+/// Atomic generation counter for cross-session cache invalidation (G8.1).
+///
+/// Incremented by any backend that modifies stream table metadata in a way
+/// that would invalidate delta/MERGE template caches (e.g., DDL on source
+/// tables that triggers reinitialize). Each backend tracks its last-seen
+/// generation and flushes its thread-local caches when the shared value
+/// advances.
+// SAFETY: PgAtomic::new requires a static CStr name.
+pub static CACHE_GENERATION: PgAtomic<AtomicU64> =
+    unsafe { PgAtomic::new(c"pg_trickle_cache_gen") };
+
+/// A reserved or live dynamic refresh worker slot.
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+pub struct RefreshWorkerSlot {
+    pub generation: u64,
+    pub database_oid: u32,
+    pub job_id: i64,
+    pub scheduler_pid: i32,
+    pub worker_pid: i32,
+    pub state: WorkerSlotState,
+    pub reserved_at_epoch_ms: u64,
+}
+
+impl Default for RefreshWorkerSlot {
+    fn default() -> Self {
+        Self {
+            generation: 0,
+            database_oid: 0,
+            job_id: 0,
+            scheduler_pid: 0,
+            worker_pid: 0,
+            state: WorkerSlotState::Free,
+            reserved_at_epoch_ms: 0,
+        }
+    }
+}
+
+/// Exact worker lifecycle state. Reservations remain occupied until their
+/// owning coordinator proves that the job can no longer start.
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+pub enum WorkerSlotState {
+    Free,
+    Reserved,
+    Live,
+}
+
+/// Cluster-wide adaptive admission state. The durable worker reservation
+/// table remains authoritative; this state only supplies its bounded target.
+#[derive(Debug, Copy, Clone, Default, Eq, PartialEq)]
+pub struct AdaptiveWorkerState {
+    pub target: u32,
+    pub last_adjust_epoch_ms: u64,
+    /// -1 means shrink, 1 means grow, and 0 means no pending signal.
+    pub signal: i8,
+    pub consecutive: u8,
+    pub cpu_percent: u8,
+    pub cpu_valid: bool,
+    pub feasible_at_risk: u32,
+    pub queue_depth: u32,
+}
+
+// SAFETY: AdaptiveWorkerState contains only fixed-size primitive fields.
+unsafe impl PGRXSharedMemory for AdaptiveWorkerState {}
+
+/// Fixed-capacity worker reservation table and adaptive admission state.
+#[derive(Debug, Copy, Clone)]
+pub struct WorkerSlotTable {
+    pub slots: [RefreshWorkerSlot; 128],
+    pub adaptive: AdaptiveWorkerState,
+}
+
+impl Default for WorkerSlotTable {
+    fn default() -> Self {
+        Self {
+            slots: [RefreshWorkerSlot::default(); 128],
+            adaptive: AdaptiveWorkerState::default(),
+        }
+    }
+}
+
+// SAFETY: The worker table contains only fixed-size primitive fields.
+unsafe impl PGRXSharedMemory for WorkerSlotTable {}
+
+/// Serializes worker reservation and adaptive target transitions.
+// SAFETY: PgLwLock::new requires a static CStr name.
+pub static WORKER_SLOT_TABLE: PgLwLock<WorkerSlotTable> =
+    unsafe { PgLwLock::new(c"pg_trickle_worker_slots") };
+
+/// Snapshot of configured and effective worker capacity for one dispatch tick.
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+pub struct WorkerCapacity {
+    pub pgtrickle_dynamic_limit: u32,
+    pub pgtrickle_parallel_limit: Option<u32>,
+    pub postgres_parallel_limit: u32,
+    pub effective_limit: u32,
+}
+
+impl WorkerCapacity {
+    pub fn new(
+        pgtrickle_dynamic_limit: u32,
+        pgtrickle_parallel_limit: Option<u32>,
+        postgres_parallel_limit: u32,
+    ) -> Self {
+        let mut effective_limit = pgtrickle_dynamic_limit;
+        if let Some(limit) = pgtrickle_parallel_limit.filter(|limit| *limit > 0) {
+            effective_limit = effective_limit.min(limit);
+        }
+        effective_limit = effective_limit.min(postgres_parallel_limit);
+        Self {
+            pgtrickle_dynamic_limit,
+            pgtrickle_parallel_limit,
+            postgres_parallel_limit,
+            effective_limit,
+        }
+    }
+
+    /// Apply the adaptive target below all existing hard worker limits.
+    pub fn with_adaptive_target(mut self, target: Option<u32>) -> Self {
+        if let Some(target) = target.filter(|target| *target > 0) {
+            self.effective_limit = self.effective_limit.min(target);
+        }
+        self
+    }
+}
+
+/// Return the current adaptive admission target, or the static hard limit when
+/// adaptive workers are disabled or shared memory is unavailable.
+pub fn adaptive_worker_target(
+    enabled: bool,
+    hard_limit: u32,
+    configured_min: u32,
+    configured_max: u32,
+) -> Option<u32> {
+    if !enabled || !is_shmem_available() {
+        return None;
+    }
+    let hard_limit = hard_limit.max(1);
+    let min = configured_min.max(1).min(hard_limit);
+    let max = configured_max.max(min).min(hard_limit);
+    let table = WORKER_SLOT_TABLE.share();
+    Some(table.adaptive.target.max(min).clamp(min, max))
+}
+
+/// Snapshot adaptive worker diagnostics without exposing the lock guard.
+pub fn adaptive_worker_state() -> AdaptiveWorkerState {
+    if !is_shmem_available() {
+        return AdaptiveWorkerState::default();
+    }
+    WORKER_SLOT_TABLE.share().adaptive
+}
+
+/// Advance the cluster adaptive target after one bounded scheduler sample.
+/// CPU protection wins over growth, and a target moves by at most one worker
+/// after three matching observations.
+#[allow(clippy::too_many_arguments)]
+pub fn adjust_adaptive_worker_target(
+    enabled: bool,
+    hard_limit: u32,
+    configured_min: u32,
+    configured_max: u32,
+    cpu_percent: Option<u8>,
+    feasible_at_risk: u32,
+    queue_depth: u32,
+    active: u32,
+    now_ms: u64,
+) -> AdaptiveWorkerState {
+    if !is_shmem_available() {
+        return AdaptiveWorkerState::default();
+    }
+    let hard_limit = hard_limit.max(1);
+    let min = configured_min.max(1).min(hard_limit);
+    let max = configured_max.max(min).min(hard_limit);
+    let mut table = WORKER_SLOT_TABLE.exclusive();
+    let state = &mut table.adaptive;
+    if state.target == 0 {
+        state.target = min;
+    }
+    state.target = state.target.clamp(min, max);
+    state.cpu_percent = cpu_percent.unwrap_or_default();
+    state.cpu_valid = cpu_percent.is_some();
+    state.feasible_at_risk = feasible_at_risk;
+    state.queue_depth = queue_depth;
+    if !enabled {
+        state.signal = 0;
+        state.consecutive = 0;
+        state.target = max;
+        return *state;
+    }
+
+    let signal = if cpu_percent.is_some_and(|cpu| cpu > 70) {
+        -1
+    } else if feasible_at_risk > 0 || queue_depth > state.target.saturating_mul(2) {
+        1
+    } else if queue_depth == 0 && active == 0 {
+        -1
+    } else {
+        0
+    };
+    if signal == 0 {
+        state.signal = 0;
+        state.consecutive = 0;
+    } else if state.signal == signal {
+        state.consecutive = state.consecutive.saturating_add(1);
+    } else {
+        state.signal = signal;
+        state.consecutive = 1;
+    }
+    if state.consecutive >= 3 {
+        state.target = if signal < 0 {
+            state.target.saturating_sub(1).max(min)
+        } else {
+            state.target.saturating_add(1).min(max)
+        };
+        state.last_adjust_epoch_ms = now_ms;
+        state.signal = 0;
+        state.consecutive = 0;
+    }
+    *state
+}
+
+/// Pure worker-capacity helper used by the scheduler and unit tests.
+pub fn effective_worker_limit(
+    pgtrickle_dynamic_limit: u32,
+    pgtrickle_parallel_limit: Option<u32>,
+    postgres_parallel_limit: u32,
+) -> u32 {
+    WorkerCapacity::new(
+        pgtrickle_dynamic_limit,
+        pgtrickle_parallel_limit,
+        postgres_parallel_limit,
+    )
+    .effective_limit
+}
+
+/// Reserve an exact worker slot.
+pub fn reserve_worker_slot(
+    capacity: WorkerCapacity,
+    database_oid: u32,
+    job_id: i64,
+    scheduler_pid: i32,
+    now_ms: u64,
+) -> Option<RefreshWorkerSlot> {
+    if !is_shmem_available() || capacity.effective_limit == 0 {
+        return None;
+    }
+    let mut table = WORKER_SLOT_TABLE.exclusive();
+    let occupied = table
+        .slots
+        .iter()
+        .filter(|slot| slot.state != WorkerSlotState::Free)
+        .count() as u32;
+    if occupied >= capacity.effective_limit {
+        return None;
+    }
+    let index = table
+        .slots
+        .iter()
+        .position(|slot| slot.state == WorkerSlotState::Free)?;
+    let generation = table.slots[index].generation.wrapping_add(1).max(1);
+    let slot = RefreshWorkerSlot {
+        generation,
+        database_oid,
+        job_id,
+        scheduler_pid,
+        worker_pid: 0,
+        state: WorkerSlotState::Reserved,
+        reserved_at_epoch_ms: now_ms,
+    };
+    table.slots[index] = slot;
+    Some(slot)
+}
+
+/// Bind a durable scheduler job ID to a permit reserved before enqueue.
+pub fn bind_worker_slot(
+    database_oid: u32,
+    scheduler_pid: i32,
+    generation: u64,
+    job_id: i64,
+) -> bool {
+    if !is_shmem_available() {
+        return false;
+    }
+    let mut table = WORKER_SLOT_TABLE.exclusive();
+    if let Some(slot) = table.slots.iter_mut().find(|slot| {
+        slot.database_oid == database_oid
+            && slot.scheduler_pid == scheduler_pid
+            && slot.generation == generation
+            && slot.job_id == 0
+            && slot.state == WorkerSlotState::Reserved
+    }) {
+        slot.job_id = job_id;
+        return true;
+    }
+    false
+}
+
+/// Promote a reservation to a live worker only when its identity matches.
+pub fn promote_worker_slot(
+    database_oid: u32,
+    job_id: i64,
+    generation: u64,
+    worker_pid: i32,
+) -> bool {
+    if !is_shmem_available() {
+        return false;
+    }
+    let mut table = WORKER_SLOT_TABLE.exclusive();
+    if let Some(slot) = table.slots.iter_mut().find(|slot| {
+        slot.database_oid == database_oid
+            && slot.job_id == job_id
+            && slot.generation == generation
+            && slot.state == WorkerSlotState::Reserved
+    }) {
+        slot.worker_pid = worker_pid;
+        slot.state = WorkerSlotState::Live;
+        return true;
+    }
+    false
+}
+
+/// Release a reservation or live slot by its complete generation identity.
+pub fn release_worker_slot(database_oid: u32, job_id: i64, generation: u64) -> bool {
+    if !is_shmem_available() {
+        return false;
+    }
+    let mut table = WORKER_SLOT_TABLE.exclusive();
+    if let Some(slot) = table.slots.iter_mut().find(|slot| {
+        slot.database_oid == database_oid
+            && slot.job_id == job_id
+            && slot.generation == generation
+            && slot.state != WorkerSlotState::Free
+    }) {
+        *slot = RefreshWorkerSlot {
+            generation,
+            ..Default::default()
+        };
+        return true;
+    }
+    false
+}
+
+/// Reclaim live slots whose worker PID disappeared and reservations that
+/// exceeded their bounded startup grace period.
+pub fn reap_stale_worker_slots(
+    database_oid: u32,
+    live_worker_pids: &[i32],
+    live_scheduler_pids: &[i32],
+    queued_job_ids: &[i64],
+) -> u32 {
+    if !is_shmem_available() {
+        return 0;
+    }
+    let mut table = WORKER_SLOT_TABLE.exclusive();
+    let mut reaped = 0;
+    for slot in &mut table.slots {
+        let stale_live = slot.state == WorkerSlotState::Live
+            && slot.worker_pid > 0
+            && !live_worker_pids.contains(&slot.worker_pid);
+        let stale_reservation = slot.state == WorkerSlotState::Reserved
+            && slot.database_oid == database_oid
+            && (!live_scheduler_pids.contains(&slot.scheduler_pid)
+                || !queued_job_ids.contains(&slot.job_id));
+        if stale_live || stale_reservation {
+            let generation = slot.generation;
+            *slot = RefreshWorkerSlot {
+                generation,
+                ..Default::default()
+            };
+            reaped += 1;
+        }
+    }
+    reaped
+}
+
+/// Return exact reserved/live occupancy without inventing free capacity.
+pub fn worker_slot_counts() -> (u32, u32) {
+    if !is_shmem_available() {
+        return (0, 0);
+    }
+    let table = WORKER_SLOT_TABLE.share();
+    let reserved = table
+        .slots
+        .iter()
+        .filter(|slot| slot.state == WorkerSlotState::Reserved)
+        .count() as u32;
+    let live = table
+        .slots
+        .iter()
+        .filter(|slot| slot.state == WorkerSlotState::Live)
+        .count() as u32;
+    (reserved, live)
+}
+
+// ── A46-7 (v0.45.0): Invalidation ring overflow counter ──────────────────
+/// Counts the number of times the invalidation ring overflowed since startup.
+/// Incremented each time a DDL event cannot fit in the ring (capacity exceeded).
+/// Exposed through diagnostics and Prometheus for capacity planning.
+///
+// SAFETY: PgAtomic::new requires a static CStr name.
+pub static INVALIDATION_RING_OVERFLOWS: PgAtomic<AtomicU64> =
+    unsafe { PgAtomic::new(c"pg_trickle_ring_overflows") };
+
+/// Epoch counter incremented each time worker tokens are reconciled after a
+/// crash or abnormal exit. Allows coordinators to detect that reconciliation
+/// happened and re-check their in-flight job state.
+// SAFETY: PgAtomic::new requires a static CStr name.
+pub static RECONCILE_EPOCH: PgAtomic<AtomicU64> =
+    unsafe { PgAtomic::new(c"pg_trickle_reconcile_epoch") };
+
+/// G14-MDED: Total number of differential refreshes executed since server start.
+///
+/// Incremented once per `execute_differential_refresh` call that proceeds past
+/// the no-data short-circuit (i.e., at least one change buffer has rows in the
+/// current frontier window).
+// SAFETY: PgAtomic::new requires a static CStr name.
+pub static TOTAL_DIFF_REFRESHES: PgAtomic<AtomicU64> =
+    unsafe { PgAtomic::new(c"pg_trickle_total_diff_refreshes") };
+
+/// G14-MDED: Number of differential refreshes where the delta required weight
+/// aggregation (deduplication) in the MERGE USING clause.
+///
+/// When `is_deduplicated = false` the DVM cannot prove that each `__pgt_row_id`
+/// appears at most once in the delta, so the MERGE must group + aggregate
+/// before merging. This counter tracks how often that occurs.
+// SAFETY: PgAtomic::new requires a static CStr name.
+pub static DEDUP_NEEDED_REFRESHES: PgAtomic<AtomicU64> =
+    unsafe { PgAtomic::new(c"pg_trickle_dedup_needed_refreshes") };
+
+/// G14-SHC: Number of delta template cache L2 hits (catalog table).
+// SAFETY: PgAtomic::new requires a static CStr name.
+pub static TEMPLATE_CACHE_L2_HITS: PgAtomic<AtomicU64> =
+    unsafe { PgAtomic::new(c"pg_trickle_template_cache_l2_hits") };
+
+/// G14-SHC: Number of delta template cache full misses (DVM re-parse).
+// SAFETY: PgAtomic::new requires a static CStr name.
+pub static TEMPLATE_CACHE_MISSES: PgAtomic<AtomicU64> =
+    unsafe { PgAtomic::new(c"pg_trickle_template_cache_misses") };
+
+/// UX-1 / CACHE-OBS: Number of delta template cache L1 hits (thread-local).
+// SAFETY: PgAtomic::new requires a static CStr name.
+pub static TEMPLATE_CACHE_L1_HITS: PgAtomic<AtomicU64> =
+    unsafe { PgAtomic::new(c"pg_trickle_template_cache_l1_hits") };
+
+/// UX-1 / CACHE-OBS: Number of delta template cache evictions (generation flush).
+// SAFETY: PgAtomic::new requires a static CStr name.
+pub static TEMPLATE_CACHE_EVICTIONS: PgAtomic<AtomicU64> =
+    unsafe { PgAtomic::new(c"pg_trickle_template_cache_evictions") };
+
+/// PERF-006 (v0.73.0): Current estimated bytes used by the per-backend
+/// template cache (gauge).
+// SAFETY: PgAtomic::new requires a static CStr name.
+pub static TEMPLATE_CACHE_BYTES: PgAtomic<AtomicU64> =
+    unsafe { PgAtomic::new(c"pg_trickle_template_cache_bytes") };
+
+/// OPS-10-02: Counter of delta template cache entries evicted because
+/// `defining_query_hash` mismatched (stale entry after ALTER STREAM TABLE
+/// or source schema change).  A sustained spike indicates rapid schema
+/// churn and may predict GROUP_RESCAN fallback storms.
+// SAFETY: PgAtomic::new requires a static CStr name.
+pub static TEMPLATE_CACHE_STALE_EVICTIONS: PgAtomic<AtomicU64> =
+    unsafe { PgAtomic::new(c"pg_trickle_tmpl_stale_evict") };
+
+/// OPS-10-02: Counter of times the DAG cycle detector returned
+/// `Err(CycleDetected)`.  Should always be zero in steady state;
+/// any non-zero value indicates a misconfiguration (circular dependency
+/// created without `allow_circular = on`).
+// SAFETY: PgAtomic::new requires a static CStr name.
+pub static DAG_CYCLES_DETECTED: PgAtomic<AtomicU64> =
+    unsafe { PgAtomic::new(c"pg_trickle_dag_cycles_detected") };
+
+/// #536: Current frontier holdback in LSN bytes (gauge).
+///
+/// Set to 0 when the frontier is not held back.
+/// Set to `write_lsn - safe_lsn` in bytes when a long-running transaction
+/// is preventing the frontier from advancing.
+// SAFETY: PgAtomic::new requires a static CStr name.
+pub static FRONTIER_HOLDBACK_LSN_BYTES: PgAtomic<AtomicU64> =
+    unsafe { PgAtomic::new(c"pg_trickle_frontier_holdback_lsn") };
+
+/// #536: Age (in seconds) of the oldest in-progress transaction contributing
+/// to a frontier holdback (gauge).
+///
+/// Set to 0 when no holdback is active.
+// SAFETY: PgAtomic::new requires a static CStr name.
+pub static FRONTIER_HOLDBACK_AGE_SECS: PgAtomic<AtomicU64> =
+    unsafe { PgAtomic::new(c"pg_trickle_frontier_holdback_age") };
+
+/// PERF-003 (v0.73.0): Total xmin-holdback probe calls.
+// SAFETY: PgAtomic::new requires a static CStr name.
+pub static HOLDBACK_PROBE_CALLS_TOTAL: PgAtomic<AtomicU64> =
+    unsafe { PgAtomic::new(c"pg_trickle_holdback_probe_calls") };
+
+/// PERF-003 (v0.73.0): Total xmin-holdback probe cache hits.
+// SAFETY: PgAtomic::new requires a static CStr name.
+pub static HOLDBACK_PROBE_CACHE_HITS_TOTAL: PgAtomic<AtomicU64> =
+    unsafe { PgAtomic::new(c"pg_trickle_holdback_probe_cache_hits") };
+
+/// PERF-003 (v0.73.0): Cumulative milliseconds spent in holdback probes.
+// SAFETY: PgAtomic::new requires a static CStr name.
+pub static HOLDBACK_PROBE_TOTAL_MS: PgAtomic<AtomicU64> =
+    unsafe { PgAtomic::new(c"pg_trickle_holdback_probe_total_ms") };
+
+/// PERF-003 (v0.73.0): Duration in milliseconds of the most recent holdback probe.
+// SAFETY: PgAtomic::new requires a static CStr name.
+pub static HOLDBACK_PROBE_LAST_MS: PgAtomic<AtomicU64> =
+    unsafe { PgAtomic::new(c"pg_trickle_holdback_probe_last_ms") };
+
+/// PERF-3 (v0.31.0): Counter of IVM lock-mode parse failures.
+///
+/// Incremented each time `IvmLockMode::for_query` falls back to `Exclusive`
+/// because the defining query could not be parsed. Exposed via
+/// `pgtrickle.metrics_summary()` as `ivm_lock_parse_error_count` and via
+/// the Prometheus metrics endpoint.
+///
+/// Operators can use this counter to audit whether IMMEDIATE-mode queries
+/// are taking unnecessarily broad advisory locks.
+// SAFETY: PgAtomic::new requires a static CStr name.
+pub static IVM_LOCK_PARSE_ERRORS: PgAtomic<AtomicU64> =
+    unsafe { PgAtomic::new(c"pg_trickle_ivm_lock_parse_errors") };
+
+/// M-6 (v0.55.0): Cumulative time spent in the DVM parser (milliseconds).
+///
+/// Incremented by `increment_dvm_parse_ms()` each time a query is processed
+/// by the DVM parser.  Exposed as `pg_trickle_dvm_parse_ms` in the Prometheus
+/// metrics endpoint.
+// SAFETY: PgAtomic::new requires a static CStr name.
+pub static DVM_PARSE_MS: PgAtomic<AtomicU64> = unsafe { PgAtomic::new(c"pg_trickle_dvm_parse_ms") };
+
+/// M-6 (v0.55.0): Cumulative size of generated delta SQL (bytes).
+///
+/// Incremented by `increment_delta_query_bytes()` each time delta SQL is
+/// generated.  Exposed as `pg_trickle_delta_query_size_bytes` in the
+/// Prometheus metrics endpoint.
+// SAFETY: PgAtomic::new requires a static CStr name.
+pub static DELTA_QUERY_SIZE_BYTES: PgAtomic<AtomicU64> =
+    unsafe { PgAtomic::new(c"pg_trickle_delta_query_bytes") };
+
+/// A35 (v0.36.0): Drain request epoch counter.
+///
+/// When `pgtrickle.drain()` is called, this counter is incremented to signal
+/// the scheduler to stop accepting new refresh cycles. The scheduler polls
+/// this counter and sets `DRAIN_COMPLETED` to the same epoch once all
+/// in-flight refreshes have finished.
+// SAFETY: PgAtomic::new requires a static CStr name.
+pub static DRAIN_REQUESTED: PgAtomic<AtomicU64> =
+    unsafe { PgAtomic::new(c"pg_trickle_drain_requested") };
+
+/// A35 (v0.36.0): Drain completed epoch counter.
+///
+/// The scheduler sets this to the value of `DRAIN_REQUESTED` once it has
+/// finished all in-flight refreshes. `pgtrickle.is_drained()` returns true
+/// when `DRAIN_COMPLETED >= DRAIN_REQUESTED`.
+// SAFETY: PgAtomic::new requires a static CStr name.
+pub static DRAIN_COMPLETED: PgAtomic<AtomicU64> =
+    unsafe { PgAtomic::new(c"pg_trickle_drain_completed") };
+
+/// Persistent cluster drain phase.
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+pub enum DrainPhase {
+    Running,
+    Draining,
+    Drained,
+}
+
+/// Persistent drain state. A completed or timed-out drain remains a dispatch
+/// gate until an explicit resume or postmaster restart.
+#[derive(Debug, Copy, Clone)]
+pub struct DrainState {
+    pub phase: DrainPhase,
+    pub epoch: u64,
+    pub requested_at_epoch_ms: u64,
+}
+
+impl Default for DrainState {
+    fn default() -> Self {
+        Self {
+            phase: DrainPhase::Running,
+            epoch: 0,
+            requested_at_epoch_ms: 0,
+        }
+    }
+}
+
+// SAFETY: DrainState contains only Copy primitive/enum fields.
+unsafe impl PGRXSharedMemory for DrainState {}
+
+// SAFETY: PgLwLock::new requires a static CStr name.
+pub static DRAIN_STATE: PgLwLock<DrainState> = unsafe { PgLwLock::new(c"pg_trickle_drain_state") };
+
+/// A46-11 (v0.45.0): Cumulative Citus worker failure counter.
+///
+/// Counts the total number of consecutive-failure threshold crossings across
+/// all Citus workers since startup. Unlike the thread-local per-worker counters
+/// in `scheduler/citus.rs`, this counter persists across scheduler restarts
+/// and is exposed through `pgtrickle.preflight()` and diagnostics for
+/// operational visibility.
+// SAFETY: PgAtomic::new requires a static CStr name.
+pub static CITUS_WORKER_FAILURE_TOTAL: PgAtomic<AtomicU64> =
+    unsafe { PgAtomic::new(c"pg_trickle_citus_fail_total") };
+
+/// COR-4 (v0.58.0): Total number of times `compact_change_buffer()` could
+/// not acquire the advisory lock and returned `Contended`.
+///
+/// Exposed as `pg_trickle_cdc_compact_contended_total` via the Prometheus
+/// `/metrics` endpoint so operators can detect persistent lock contention.
+// SAFETY: PgAtomic::new requires a static CStr name.
+pub static CDC_COMPACT_CONTENDED_TOTAL: PgAtomic<AtomicU64> =
+    unsafe { PgAtomic::new(c"pg_trickle_cdc_compact_cnt") };
+
+/// COR-4: Increment the CDC compaction contention counter.
+pub fn increment_cdc_compact_contended() {
+    if !SHMEM_INITIALIZED.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    CDC_COMPACT_CONTENDED_TOTAL
+        .get()
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+// ── OBS-2 (v0.59.0): Parallel worker utilisation metrics ─────────────────
+
+/// OBS-2: Parallel refresh job queue depth.
+///
+/// Incremented when a job is enqueued in `pgt_scheduler_jobs`, decremented
+/// when a pool worker picks it up.  The difference gives the current backlog.
+// SAFETY: PgAtomic::new requires a static CStr name.
+pub static PARALLEL_QUEUE_DEPTH: PgAtomic<AtomicU64> =
+    unsafe { PgAtomic::new(c"pg_trickle_parallel_queue_depth") };
+
+/// v0.87.0: Cumulative scheduler ticks deferred by application load pressure.
+// SAFETY: PgAtomic::new requires a static CStr name.
+pub static LOAD_DEFERRALS_TOTAL: PgAtomic<AtomicU64> =
+    unsafe { PgAtomic::new(c"pg_trickle_load_deferrals_total") };
+
+/// v0.87.0: Latest scheduler load pressure in millionths, for health reporting.
+// SAFETY: PgAtomic::new requires a static CStr name.
+pub static LOAD_PRESSURE_MILLIONTHS: PgAtomic<AtomicU64> =
+    unsafe { PgAtomic::new(c"pg_trickle_load_pressure") };
+
+/// v0.87.0: Current scheduler pressure deferral multiplier.
+// SAFETY: PgAtomic::new requires a static CStr name.
+pub static LOAD_DEFERRAL_FACTOR: PgAtomic<AtomicU64> =
+    unsafe { PgAtomic::new(c"pg_trickle_load_deferral_factor") };
+
+/// v0.87.0: Bounded differential-pipeline counters and high-water marks.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PipelineMetricState {
+    pub direct_small: u64,
+    pub pipelined_large: u64,
+    pub pipelined_amplifying: u64,
+    pub compatibility_fallback: u64,
+    pub batches: u64,
+    pub rows: u64,
+    pub bytes: u64,
+    pub largest_rows: u64,
+    pub largest_bytes: u64,
+    pub oversize_batches: u64,
+}
+
+// SAFETY: PipelineMetricState contains only Copy integer counters.
+unsafe impl PGRXSharedMemory for PipelineMetricState {}
+
+// SAFETY: PgLwLock::new requires a static CStr name.
+pub static PIPELINE_METRICS: PgLwLock<PipelineMetricState> =
+    unsafe { PgLwLock::new(c"pg_trickle_pipeline_metrics") };
+
+/// OBS-2: Cumulative milliseconds pool workers have spent in the idle-wait loop.
+// SAFETY: PgAtomic::new requires a static CStr name.
+pub static WORKER_IDLE_MS_TOTAL: PgAtomic<AtomicU64> =
+    unsafe { PgAtomic::new(c"pg_trickle_worker_idle_ms") };
+
+// ── OBS-3 (v0.59.0): WAL decoder pending-record metric ───────────────────
+
+/// OBS-3: Number of logical-replication records buffered but not yet written
+/// to the CDC change buffer after the last WAL decoder poll cycle.
+///
+/// A sustained non-zero value means the decoder is falling behind the WAL
+/// stream.  Exposed as `pg_trickle_wal_decoder_pending_records`.
+// SAFETY: PgAtomic::new requires a static CStr name.
+pub static WAL_DECODER_PENDING_RECORDS: PgAtomic<AtomicU64> =
+    unsafe { PgAtomic::new(c"pg_trickle_wal_pending") };
+
+// ── OBS-4 (v0.59.0): Refresh-mode ratio counters ─────────────────────────
+
+/// OBS-4: Total DIFFERENTIAL refresh cycles across all stream tables.
+// SAFETY: PgAtomic::new requires a static CStr name.
+pub static REFRESH_MODE_DIFFERENTIAL_TOTAL: PgAtomic<AtomicU64> =
+    unsafe { PgAtomic::new(c"pg_trickle_diff_refresh_total") };
+
+/// OBS-4: Total FULL refresh cycles across all stream tables.
+// SAFETY: PgAtomic::new requires a static CStr name.
+pub static REFRESH_MODE_FULL_TOTAL: PgAtomic<AtomicU64> =
+    unsafe { PgAtomic::new(c"pg_trickle_full_refresh_total") };
+
+/// COR-8 (v0.61.0): Snapshot CTE cache hash collisions detected.
+///
+/// Incremented when `get_or_register_snapshot_cte()` finds a hash hit but
+/// the stored canonical fingerprint does not match the current subtree.
+/// A non-zero value indicates a DefaultHasher collision in the snapshot
+/// cache key computation. Should be zero under normal operation.
+// SAFETY: PgAtomic::new requires a static CStr name.
+pub static SNAPSHOT_CACHE_COLLISIONS: PgAtomic<AtomicU64> =
+    unsafe { PgAtomic::new(c"pg_trickle_snapshot_cache_collisions_total") };
+
+// ── OBS-002 (v0.70.0): History prune error counter ───────────────────────
+
+/// OBS-002: Cumulative count of history prune failures since server start.
+///
+/// Incremented each time the background history retention DELETE encounters
+/// an SPI error. A non-zero value indicates the prune loop is failing and
+/// `pgt_refresh_history` may be growing unbounded.
+/// Exposed via `pgtrickle.history_prune_status()` and Prometheus metrics.
+// SAFETY: PgAtomic::new requires a static CStr name.
+pub static HISTORY_PRUNE_ERRORS: PgAtomic<AtomicU64> =
+    unsafe { PgAtomic::new(c"pg_trickle_history_prune_errors_total") };
+
+/// OBS-002: Increment the history prune error counter.
+pub fn increment_history_prune_errors() {
+    if !SHMEM_INITIALIZED.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    HISTORY_PRUNE_ERRORS
+        .get()
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+// ── SCAL-002 (v0.70.0): Launcher extension-install epoch ────────────────
+
+/// SCAL-002: Monotonic epoch bumped whenever pg_trickle is installed or
+/// removed from a database.  The launcher reads this on every loop and
+/// resets to a fast-poll interval when it detects a change, then backs off
+/// to the steady-state 60-second interval once the epoch is stable.
+// SAFETY: PgAtomic::new requires a static CStr name. Registered via pg_shmem_init!
+// in init_shared_memory(); must stay in sync with the pg_shmem_init! call below.
+pub static LAUNCHER_INSTALL_EPOCH: PgAtomic<AtomicU64> =
+    unsafe { PgAtomic::new(c"pg_trickle_launcher_install_epoch") };
+
+/// PERF-004 / ARCH-003 (v0.73.0): Duration (ms) of the last launcher discovery scan.
+// SAFETY: PgAtomic::new requires a static CStr name.
+pub static LAUNCHER_LAST_SCAN_MS: PgAtomic<AtomicU64> =
+    unsafe { PgAtomic::new(c"pg_trickle_launcher_last_scan_ms") };
+
+/// PERF-004 / ARCH-003 (v0.73.0): Number of databases seen in the last launcher scan.
+// SAFETY: PgAtomic::new requires a static CStr name.
+pub static LAUNCHER_LAST_DB_COUNT: PgAtomic<AtomicU64> =
+    unsafe { PgAtomic::new(c"pg_trickle_launcher_last_db_count") };
+
+/// PERF-004 / ARCH-003 (v0.73.0): Number of active scheduler workers seen in the last launcher scan.
+// SAFETY: PgAtomic::new requires a static CStr name.
+pub static LAUNCHER_LAST_ACTIVE_COUNT: PgAtomic<AtomicU64> =
+    unsafe { PgAtomic::new(c"pg_trickle_launcher_last_active_count") };
+
+/// PERF-004 / ARCH-003 (v0.73.0): Unix epoch seconds of the last launcher scan.
+// SAFETY: PgAtomic::new requires a static CStr name.
+pub static LAUNCHER_LAST_SCAN_EPOCH_SECS: PgAtomic<AtomicU64> =
+    unsafe { PgAtomic::new(c"pg_trickle_launcher_last_scan_epoch") };
+
+/// SCAL-002: Bump the launcher install epoch (called from DDL event trigger).
+pub fn bump_launcher_install_epoch() {
+    if !SHMEM_INITIALIZED.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    LAUNCHER_INSTALL_EPOCH
+        .get()
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+// ── API-1/2 (v0.62.0): Scheduler per-node pause state ───────────────────
+
+/// Maximum number of simultaneously paused stream table nodes.
+const MAX_PAUSED_NODES: usize = 256;
+
+/// Database-qualified paused stream-table identity.
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Default)]
+pub struct PausedNodeEntry {
+    pub database_oid: u32,
+    pub pgt_id: i64,
+}
+
+/// API-1/2 (v0.62.0): Shared set of paused stream table pgt_ids.
+///
+/// Protected by `PAUSED_NODES_STATE` lightweight lock. When a node's pgt_id
+/// is present in this set, the scheduler skips dispatching refreshes for it.
+/// Zero slots are unused (pgt_ids are always > 0).
+#[derive(Copy, Clone)]
+pub struct PausedNodesState {
+    /// Fixed-size array of database-qualified paused nodes.
+    entries: [PausedNodeEntry; MAX_PAUSED_NODES],
+    /// Number of occupied slots.
+    count: u16,
+}
+
+impl Default for PausedNodesState {
+    fn default() -> Self {
+        Self {
+            entries: [PausedNodeEntry::default(); MAX_PAUSED_NODES],
+            count: 0,
+        }
+    }
+}
+
+// SAFETY: PausedNodesState is Copy + Clone + Default with only primitive types.
+unsafe impl PGRXSharedMemory for PausedNodesState {}
+
+/// Lightweight-lock–protected pause set for per-node scheduler control.
+// SAFETY: PgLwLock::new requires a static CStr name.
+pub static PAUSED_NODES_STATE: PgLwLock<PausedNodesState> =
+    unsafe { PgLwLock::new(c"pg_trickle_paused_nodes") };
+
+/// API-1 (v0.62.0): Mark a stream table node as paused.
+///
+/// The scheduler will skip dispatching refreshes for this node until
+/// `resume_node` is called. No-op if already paused or if the pause set
+/// is full (`MAX_PAUSED_NODES` reached).
+pub fn pause_node_for_database(
+    database_oid: u32,
+    pgt_id: i64,
+) -> Result<(), crate::error::PgTrickleError> {
+    if !SHMEM_INITIALIZED.load(std::sync::atomic::Ordering::Relaxed) {
+        return Err(crate::error::PgTrickleError::SharedStateCapacity(
+            "shared memory is not initialized".to_string(),
+        ));
+    }
+    let mut state = PAUSED_NODES_STATE.exclusive();
+    let count = state.count as usize;
+    // Already paused?
+    if state.entries[..count]
+        .iter()
+        .any(|entry| entry.database_oid == database_oid && entry.pgt_id == pgt_id)
+    {
+        return Ok(());
+    }
+    if count >= MAX_PAUSED_NODES {
+        return Err(crate::error::PgTrickleError::SharedStateCapacity(format!(
+            "paused-node registry capacity {} exhausted for database OID {}",
+            MAX_PAUSED_NODES, database_oid
+        )));
+    }
+    state.entries[count] = PausedNodeEntry {
+        database_oid,
+        pgt_id,
+    };
+    state.count = (count + 1) as u16;
+    Ok(())
+}
+
+/// Backward-compatible pause helper for internal callers that do not yet have
+/// a database key. New callers must use `pause_node_for_database`.
+pub fn pause_node(pgt_id: i64) {
+    let _ = pause_node_for_database(0, pgt_id);
+}
+
+/// API-2 (v0.62.0): Remove a stream table node from the paused set.
+///
+/// The scheduler will resume dispatching refreshes for this node on the
+/// next tick. No-op if the node was not paused.
+pub fn resume_node_for_database(database_oid: u32, pgt_id: i64) {
+    if !SHMEM_INITIALIZED.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    let mut state = PAUSED_NODES_STATE.exclusive();
+    let count = state.count as usize;
+    if let Some(pos) = state.entries[..count]
+        .iter()
+        .position(|entry| entry.database_oid == database_oid && entry.pgt_id == pgt_id)
+    {
+        // Swap-remove to keep the array compact.
+        let last = count - 1;
+        state.entries[pos] = state.entries[last];
+        state.entries[last] = PausedNodeEntry::default();
+        state.count = last as u16;
+    }
+}
+
+/// Backward-compatible resume helper for internal callers.
+pub fn resume_node(pgt_id: i64) {
+    resume_node_for_database(0, pgt_id);
+}
+
+/// API-1/2 (v0.62.0): Check whether a stream table node is currently paused.
+pub fn is_node_paused(pgt_id: i64) -> bool {
+    is_node_paused_for_database(0, pgt_id)
+}
+
+/// Check whether a database-qualified stream table node is paused.
+pub fn is_node_paused_for_database(database_oid: u32, pgt_id: i64) -> bool {
+    if !SHMEM_INITIALIZED.load(std::sync::atomic::Ordering::Relaxed) {
+        return false;
+    }
+    let state = PAUSED_NODES_STATE.share();
+    let count = state.count as usize;
+    state.entries[..count]
+        .iter()
+        .any(|entry| entry.database_oid == database_oid && entry.pgt_id == pgt_id)
+}
+
+/// Atomically validate and insert a batch of database-qualified pause entries.
+pub fn pause_nodes_for_database(
+    database_oid: u32,
+    pgt_ids: &[i64],
+) -> Result<(), crate::error::PgTrickleError> {
+    if !SHMEM_INITIALIZED.load(std::sync::atomic::Ordering::Relaxed) {
+        return Err(crate::error::PgTrickleError::SharedStateCapacity(
+            "shared memory is not initialized".to_string(),
+        ));
+    }
+    let mut unique = Vec::with_capacity(pgt_ids.len());
+    for &pgt_id in pgt_ids {
+        if !unique.contains(&pgt_id) {
+            unique.push(pgt_id);
+        }
+    }
+    let mut state = PAUSED_NODES_STATE.exclusive();
+    let existing = unique
+        .iter()
+        .filter(|&&pgt_id| {
+            state.entries[..state.count as usize]
+                .iter()
+                .any(|entry| entry.database_oid == database_oid && entry.pgt_id == pgt_id)
+        })
+        .count();
+    let new_count = unique.len().saturating_sub(existing);
+    if state.count as usize + new_count > MAX_PAUSED_NODES {
+        return Err(crate::error::PgTrickleError::SharedStateCapacity(format!(
+            "paused-node registry capacity {} exhausted for database OID {}",
+            MAX_PAUSED_NODES, database_oid
+        )));
+    }
+    for pgt_id in unique {
+        if !state.entries[..state.count as usize]
+            .iter()
+            .any(|entry| entry.database_oid == database_oid && entry.pgt_id == pgt_id)
+        {
+            let index = state.count as usize;
+            state.entries[index] = PausedNodeEntry {
+                database_oid,
+                pgt_id,
+            };
+            state.count += 1;
+        }
+    }
+    Ok(())
+}
+
+/// Atomically remove a batch of database-qualified pause entries.
+pub fn resume_nodes_for_database(database_oid: u32, pgt_ids: &[i64]) {
+    if !SHMEM_INITIALIZED.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    let mut state = PAUSED_NODES_STATE.exclusive();
+    let mut index = 0;
+    while index < state.count as usize {
+        let entry = state.entries[index];
+        if entry.database_oid == database_oid && pgt_ids.contains(&entry.pgt_id) {
+            let last = state.count as usize - 1;
+            state.entries[index] = state.entries[last];
+            state.entries[last] = PausedNodeEntry::default();
+            state.count -= 1;
+        } else {
+            index += 1;
+        }
+    }
+}
+
+/// Maximum number of lag samples in the rolling reservoir.
+const CDC_LAG_SAMPLES: usize = 256;
+
+/// OBS-1: Rolling reservoir of CDC lag samples (milliseconds, fixed 256 slots).
+///
+/// Samples are written in a round-robin fashion by updating the slot at
+/// `(sample_index % CDC_LAG_SAMPLES)`.  Percentiles are computed on metric
+/// scrape by sorting the current window.
+#[derive(Copy, Clone)]
+pub struct CdcLagSampler {
+    /// Fixed-size ring buffer of lag values in milliseconds.
+    pub samples: [u64; CDC_LAG_SAMPLES],
+    /// Next write slot (wraps at CDC_LAG_SAMPLES).
+    pub write_idx: u32,
+    /// Number of valid samples currently in the buffer (capped at CDC_LAG_SAMPLES).
+    pub sample_count: u32,
+}
+
+impl Default for CdcLagSampler {
+    fn default() -> Self {
+        Self {
+            samples: [0u64; CDC_LAG_SAMPLES],
+            write_idx: 0,
+            sample_count: 0,
+        }
+    }
+}
+
+// SAFETY: CdcLagSampler is Copy + Clone + Default with only primitive types.
+unsafe impl PGRXSharedMemory for CdcLagSampler {}
+
+/// OBS-1: Shared CDC lag sampler protected by a lightweight lock.
+// SAFETY: PgLwLock::new requires a static CStr name.
+pub static CDC_LAG_SAMPLER: PgLwLock<CdcLagSampler> =
+    unsafe { PgLwLock::new(c"pg_trickle_cdc_lag") };
+
+/// OBS-1: Record a CDC lag sample (age of a frontier advancement, in milliseconds).
+pub fn record_cdc_lag_ms(lag_ms: u64) {
+    if !SHMEM_INITIALIZED.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    let mut state = CDC_LAG_SAMPLER.exclusive();
+    let idx = (state.write_idx as usize) % CDC_LAG_SAMPLES;
+    state.samples[idx] = lag_ms;
+    state.write_idx = state.write_idx.wrapping_add(1);
+    if state.sample_count < CDC_LAG_SAMPLES as u32 {
+        state.sample_count += 1;
+    }
+}
+
+/// OBS-1: Read CDC lag percentiles (p50, p95, p99) in milliseconds.
+pub fn read_cdc_lag_percentiles() -> (u64, u64, u64) {
+    if !SHMEM_INITIALIZED.load(std::sync::atomic::Ordering::Relaxed) {
+        return (0, 0, 0);
+    }
+    let state = CDC_LAG_SAMPLER.share();
+    let count = state.sample_count as usize;
+    if count == 0 {
+        return (0, 0, 0);
+    }
+    let mut sorted: Vec<u64> = state.samples[..count].to_vec();
+    sorted.sort_unstable();
+    let p50 = sorted[(count * 50 / 100).min(count - 1)];
+    let p95 = sorted[(count * 95 / 100).min(count - 1)];
+    let p99 = sorted[(count * 99 / 100).min(count - 1)];
+    (p50, p95, p99)
+}
+
+/// OBS-2: Increment the parallel job queue depth.
+pub fn increment_parallel_queue_depth() {
+    if !SHMEM_INITIALIZED.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    PARALLEL_QUEUE_DEPTH
+        .get()
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Increment queue depth for one registered database scheduler.
+pub fn increment_parallel_queue_depth_for_database(database_oid: u32) {
+    increment_parallel_queue_depth();
+    update_database_scheduler(database_oid, |slot| {
+        slot.queue_depth = slot.queue_depth.saturating_add(1);
+    });
+}
+
+/// OBS-2: Decrement the parallel job queue depth (when a worker picks up a job).
+pub fn decrement_parallel_queue_depth() {
+    if !SHMEM_INITIALIZED.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    let counter = PARALLEL_QUEUE_DEPTH.get();
+    let mut depth = counter.load(std::sync::atomic::Ordering::Relaxed);
+    loop {
+        match counter.compare_exchange_weak(
+            depth,
+            depth.saturating_sub(1),
+            std::sync::atomic::Ordering::Relaxed,
+            std::sync::atomic::Ordering::Relaxed,
+        ) {
+            Ok(_) => break,
+            Err(actual) => depth = actual,
+        }
+    }
+}
+
+/// Decrement queue depth for one registered database scheduler.
+pub fn decrement_parallel_queue_depth_for_database(database_oid: u32) {
+    decrement_parallel_queue_depth();
+    update_database_scheduler(database_oid, |slot| {
+        slot.queue_depth = slot.queue_depth.saturating_sub(1);
+    });
+}
+
+/// OBS-2: Read the current parallel job queue depth.
+pub fn parallel_queue_depth() -> u64 {
+    if !is_shmem_available() {
+        return 0;
+    }
+    PARALLEL_QUEUE_DEPTH
+        .get()
+        .load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Return the current logical invalidation-ring occupancy in bytes.
+pub fn invalidation_ring_bytes() -> u64 {
+    if !is_shmem_available() {
+        return 0;
+    }
+    PGS_STATE.share().inv_count as u64 * std::mem::size_of::<i64>() as u64
+}
+
+/// Record the scheduler's current load-pressure admission decision.
+pub fn record_scheduler_load(pressure: f64, deferred: bool, factor: u8) {
+    if !is_shmem_available() {
+        return;
+    }
+    let millionths = (pressure.clamp(0.0, 1.0) * 1_000_000.0).round() as u64;
+    LOAD_PRESSURE_MILLIONTHS
+        .get()
+        .store(millionths, std::sync::atomic::Ordering::Relaxed);
+    LOAD_DEFERRAL_FACTOR
+        .get()
+        .store(factor.max(1) as u64, std::sync::atomic::Ordering::Relaxed);
+    if deferred {
+        LOAD_DEFERRALS_TOTAL
+            .get()
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Read the latest scheduler load pressure and cumulative deferral count.
+pub fn scheduler_load_stats() -> (f64, u64, u64) {
+    if !is_shmem_available() {
+        return (0.0, 0, 1);
+    }
+    (
+        LOAD_PRESSURE_MILLIONTHS
+            .get()
+            .load(std::sync::atomic::Ordering::Relaxed) as f64
+            / 1_000_000.0,
+        LOAD_DEFERRALS_TOTAL
+            .get()
+            .load(std::sync::atomic::Ordering::Relaxed),
+        LOAD_DEFERRAL_FACTOR
+            .get()
+            .load(std::sync::atomic::Ordering::Relaxed)
+            .max(1),
+    )
+}
+
+/// Record one pipeline decision and its bounded apply statistics.
+pub fn record_pipeline_metrics(reason: &str, stats: Option<(u64, u64, u64, u64, u64, u64)>) {
+    if !is_shmem_available() {
+        return;
+    }
+    let mut metrics = PIPELINE_METRICS.exclusive();
+    if stats.is_none() {
+        match reason {
+            "small_non_amplifying" => metrics.direct_small = metrics.direct_small.saturating_add(1),
+            "large_input" => metrics.pipelined_large = metrics.pipelined_large.saturating_add(1),
+            "potential_amplification" => {
+                metrics.pipelined_amplifying = metrics.pipelined_amplifying.saturating_add(1)
+            }
+            _ => metrics.compatibility_fallback = metrics.compatibility_fallback.saturating_add(1),
+        }
+    }
+    if let Some((batches, rows, bytes, largest_rows, largest_bytes, oversize)) = stats {
+        metrics.batches = metrics.batches.saturating_add(batches);
+        metrics.rows = metrics.rows.saturating_add(rows);
+        metrics.bytes = metrics.bytes.saturating_add(bytes);
+        metrics.largest_rows = metrics.largest_rows.max(largest_rows);
+        metrics.largest_bytes = metrics.largest_bytes.max(largest_bytes);
+        metrics.oversize_batches = metrics.oversize_batches.saturating_add(oversize);
+    }
+}
+
+/// Read the bounded pipeline counters.
+pub fn pipeline_metrics() -> PipelineMetricState {
+    if !is_shmem_available() {
+        return PipelineMetricState::default();
+    }
+    *PIPELINE_METRICS.share()
+}
+
+/// OBS-2: Add idle time (milliseconds) to the cumulative worker idle counter.
+pub fn add_worker_idle_ms(ms: u64) {
+    if !SHMEM_INITIALIZED.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    WORKER_IDLE_MS_TOTAL
+        .get()
+        .fetch_add(ms, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// OBS-3: Set the WAL decoder pending-record count.
+pub fn set_wal_decoder_pending_records(count: u64) {
+    if !SHMEM_INITIALIZED.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    WAL_DECODER_PENDING_RECORDS
+        .get()
+        .store(count, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// OBS-3: Read the WAL decoder pending-record count.
+pub fn read_wal_decoder_pending_records() -> u64 {
+    if !SHMEM_INITIALIZED.load(std::sync::atomic::Ordering::Relaxed) {
+        return 0;
+    }
+    WAL_DECODER_PENDING_RECORDS
+        .get()
+        .load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// OBS-4: Record a refresh mode selection.
+pub fn record_refresh_mode(is_differential: bool) {
+    if !SHMEM_INITIALIZED.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    if is_differential {
+        REFRESH_MODE_DIFFERENTIAL_TOTAL
+            .get()
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    } else {
+        REFRESH_MODE_FULL_TOTAL
+            .get()
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Register shared memory allocations. Called from `_PG_init()`.
+pub fn init_shared_memory() {
+    pg_shmem_init!(PGS_STATE);
+    // SCAL-3: Dedicated per-concern locks.
+    pg_shmem_init!(SCHEDULER_META_STATE);
+    pg_shmem_init!(DATABASE_SCHEDULER_REGISTRY);
+    pg_shmem_init!(TICK_WATERMARK_STATE);
+    pg_shmem_init!(DAG_REBUILD_SIGNAL);
+    pg_shmem_init!(CACHE_GENERATION);
+    pg_shmem_init!(WORKER_SLOT_TABLE);
+    pg_shmem_init!(INVALIDATION_RING_OVERFLOWS);
+    pg_shmem_init!(RECONCILE_EPOCH);
+    pg_shmem_init!(TOTAL_DIFF_REFRESHES);
+    pg_shmem_init!(DEDUP_NEEDED_REFRESHES);
+    pg_shmem_init!(TEMPLATE_CACHE_L2_HITS);
+    pg_shmem_init!(TEMPLATE_CACHE_MISSES);
+    pg_shmem_init!(TEMPLATE_CACHE_L1_HITS);
+    pg_shmem_init!(TEMPLATE_CACHE_EVICTIONS);
+    pg_shmem_init!(TEMPLATE_CACHE_BYTES);
+    // OPS-10-02: Stale hash-mismatch evictions and DAG cycle counter.
+    pg_shmem_init!(TEMPLATE_CACHE_STALE_EVICTIONS);
+    pg_shmem_init!(DAG_CYCLES_DETECTED);
+    pg_shmem_init!(FRONTIER_HOLDBACK_LSN_BYTES);
+    pg_shmem_init!(FRONTIER_HOLDBACK_AGE_SECS);
+    pg_shmem_init!(HOLDBACK_PROBE_CALLS_TOTAL);
+    pg_shmem_init!(HOLDBACK_PROBE_CACHE_HITS_TOTAL);
+    pg_shmem_init!(HOLDBACK_PROBE_TOTAL_MS);
+    pg_shmem_init!(HOLDBACK_PROBE_LAST_MS);
+    // PERF-3 (v0.31.0): IVM lock-mode parse error counter.
+    pg_shmem_init!(IVM_LOCK_PARSE_ERRORS);
+    // PERF-3: Cost-model cache.
+    pg_shmem_init!(COST_MODEL_STATE);
+    // A35 (v0.36.0): Drain mode epoch counters.
+    pg_shmem_init!(DRAIN_REQUESTED);
+    pg_shmem_init!(DRAIN_COMPLETED);
+    pg_shmem_init!(DRAIN_STATE);
+    pg_shmem_init!(CITUS_WORKER_FAILURE_TOTAL);
+    // M-6 (v0.55.0): DVM parse-time and delta SQL size metrics.
+    pg_shmem_init!(DVM_PARSE_MS);
+    pg_shmem_init!(DELTA_QUERY_SIZE_BYTES);
+    // COR-4 (v0.58.0): CDC compaction contention counter.
+    pg_shmem_init!(CDC_COMPACT_CONTENDED_TOTAL);
+    // OBS-1 (v0.59.0): CDC lag percentile sampler.
+    pg_shmem_init!(CDC_LAG_SAMPLER);
+    // OBS-2 (v0.59.0): Parallel worker utilisation metrics.
+    pg_shmem_init!(PARALLEL_QUEUE_DEPTH);
+    pg_shmem_init!(LOAD_DEFERRALS_TOTAL);
+    pg_shmem_init!(LOAD_PRESSURE_MILLIONTHS);
+    pg_shmem_init!(LOAD_DEFERRAL_FACTOR);
+    pg_shmem_init!(PIPELINE_METRICS);
+    pg_shmem_init!(WORKER_IDLE_MS_TOTAL);
+    // OBS-3 (v0.59.0): WAL decoder pending-record metric.
+    pg_shmem_init!(WAL_DECODER_PENDING_RECORDS);
+    // OBS-4 (v0.59.0): Refresh-mode ratio counters.
+    pg_shmem_init!(REFRESH_MODE_DIFFERENTIAL_TOTAL);
+    pg_shmem_init!(REFRESH_MODE_FULL_TOTAL);
+    // COR-8 (v0.61.0): Snapshot cache collision counter.
+    pg_shmem_init!(SNAPSHOT_CACHE_COLLISIONS);
+    // API-1/2 (v0.62.0): Per-node pause state.
+    pg_shmem_init!(PAUSED_NODES_STATE);
+    // OBS-002 (v0.70.0): History prune error counter.
+    pg_shmem_init!(HISTORY_PRUNE_ERRORS);
+    // SCAL-002 (v0.70.0): Launcher install epoch for fast CREATE/DROP EXTENSION detection.
+    pg_shmem_init!(LAUNCHER_INSTALL_EPOCH);
+    pg_shmem_init!(LAUNCHER_LAST_SCAN_MS);
+    pg_shmem_init!(LAUNCHER_LAST_DB_COUNT);
+    pg_shmem_init!(LAUNCHER_LAST_ACTIVE_COUNT);
+    pg_shmem_init!(LAUNCHER_LAST_SCAN_EPOCH_SECS);
+    SHMEM_INITIALIZED.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// G14-MDED: Increment the total-diff-refreshes counter.
+///
+/// No-op when shared memory is not initialized (extension not loaded via
+/// `shared_preload_libraries`).
+pub fn record_diff_refresh(is_deduplicated: bool) {
+    if !SHMEM_INITIALIZED.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    TOTAL_DIFF_REFRESHES
+        .get()
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if !is_deduplicated {
+        DEDUP_NEEDED_REFRESHES
+            .get()
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// G14-MDED: Read the dedup profiling counters.
+///
+/// Returns `(total_diff_refreshes, dedup_needed_refreshes)`.
+pub fn read_dedup_stats() -> (u64, u64) {
+    if !SHMEM_INITIALIZED.load(std::sync::atomic::Ordering::Relaxed) {
+        return (0, 0);
+    }
+    let total = TOTAL_DIFF_REFRESHES
+        .get()
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let dedup = DEDUP_NEEDED_REFRESHES
+        .get()
+        .load(std::sync::atomic::Ordering::Relaxed);
+    (total, dedup)
+}
+
+/// PERF-3 (v0.31.0): Increment the IVM lock-mode parse error counter.
+///
+/// Called from `IvmLockMode::for_query` whenever parsing the defining query
+/// fails and the lock mode falls back to `Exclusive`.
+pub fn increment_ivm_lock_parse_errors() {
+    if !SHMEM_INITIALIZED.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    IVM_LOCK_PARSE_ERRORS
+        .get()
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// PERF-3 (v0.31.0): Read the IVM lock-mode parse error counter.
+pub fn read_ivm_lock_parse_errors() -> u64 {
+    if !SHMEM_INITIALIZED.load(std::sync::atomic::Ordering::Relaxed) {
+        return 0;
+    }
+    IVM_LOCK_PARSE_ERRORS
+        .get()
+        .load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// M-6 (v0.55.0): Increment the DVM parser time counter by `ms` milliseconds.
+pub fn increment_dvm_parse_ms(ms: u64) {
+    if !SHMEM_INITIALIZED.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    DVM_PARSE_MS
+        .get()
+        .fetch_add(ms, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// M-6 (v0.55.0): Increment the delta query size counter by `bytes`.
+pub fn increment_delta_query_bytes(bytes: u64) {
+    if !SHMEM_INITIALIZED.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    DELTA_QUERY_SIZE_BYTES
+        .get()
+        .fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// M-6 (v0.55.0): Read the DVM parse milliseconds counter.
+pub fn read_dvm_parse_ms() -> u64 {
+    if !SHMEM_INITIALIZED.load(std::sync::atomic::Ordering::Relaxed) {
+        return 0;
+    }
+    DVM_PARSE_MS
+        .get()
+        .load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// M-6 (v0.55.0): Read the delta query size bytes counter.
+pub fn read_delta_query_size_bytes() -> u64 {
+    if !SHMEM_INITIALIZED.load(std::sync::atomic::Ordering::Relaxed) {
+        return 0;
+    }
+    DELTA_QUERY_SIZE_BYTES
+        .get()
+        .load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// COR-8 (v0.61.0): Increment the snapshot cache collision counter.
+pub fn increment_snapshot_cache_collisions() {
+    if !SHMEM_INITIALIZED.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    SNAPSHOT_CACHE_COLLISIONS
+        .get()
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// COR-8 (v0.61.0): Read the snapshot cache collision counter.
+pub fn read_snapshot_cache_collisions() -> u64 {
+    if !SHMEM_INITIALIZED.load(std::sync::atomic::Ordering::Relaxed) {
+        return 0;
+    }
+    SNAPSHOT_CACHE_COLLISIONS
+        .get()
+        .load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Signal the scheduler to rebuild the dependency DAG.
+///
+/// Called by API functions (create/alter/drop) after modifying catalog entries.
+/// No-op if shared memory is not initialized (i.e., extension not in
+/// `shared_preload_libraries`).
+///
+/// This signals a full rebuild (sets overflow flag). For targeted
+/// invalidation of a specific stream table, use [`signal_dag_invalidation`].
+pub fn signal_dag_rebuild() {
+    // Guard: PgAtomic is only initialized when loaded via shared_preload_libraries.
+    // When loaded dynamically (CREATE EXTENSION without shared_preload), the
+    // scheduler and shared memory are unavailable. Just skip the signal.
+    if !is_shmem_available() {
+        return;
+    }
+    // C2-1: Set overflow flag so the scheduler does a full rebuild.
+    PGS_STATE.exclusive().inv_overflow = true;
+    DAG_REBUILD_SIGNAL
+        .get()
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// C2-1: Signal the scheduler that a specific stream table's DAG state
+/// may have changed.
+///
+/// Pushes `pgt_id` into the shared invalidation ring buffer. If the ring
+/// is full, sets the overflow flag — the scheduler will fall back to a
+/// full DAG rebuild on its next tick.
+///
+/// Called by DDL hooks and API functions after modifying catalog entries
+/// for a known stream table.
+pub fn signal_dag_invalidation(pgt_id: i64) {
+    if !is_shmem_available() {
+        return;
+    }
+    {
+        let mut state = PGS_STATE.exclusive();
+        push_invalidation(&mut state, pgt_id);
+    }
+    DAG_REBUILD_SIGNAL
+        .get()
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// C2-1: Push a pgt_id into the invalidation ring buffer.
+///
+/// Pure logic extracted for unit-testability. Deduplicates entries and
+/// sets the overflow flag when the ring is full.
+fn push_invalidation(state: &mut PgTrickleSharedState, pgt_id: i64) {
+    // A46-7: Use the configurable effective capacity (GUC-controlled, default 128).
+    let effective_capacity =
+        crate::config::pg_trickle_invalidation_ring_capacity().min(INVALIDATION_RING_MAX_CAPACITY);
+    let count = state.inv_count as usize;
+    if count < effective_capacity {
+        // Deduplicate: skip if this pgt_id is already in the ring.
+        if !state.inv_ring[..count].contains(&pgt_id) {
+            state.inv_ring[count] = pgt_id;
+            state.inv_count = (count + 1) as u16;
+        }
+    } else {
+        state.inv_overflow = true;
+        // A46-7: Increment the persistent overflow counter for capacity planning.
+        // Guard against uninitialized atomics in unit tests.
+        if is_shmem_available() {
+            INVALIDATION_RING_OVERFLOWS
+                .get()
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
+
+/// C2-1: Drain the invalidation ring buffer, returning the set of
+/// affected pgt_ids.
+///
+/// Returns `Some(vec)` with the affected pgt_ids if no overflow occurred,
+/// or `None` if the ring overflowed (caller must do a full DAG rebuild).
+///
+/// After draining, the ring buffer and overflow flag are reset.
+/// Called by the scheduler at the start of each tick.
+pub fn drain_invalidations() -> Option<Vec<i64>> {
+    if !is_shmem_available() {
+        return Some(Vec::new());
+    }
+    let mut state = PGS_STATE.exclusive();
+    drain_ring(&mut state)
+}
+
+/// C2-1: Drain all entries from the invalidation ring buffer.
+///
+/// Pure logic extracted for unit-testability. Returns `Some(ids)` on
+/// success or `None` if the ring overflowed. Resets the ring in either case.
+fn drain_ring(state: &mut PgTrickleSharedState) -> Option<Vec<i64>> {
+    if state.inv_overflow {
+        state.inv_count = 0;
+        state.inv_overflow = false;
+        return None;
+    }
+    let count = state.inv_count as usize;
+    if count == 0 {
+        return Some(Vec::new());
+    }
+    let ids: Vec<i64> = state.inv_ring[..count].to_vec();
+    state.inv_count = 0;
+    Some(ids)
+}
+
+/// Read the current DAG rebuild signal value.
+pub fn current_dag_version() -> u64 {
+    if !is_shmem_available() {
+        return 0;
+    }
+    DAG_REBUILD_SIGNAL
+        .get()
+        .load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Bump the shared cache generation counter.
+///
+/// Called by DDL paths that invalidate delta/MERGE template caches:
+/// - Source table DDL causing stream table reinitialize
+/// - Stream table drop
+///
+/// No-op if shared memory is not initialized.
+pub fn bump_cache_generation() {
+    if !is_shmem_available() {
+        return;
+    }
+    CACHE_GENERATION
+        .get()
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Read the current shared cache generation value.
+///
+/// Backends compare this against their local generation to detect if
+/// caches need flushing.
+pub fn current_cache_generation() -> u64 {
+    if !is_shmem_available() {
+        return 0;
+    }
+    CACHE_GENERATION
+        .get()
+        .load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Check if shared memory has been initialized.
+///
+/// Returns `false` when the extension was loaded via `CREATE EXTENSION`
+/// without being listed in `shared_preload_libraries`.
+pub fn is_shmem_available() -> bool {
+    // Use a simple flag set during init_shared_memory()
+    SHMEM_INITIALIZED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+// ── A35 (v0.36.0): Drain mode helpers ─────────────────────────────────────
+
+/// Signal the scheduler to drain: increments DRAIN_REQUESTED and returns the
+/// new epoch that the scheduler must reach to confirm draining.
+///
+/// Returns `None` when shared memory is not initialized.
+pub fn signal_drain() -> Option<u64> {
+    if !SHMEM_INITIALIZED.load(std::sync::atomic::Ordering::Relaxed) {
+        return None;
+    }
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let mut state = DRAIN_STATE.exclusive();
+    let epoch = match state.phase {
+        DrainPhase::Running => {
+            state.epoch = state.epoch.wrapping_add(1).max(1);
+            state.requested_at_epoch_ms = now_ms;
+            state.phase = DrainPhase::Draining;
+            state.epoch
+        }
+        DrainPhase::Draining | DrainPhase::Drained => state.epoch,
+    };
+    DRAIN_REQUESTED
+        .get()
+        .store(epoch, std::sync::atomic::Ordering::Release);
+    Some(epoch)
+}
+
+/// Check whether the scheduler has quiesced to the given drain epoch.
+///
+/// Returns `true` when `DRAIN_COMPLETED >= epoch`.
+pub fn check_drain_completed(epoch: u64) -> bool {
+    if !SHMEM_INITIALIZED.load(std::sync::atomic::Ordering::Relaxed) {
+        return true; // No scheduler = trivially drained
+    }
+    DRAIN_COMPLETED
+        .get()
+        .load(std::sync::atomic::Ordering::Acquire)
+        >= epoch
+}
+
+/// Called by the scheduler at the start of each tick to check whether a drain
+/// was requested and whether it is already completed (no in-flight refreshes).
+///
+/// If a drain is requested and no refreshes are running, sets DRAIN_COMPLETED
+/// to the current DRAIN_REQUESTED epoch and returns `true` (stop scheduling).
+/// Returns `false` when no drain is requested or refreshes are still in flight.
+pub fn scheduler_check_and_complete_drain(database_oid: u32) -> bool {
+    if !SHMEM_INITIALIZED.load(std::sync::atomic::Ordering::Relaxed) {
+        return false;
+    }
+    let mut state = DRAIN_STATE.exclusive();
+    if state.phase == DrainPhase::Running {
+        return false;
+    }
+    let requested_epoch = state.epoch;
+    update_database_scheduler(database_oid, |slot| {
+        slot.drain_seen_epoch = requested_epoch;
+    });
+    let registry = DATABASE_SCHEDULER_REGISTRY.share();
+    let all_schedulers_acknowledged = registry
+        .slots
+        .iter()
+        .filter(|slot| slot.database_oid != 0 && slot.running)
+        .all(|slot| slot.drain_seen_epoch >= requested_epoch);
+    let all_database_work_quiesced = registry
+        .slots
+        .iter()
+        .filter(|slot| slot.database_oid != 0 && slot.running)
+        .all(|slot| slot.queue_depth == 0 && slot.inline_pgt_id == 0);
+    let (reserved, live) = worker_slot_counts();
+    if state.phase == DrainPhase::Draining
+        && all_schedulers_acknowledged
+        && all_database_work_quiesced
+        && reserved == 0
+        && live == 0
+    {
+        state.phase = DrainPhase::Drained;
+        DRAIN_COMPLETED
+            .get()
+            .store(state.epoch, std::sync::atomic::Ordering::Release);
+    }
+    true
+}
+
+/// Explicitly resume dispatch after a drain.
+pub fn cancel_drain() {
+    let _ = resume_after_drain();
+}
+
+/// Clear a persistent drain gate. Returns `true` only when a drain was active.
+pub fn resume_after_drain() -> bool {
+    if !SHMEM_INITIALIZED.load(std::sync::atomic::Ordering::Relaxed) {
+        return false;
+    }
+    let mut state = DRAIN_STATE.exclusive();
+    if state.phase == DrainPhase::Running {
+        return false;
+    }
+    state.phase = DrainPhase::Running;
+    DRAIN_REQUESTED
+        .get()
+        .store(state.epoch, std::sync::atomic::Ordering::Release);
+    true
+}
+
+/// Returns `true` when DRAIN_COMPLETED >= DRAIN_REQUESTED, i.e., the scheduler
+/// has quiesced and no new cycles are being dispatched.
+pub fn is_drained() -> bool {
+    if !SHMEM_INITIALIZED.load(std::sync::atomic::Ordering::Relaxed) {
+        return true;
+    }
+    DRAIN_STATE.share().phase == DrainPhase::Drained
+}
+
+/// SQL-visible tri-state drain status: `None` means Running/no request,
+/// `Some(false)` means Draining, and `Some(true)` means Drained.
+pub fn drain_status() -> Option<bool> {
+    if !SHMEM_INITIALIZED.load(std::sync::atomic::Ordering::Relaxed) {
+        return None;
+    }
+    match DRAIN_STATE.share().phase {
+        DrainPhase::Running => None,
+        DrainPhase::Draining => Some(false),
+        DrainPhase::Drained => Some(true),
+    }
+}
+
+fn increment_epoch(atomic: &AtomicU64) {
+    atomic.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Read the current number of active dynamic refresh workers.
+pub fn active_worker_count() -> u32 {
+    if !is_shmem_available() {
+        return 0;
+    }
+    let (reserved, live) = worker_slot_counts();
+    reserved + live
+}
+
+/// A46-7: Returns the total number of invalidation ring overflow events since startup.
+///
+/// Each overflow means a DDL event exceeded the ring capacity and forced a full
+/// DAG rebuild. Use this for capacity planning: if the count is increasing,
+/// consider raising `pg_trickle.invalidation_ring_capacity`.
+pub fn invalidation_ring_overflow_count() -> u64 {
+    if !is_shmem_available() {
+        return 0;
+    }
+    INVALIDATION_RING_OVERFLOWS
+        .get()
+        .load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// A46-11: Increment the Citus worker failure total counter.
+///
+/// Called from the scheduler when a Citus worker consecutive-failure threshold
+/// is crossed. The counter persists across scheduler restarts.
+pub fn increment_citus_worker_failure_total() {
+    if !is_shmem_available() {
+        return;
+    }
+    CITUS_WORKER_FAILURE_TOTAL
+        .get()
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// A46-11: Returns the total number of Citus worker failure events since startup.
+pub fn citus_worker_failure_total() -> u64 {
+    if !is_shmem_available() {
+        return 0;
+    }
+    CITUS_WORKER_FAILURE_TOTAL
+        .get()
+        .load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Bump the reconcile epoch (signals that token count was corrected).
+pub fn bump_reconcile_epoch() {
+    if !is_shmem_available() {
+        return;
+    }
+
+    increment_epoch(RECONCILE_EPOCH.get());
+}
+
+/// Read the current reconcile epoch.
+pub fn current_reconcile_epoch() -> u64 {
+    if !is_shmem_available() {
+        return 0;
+    }
+    RECONCILE_EPOCH
+        .get()
+        .load(std::sync::atomic::Ordering::Relaxed)
+}
+
+// ── #536: Frontier visibility holdback helpers ─────────────────────────────
+
+/// Read the oldest-xmin seen at the previous scheduler tick.
+///
+/// SCAL-3: Uses `TICK_WATERMARK_STATE` (dedicated lock) instead of `PGS_STATE`.
+/// Returns 0 when shmem is unavailable or no baseline has been recorded.
+pub fn last_tick_oldest_xmin() -> u64 {
+    if !is_shmem_available() {
+        return 0;
+    }
+    TICK_WATERMARK_STATE.share().last_tick_oldest_xmin
+}
+
+/// Read the database-scoped oldest-xmin watermark baseline.
+pub fn database_last_tick_oldest_xmin(database_oid: u32) -> u64 {
+    if !is_shmem_available() {
+        return 0;
+    }
+    let registry = DATABASE_SCHEDULER_REGISTRY.share();
+    database_slot_index(&registry, database_oid)
+        .map(|index| registry.slots[index].last_tick_oldest_xmin)
+        .unwrap_or(0)
+}
+
+/// Read the database-scoped safe-LSN watermark baseline.
+pub fn database_last_tick_safe_lsn_u64(database_oid: u32) -> u64 {
+    if !is_shmem_available() {
+        return 0;
+    }
+    let registry = DATABASE_SCHEDULER_REGISTRY.share();
+    database_slot_index(&registry, database_oid)
+        .map(|index| registry.slots[index].last_tick_safe_lsn_u64)
+        .unwrap_or(0)
+}
+
+/// Persist both database-scoped watermark baselines atomically.
+pub fn set_database_last_tick_holdback_state(
+    database_oid: u32,
+    oldest_xmin: u64,
+    safe_lsn_u64: u64,
+) {
+    update_database_scheduler(database_oid, |slot| {
+        slot.last_tick_oldest_xmin = oldest_xmin;
+        slot.last_tick_safe_lsn_u64 = safe_lsn_u64;
+    });
+}
+
+/// Persist the oldest-xmin from the current tick so next tick can compare.
+///
+/// SCAL-3: Uses `TICK_WATERMARK_STATE` (dedicated lock).
+pub fn set_last_tick_oldest_xmin(xmin: u64) {
+    if !is_shmem_available() {
+        return;
+    }
+    TICK_WATERMARK_STATE.exclusive().last_tick_oldest_xmin = xmin;
+}
+
+/// Persist both the oldest-xmin and the safe frontier LSN **atomically** under
+/// a single exclusive lock acquisition so that dynamic workers never see a
+/// state where the xmin has advanced but the safe LSN has not yet been updated
+/// (or vice-versa).
+///
+/// SCAL-3: Uses `TICK_WATERMARK_STATE` (dedicated lock).
+pub fn set_last_tick_holdback_state(xmin: u64, lsn_u64: u64) {
+    if !is_shmem_available() {
+        return;
+    }
+    let mut state = TICK_WATERMARK_STATE.exclusive();
+    state.last_tick_oldest_xmin = xmin;
+    state.last_tick_safe_lsn_u64 = lsn_u64;
+}
+
+/// Read the safe frontier LSN (u64) written by the coordinator at the last tick.
+///
+/// SCAL-3: Uses `TICK_WATERMARK_STATE.share()` — reads do not block DAG writers.
+/// Returns 0 when shmem is unavailable or unset.
+pub fn last_tick_safe_lsn_u64() -> u64 {
+    if !is_shmem_available() {
+        return 0;
+    }
+    TICK_WATERMARK_STATE.share().last_tick_safe_lsn_u64
+}
+
+/// Persist the safe frontier LSN (u64) so dynamic workers can read it.
+///
+/// SCAL-3: Uses `TICK_WATERMARK_STATE` (dedicated lock).
+pub fn set_last_tick_safe_lsn(lsn_u64: u64) {
+    if !is_shmem_available() {
+        return;
+    }
+    // Update only the cached safe LSN under the dedicated watermark lock.
+    // When both xmin and LSN must be updated together, use set_last_tick_holdback_state().
+    TICK_WATERMARK_STATE.exclusive().last_tick_safe_lsn_u64 = lsn_u64;
+}
+
+// ── SCAL-3 (v0.25.0): Scheduler metadata helpers ──────────────────────────
+
+/// Read the current scheduler PID from shared memory.
+///
+/// Returns 0 when shmem is unavailable or the scheduler has not started.
+pub fn scheduler_pid() -> i32 {
+    if !is_shmem_available() {
+        return 0;
+    }
+    SCHEDULER_META_STATE.share().scheduler_pid
+}
+
+/// Record scheduler startup: set PID, mark as running, record wake time.
+pub fn set_scheduler_meta(pid: i32, running: bool, wake_ts: i64) {
+    if !is_shmem_available() {
+        return;
+    }
+    let mut meta = SCHEDULER_META_STATE.exclusive();
+    meta.scheduler_pid = pid;
+    meta.scheduler_running = running;
+    meta.last_scheduler_wake = wake_ts;
+}
+
+/// Read scheduler running status.
+pub fn scheduler_running() -> bool {
+    if !is_shmem_available() {
+        return false;
+    }
+    SCHEDULER_META_STATE.share().scheduler_running
+}
+
+/// Read the last scheduler wake timestamp (Unix seconds).
+pub fn last_scheduler_wake() -> i64 {
+    if !is_shmem_available() {
+        return 0;
+    }
+    SCHEDULER_META_STATE.share().last_scheduler_wake
+}
+
+/// Update the holdback gauge metrics.
+///
+/// - `lsn_bytes`: how many bytes behind write_lsn the safe frontier is.
+/// - `age_secs`: age (seconds) of the oldest in-progress transaction.
+pub fn update_holdback_metrics(lsn_bytes: u64, age_secs: u64) {
+    if !is_shmem_available() {
+        return;
+    }
+    FRONTIER_HOLDBACK_LSN_BYTES
+        .get()
+        .store(lsn_bytes, std::sync::atomic::Ordering::Relaxed);
+    FRONTIER_HOLDBACK_AGE_SECS
+        .get()
+        .store(age_secs, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Read the current holdback gauge metrics.
+///
+/// Returns `(lsn_bytes, age_secs)`.
+pub fn read_holdback_metrics() -> (u64, u64) {
+    if !is_shmem_available() {
+        return (0, 0);
+    }
+    let lsn = FRONTIER_HOLDBACK_LSN_BYTES
+        .get()
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let age = FRONTIER_HOLDBACK_AGE_SECS
+        .get()
+        .load(std::sync::atomic::Ordering::Relaxed);
+    (lsn, age)
+}
+
+/// CACHE-2: Increment the L1 template cache evictions counter.
+///
+/// Called by `maybe_evict_lru_cache_entry` when an LRU eviction occurs.
+pub fn increment_template_cache_evictions() {
+    if !SHMEM_INITIALIZED.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    TEMPLATE_CACHE_EVICTIONS
+        .get()
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// PERF-006: Update current estimated template-cache bytes.
+pub fn set_template_cache_bytes(bytes: u64) {
+    if !SHMEM_INITIALIZED.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    TEMPLATE_CACHE_BYTES
+        .get()
+        .store(bytes, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// PERF-006: Read current estimated template-cache bytes.
+pub fn template_cache_bytes() -> u64 {
+    if !is_shmem_available() {
+        return 0;
+    }
+    TEMPLATE_CACHE_BYTES
+        .get()
+        .load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// PERF-003: Record holdback-probe duration and cache-hit information.
+pub fn record_holdback_probe(duration_ms: u64, cache_hit: bool) {
+    if !SHMEM_INITIALIZED.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+
+    HOLDBACK_PROBE_CALLS_TOTAL
+        .get()
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    HOLDBACK_PROBE_TOTAL_MS
+        .get()
+        .fetch_add(duration_ms, std::sync::atomic::Ordering::Relaxed);
+    HOLDBACK_PROBE_LAST_MS
+        .get()
+        .store(duration_ms, std::sync::atomic::Ordering::Relaxed);
+
+    if cache_hit {
+        HOLDBACK_PROBE_CACHE_HITS_TOTAL
+            .get()
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// PERF-003: Read holdback-probe metrics.
+pub fn read_holdback_probe_metrics() -> (u64, u64, u64, u64) {
+    if !is_shmem_available() {
+        return (0, 0, 0, 0);
+    }
+
+    (
+        HOLDBACK_PROBE_CALLS_TOTAL
+            .get()
+            .load(std::sync::atomic::Ordering::Relaxed),
+        HOLDBACK_PROBE_CACHE_HITS_TOTAL
+            .get()
+            .load(std::sync::atomic::Ordering::Relaxed),
+        HOLDBACK_PROBE_TOTAL_MS
+            .get()
+            .load(std::sync::atomic::Ordering::Relaxed),
+        HOLDBACK_PROBE_LAST_MS
+            .get()
+            .load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
+/// PERF-004 / ARCH-003: Update launcher discovery-scan health metrics.
+pub fn set_launcher_scan_metrics(scan_ms: u64, db_count: u64, active_count: u64, epoch_secs: u64) {
+    if !SHMEM_INITIALIZED.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+
+    LAUNCHER_LAST_SCAN_MS
+        .get()
+        .store(scan_ms, std::sync::atomic::Ordering::Relaxed);
+    LAUNCHER_LAST_DB_COUNT
+        .get()
+        .store(db_count, std::sync::atomic::Ordering::Relaxed);
+    LAUNCHER_LAST_ACTIVE_COUNT
+        .get()
+        .store(active_count, std::sync::atomic::Ordering::Relaxed);
+    LAUNCHER_LAST_SCAN_EPOCH_SECS
+        .get()
+        .store(epoch_secs, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// PERF-004 / ARCH-003: Read launcher discovery-scan health metrics.
+pub fn read_launcher_scan_metrics() -> (u64, u64, u64, u64) {
+    if !is_shmem_available() {
+        return (0, 0, 0, 0);
+    }
+
+    (
+        LAUNCHER_LAST_SCAN_MS
+            .get()
+            .load(std::sync::atomic::Ordering::Relaxed),
+        LAUNCHER_LAST_DB_COUNT
+            .get()
+            .load(std::sync::atomic::Ordering::Relaxed),
+        LAUNCHER_LAST_ACTIVE_COUNT
+            .get()
+            .load(std::sync::atomic::Ordering::Relaxed),
+        LAUNCHER_LAST_SCAN_EPOCH_SECS
+            .get()
+            .load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
+/// OPS-10-02: Increment the template cache stale evictions counter.
+///
+/// Called when the L1 delta template cache has a hit on `pgt_id` but the
+/// stored `defining_query_hash` does not match the current query (stale entry
+/// after ALTER STREAM TABLE or source schema change).
+pub fn increment_template_cache_stale_evictions() {
+    if !SHMEM_INITIALIZED.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    TEMPLATE_CACHE_STALE_EVICTIONS
+        .get()
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// OPS-10-02: Increment the DAG cycle detection counter.
+///
+/// Called whenever `detect_cycles()` or `topological_levels()` returns
+/// `Err(CycleDetected)`.  Should remain zero in normal operation.
+pub fn increment_dag_cycles_detected() {
+    if !SHMEM_INITIALIZED.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    DAG_CYCLES_DETECTED
+        .get()
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+// ── PERF-3 (v0.25.0): Shmem adaptive cost-model state ─────────────────────
+
+/// A44-4 (v0.43.0): Physical number of per-ST cost model slots in the shmem cache.
+///
+/// This is the compile-time maximum. The runtime effective capacity is
+/// controlled by `pg_trickle.cost_cache_capacity` GUC (default 256).
+/// Slots are addressed by `(pgt_id as usize) % effective_capacity`.
+/// Collisions are tolerated — a wrong slot is treated as a miss and
+/// triggers an SPI fallback. 256 slots give < 0.4% expected collision
+/// rate for workloads with ≤ 1 000 stream tables.
+const COST_CACHE_CAPACITY: usize = 256;
+
+/// A44-4 (v0.43.0): Returns the effective cost-cache capacity from the GUC.
+/// Capped to COST_CACHE_CAPACITY (256) regardless of GUC value.
+#[inline]
+fn effective_cost_cache_capacity() -> usize {
+    // In test environments (no PostgreSQL backend), GucSetting returns its
+    // compile-time default, so this is safe to call unconditionally.
+    crate::config::pg_trickle_cost_cache_capacity().min(COST_CACHE_CAPACITY)
+}
+
+/// One cost model entry for a single stream table.
+///
+/// `last_full_ms` and `last_diff_ms` are stored as IEEE 754 bit patterns
+/// (via `f64::to_bits` / `f64::from_bits`) so that `Copy + Clone +
+/// Default` work without needing a `f64` field.
+#[derive(Copy, Clone, Default)]
+pub struct CostModelEntry {
+    /// `pgt_id` of the stream table that owns this slot, or 0 if empty.
+    pub pgt_id: i64,
+    /// Last observed FULL refresh duration (ms) as IEEE 754 bits.
+    pub last_full_ms_bits: u64,
+    /// Last observed DIFFERENTIAL refresh duration (ms) as IEEE 754 bits.
+    pub last_diff_ms_bits: u64,
+}
+
+/// Fixed-size array of cost model entries, shared across all backends.
+///
+/// Protected by `COST_MODEL_STATE` PgLwLock.
+#[derive(Copy, Clone)]
+pub struct CostModelCache {
+    pub entries: [CostModelEntry; COST_CACHE_CAPACITY],
+}
+
+impl Default for CostModelCache {
+    fn default() -> Self {
+        Self {
+            entries: [CostModelEntry::default(); COST_CACHE_CAPACITY],
+        }
+    }
+}
+
+// SAFETY: CostModelCache contains only primitive types and is Copy + Clone +
+// Default, making it safe for use in PostgreSQL shared memory.
+unsafe impl PGRXSharedMemory for CostModelCache {}
+
+/// PERF-3: Shared cost-model state protected by a dedicated lightweight lock.
+///
+/// Separate from `PGS_STATE` to avoid contention with DAG / scheduler state.
+// SAFETY: PgLwLock::new requires a static CStr name.
+pub static COST_MODEL_STATE: PgLwLock<CostModelCache> =
+    unsafe { PgLwLock::new(c"pg_trickle_cost_model") };
+
+/// PERF-3: Write cost-model timing data for a stream table to shmem.
+///
+/// Called by the scheduler after each refresh completes. Parallel workers
+/// can then read the timing from shmem instead of issuing an SPI query.
+///
+/// `last_full_ms` and/or `last_diff_ms` can be `None` to leave the
+/// corresponding slot value unchanged.
+pub fn update_cost_model(pgt_id: i64, last_full_ms: Option<f64>, last_diff_ms: Option<f64>) {
+    if !is_shmem_available() {
+        return;
+    }
+    let slot = (pgt_id as usize).wrapping_rem(effective_cost_cache_capacity());
+    let mut cache = COST_MODEL_STATE.exclusive();
+    let entry = &mut cache.entries[slot];
+    // If the slot is taken by a different pgt_id, overwrite it.
+    entry.pgt_id = pgt_id;
+    if let Some(ms) = last_full_ms {
+        entry.last_full_ms_bits = ms.to_bits();
+    }
+    if let Some(ms) = last_diff_ms {
+        entry.last_diff_ms_bits = ms.to_bits();
+    }
+}
+
+/// PERF-3: Read cost-model timing data for a stream table from shmem.
+///
+/// Returns `Some((last_full_ms, last_diff_ms))` on a cache hit, or `None`
+/// on a miss (slot empty, slot occupied by a different pgt_id, or
+/// shmem unavailable). Callers should fall back to SPI on `None`.
+pub fn read_cost_model(pgt_id: i64) -> Option<(f64, f64)> {
+    if !is_shmem_available() {
+        return None;
+    }
+    let slot = (pgt_id as usize).wrapping_rem(effective_cost_cache_capacity());
+    let cache = COST_MODEL_STATE.share();
+    let entry = &cache.entries[slot];
+    if entry.pgt_id != pgt_id || entry.pgt_id == 0 {
+        return None;
+    }
+    let full_ms = f64::from_bits(entry.last_full_ms_bits);
+    let diff_ms = f64::from_bits(entry.last_diff_ms_bits);
+    Some((full_ms, diff_ms))
+}
+
+/// Flag indicating whether shared memory was initialized via _PG_init.
+static SHMEM_INITIALIZED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(test)]
+mod tests {
+    use super::{PgTrickleSharedState, drain_ring, increment_epoch, push_invalidation};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    #[test]
+    fn test_increment_epoch_advances_counter() {
+        let epoch = AtomicU64::new(41);
+
+        increment_epoch(&epoch);
+        increment_epoch(&epoch);
+
+        assert_eq!(epoch.load(Ordering::Relaxed), 43);
+    }
+
+    #[test]
+    fn test_epoch_monotonically_increases() {
+        let epoch = AtomicU64::new(0);
+        let mut last = epoch.load(Ordering::Relaxed);
+
+        for _ in 0..10 {
+            increment_epoch(&epoch);
+            let current = epoch.load(Ordering::Relaxed);
+            assert!(current > last);
+            last = current;
+        }
+    }
+
+    // ── C2-1: Invalidation ring buffer tests ──────────────────────────────
+
+    fn new_state() -> PgTrickleSharedState {
+        PgTrickleSharedState::default()
+    }
+
+    #[test]
+    fn test_ring_push_single() {
+        let mut s = new_state();
+        push_invalidation(&mut s, 42);
+
+        assert_eq!(s.inv_count, 1);
+        assert_eq!(s.inv_ring[0], 42);
+        assert!(!s.inv_overflow);
+    }
+
+    #[test]
+    fn test_ring_push_deduplicates() {
+        let mut s = new_state();
+        push_invalidation(&mut s, 1);
+        push_invalidation(&mut s, 1);
+        push_invalidation(&mut s, 1);
+
+        assert_eq!(s.inv_count, 1);
+        assert!(!s.inv_overflow);
+    }
+
+    #[test]
+    fn test_ring_push_multiple_distinct() {
+        let mut s = new_state();
+        for id in 1..=5 {
+            push_invalidation(&mut s, id);
+        }
+        assert_eq!(s.inv_count, 5);
+        assert!(!s.inv_overflow);
+
+        let ids = drain_ring(&mut s).unwrap();
+        assert_eq!(ids, vec![1, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn test_ring_overflow_at_capacity() {
+        let mut s = new_state();
+        // Fill to the default effective capacity (128 in test mode)
+        for id in 0..128_i64 {
+            push_invalidation(&mut s, id);
+        }
+        assert_eq!(s.inv_count as usize, 128);
+        assert!(!s.inv_overflow);
+
+        // One more triggers overflow
+        push_invalidation(&mut s, 999);
+        assert!(s.inv_overflow);
+    }
+
+    #[test]
+    fn test_drain_empty() {
+        let mut s = new_state();
+        let ids = drain_ring(&mut s);
+        assert_eq!(ids, Some(vec![]));
+    }
+
+    #[test]
+    fn test_drain_returns_ids_and_resets() {
+        let mut s = new_state();
+        push_invalidation(&mut s, 10);
+        push_invalidation(&mut s, 20);
+
+        let ids = drain_ring(&mut s).unwrap();
+        assert_eq!(ids, vec![10, 20]);
+        assert_eq!(s.inv_count, 0);
+
+        // Second drain is empty
+        let ids2 = drain_ring(&mut s).unwrap();
+        assert!(ids2.is_empty());
+    }
+
+    #[test]
+    fn test_drain_overflow_returns_none() {
+        let mut s = new_state();
+        // Fill up and overflow (default capacity 128 in test mode)
+        for id in 0..=128_i64 {
+            push_invalidation(&mut s, id);
+        }
+        assert!(s.inv_overflow);
+
+        let result = drain_ring(&mut s);
+        assert!(result.is_none());
+        // State is reset after drain
+        assert_eq!(s.inv_count, 0);
+        assert!(!s.inv_overflow);
+    }
+
+    #[test]
+    fn test_ring_push_then_drain_then_reuse() {
+        let mut s = new_state();
+        push_invalidation(&mut s, 1);
+        push_invalidation(&mut s, 2);
+        let ids = drain_ring(&mut s).unwrap();
+        assert_eq!(ids, vec![1, 2]);
+
+        // Ring is reusable after drain
+        push_invalidation(&mut s, 3);
+        let ids2 = drain_ring(&mut s).unwrap();
+        assert_eq!(ids2, vec![3]);
+    }
+
+    #[test]
+    fn test_ring_dedup_across_different_ids() {
+        let mut s = new_state();
+        push_invalidation(&mut s, 1);
+        push_invalidation(&mut s, 2);
+        push_invalidation(&mut s, 1);
+        push_invalidation(&mut s, 3);
+        push_invalidation(&mut s, 2);
+
+        assert_eq!(s.inv_count, 3);
+        let ids = drain_ring(&mut s).unwrap();
+        assert_eq!(ids, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn test_signal_dag_rebuild_sets_overflow() {
+        let mut s = new_state();
+        push_invalidation(&mut s, 1);
+
+        // Simulate signal_dag_rebuild: set overflow
+        s.inv_overflow = true;
+
+        // Drain returns None (overflow)
+        assert!(drain_ring(&mut s).is_none());
+
+        // After drain, overflow is cleared and ring is usable
+        push_invalidation(&mut s, 2);
+        let ids = drain_ring(&mut s).unwrap();
+        assert_eq!(ids, vec![2]);
+    }
+
+    // ── Scheduler meta state tracking ────────────────────────────────────
+
+    #[test]
+    fn test_scheduler_meta_stores_and_retrieves_state() {
+        // This test directly manipulates SCHEDULER_META_STATE to verify
+        // the set/get contract, even though the public API (scheduler_running)
+        // requires shmem to be initialized. The underlying struct must hold
+        // values correctly across set_scheduler_meta calls.
+
+        let mut meta = super::SchedulerMetaState::default();
+
+        // Initial state: pid=0, running=false, wake=0
+        assert_eq!(meta.scheduler_pid, 0);
+        assert!(!meta.scheduler_running);
+        assert_eq!(meta.last_scheduler_wake, 0);
+
+        // Simulate startup: set(12345, true, 1234567890)
+        meta.scheduler_pid = 12345;
+        meta.scheduler_running = true;
+        meta.last_scheduler_wake = 1234567890;
+
+        assert_eq!(meta.scheduler_pid, 12345);
+        assert!(meta.scheduler_running);
+        assert_eq!(meta.last_scheduler_wake, 1234567890);
+
+        // Simulate shutdown: set(0, false, 0)
+        meta.scheduler_pid = 0;
+        meta.scheduler_running = false;
+        meta.last_scheduler_wake = 0;
+
+        assert_eq!(meta.scheduler_pid, 0);
+        assert!(!meta.scheduler_running);
+        assert_eq!(meta.last_scheduler_wake, 0);
+    }
+
+    #[test]
+    fn test_scheduler_meta_wake_timestamp_updates() {
+        let mut meta = super::SchedulerMetaState {
+            scheduler_running: true,
+            last_scheduler_wake: 1000,
+            ..Default::default()
+        };
+        assert_eq!(meta.last_scheduler_wake, 1000);
+
+        // Periodic update in scheduler loop
+        meta.last_scheduler_wake = 1060; // 60s later
+        assert_eq!(meta.last_scheduler_wake, 1060);
+
+        // Multiple updates preserve monotonicity
+        meta.last_scheduler_wake = 1120;
+        assert_eq!(meta.last_scheduler_wake, 1120);
+    }
+}

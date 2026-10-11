@@ -1,0 +1,213 @@
+//! The single pg_trickle-owned memory sizing policy.
+
+use pgrx::guc::*;
+
+/// Master budget for pg_trickle-owned in-process accumulations, in MiB.
+///
+/// The default value of 256 is an automatic sentinel: it derives a budget
+/// from memory visible to PostgreSQL. Set an explicit value to override it.
+pub static PGS_MEMORY_BUDGET_MB: GucSetting<i32> = GucSetting::<i32>::new(256);
+
+/// A bounded component of the pg_trickle memory policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemoryComponent {
+    DeltaPipeline,
+    TemplatePlanCache,
+    DagQueue,
+    InvalidationRing,
+    ChangeBuffer,
+    WindowState,
+}
+
+impl MemoryComponent {
+    pub const ALL: [Self; 6] = [
+        Self::DeltaPipeline,
+        Self::TemplatePlanCache,
+        Self::DagQueue,
+        Self::InvalidationRing,
+        Self::ChangeBuffer,
+        Self::WindowState,
+    ];
+
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::DeltaPipeline => "delta_pipeline",
+            Self::TemplatePlanCache => "template_plan_cache",
+            Self::DagQueue => "dag_queue",
+            Self::InvalidationRing => "invalidation_ring",
+            Self::ChangeBuffer => "change_buffer",
+            Self::WindowState => "window_state",
+        }
+    }
+}
+
+/// Derived byte limits. Storage values are guards, not lossy caps.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MemoryBudget {
+    pub total_bytes: u64,
+    pub delta_pipeline_bytes: u64,
+    pub template_plan_cache_bytes: u64,
+    pub dag_queue_bytes: u64,
+    pub invalidation_ring_bytes: u64,
+    pub change_buffer_bytes: u64,
+    pub window_state_bytes: u64,
+}
+
+impl MemoryBudget {
+    pub const MIN_MB: u64 = 16;
+    pub const MAX_MB: u64 = 1_048_576;
+    const MIB: u64 = 1024 * 1024;
+
+    pub fn from_mb(mb: u64) -> Option<Self> {
+        let mb = mb.clamp(Self::MIN_MB, Self::MAX_MB);
+        let total_bytes = mb.checked_mul(Self::MIB)?;
+        let share = |percent: u64| total_bytes.checked_mul(percent)?.checked_div(100);
+        let delta_pipeline_bytes = share(75)?;
+        let template_plan_cache_bytes = share(15)?;
+        let dag_queue_bytes = share(5)?;
+        let invalidation_ring_bytes = total_bytes
+            .checked_sub(delta_pipeline_bytes)?
+            .checked_sub(template_plan_cache_bytes)?
+            .checked_sub(dag_queue_bytes)?;
+        Some(Self {
+            total_bytes,
+            delta_pipeline_bytes,
+            template_plan_cache_bytes,
+            dag_queue_bytes,
+            invalidation_ring_bytes,
+            change_buffer_bytes: total_bytes,
+            window_state_bytes: total_bytes,
+        })
+    }
+
+    pub fn from_guc() -> Self {
+        let configured_mb = PGS_MEMORY_BUDGET_MB.get().max(0) as u64;
+        let effective_mb = if configured_mb == 256 {
+            auto_memory_budget_mb().unwrap_or(configured_mb)
+        } else {
+            configured_mb
+        };
+        match Self::from_mb(effective_mb) {
+            Some(budget) => budget,
+            None => Self {
+                total_bytes: 256 * Self::MIB,
+                delta_pipeline_bytes: 192 * Self::MIB,
+                template_plan_cache_bytes: 40 * Self::MIB,
+                dag_queue_bytes: 12 * Self::MIB,
+                invalidation_ring_bytes: 12 * Self::MIB,
+                change_buffer_bytes: 256 * Self::MIB,
+                window_state_bytes: 256 * Self::MIB,
+            },
+        }
+    }
+
+    pub const fn limit(self, component: MemoryComponent) -> u64 {
+        match component {
+            MemoryComponent::DeltaPipeline => self.delta_pipeline_bytes,
+            MemoryComponent::TemplatePlanCache => self.template_plan_cache_bytes,
+            MemoryComponent::DagQueue => self.dag_queue_bytes,
+            MemoryComponent::InvalidationRing => self.invalidation_ring_bytes,
+            MemoryComponent::ChangeBuffer => self.change_buffer_bytes,
+            MemoryComponent::WindowState => self.window_state_bytes,
+        }
+    }
+
+    /// Existing component settings can only make a derived limit stricter.
+    pub const fn stricter_limit(
+        self,
+        component: MemoryComponent,
+        override_bytes: Option<u64>,
+    ) -> u64 {
+        match override_bytes {
+            Some(value) => {
+                let limit = self.limit(component);
+                if value < limit { value } else { limit }
+            }
+            None => self.limit(component),
+        }
+    }
+}
+
+/// Derive a conservative default from the memory visible to the PostgreSQL
+/// process. The explicit GUC remains the escape hatch for workload tuning.
+fn auto_memory_budget_mb() -> Option<u64> {
+    // ponytail: 10% host-memory heuristic; replace with measured workload
+    // sizing only if production evidence shows this ceiling is insufficient.
+    let bytes = [
+        "/sys/fs/cgroup/memory.max",
+        "/sys/fs/cgroup/memory/memory.limit_in_bytes",
+    ]
+    .iter()
+    .filter_map(|path| std::fs::read_to_string(path).ok())
+    .filter_map(|value| {
+        let value = value.trim();
+        if value == "max" {
+            None
+        } else {
+            value.parse::<u64>().ok().filter(|bytes| *bytes > 0)
+        }
+    })
+    .next()
+    .or_else(|| {
+        std::fs::read_to_string("/proc/meminfo")
+            .ok()
+            .and_then(|text| {
+                text.lines()
+                    .find(|line| line.starts_with("MemTotal:"))
+                    .and_then(|line| line.split_whitespace().nth(1))
+                    .and_then(|kb| kb.parse::<u64>().ok())
+                    .map(|kb| kb.saturating_mul(1024))
+            })
+    })?;
+
+    Some((bytes / 10 / MemoryBudget::MIB).clamp(MemoryBudget::MIN_MB, MemoryBudget::MAX_MB))
+}
+
+/// Register the master memory policy GUC.
+pub fn register_memory_gucs() {
+    GucRegistry::define_int_guc(
+        c"pg_trickle.memory_budget_mb",
+        c"Master pg_trickle memory budget in MiB (256 = automatic).",
+        c"Bounds pg_trickle-owned pipeline, cache, queue, and invalidation accumulations. The default 256 derives a conservative budget from visible memory. Change-buffer growth is a lossless storage guard; it never drops committed rows.",
+        &PGS_MEMORY_BUDGET_MB,
+        MemoryBudget::MIN_MB as i32,
+        MemoryBudget::MAX_MB as i32,
+        GucContext::Suset,
+        GucFlags::default(),
+    );
+}
+
+/// Return the effective master memory policy.
+pub fn pg_trickle_memory_budget() -> MemoryBudget {
+    MemoryBudget::from_guc()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn budget_has_all_five_shares() {
+        let budget = MemoryBudget::from_mb(256).expect("valid budget");
+        assert_eq!(
+            budget.delta_pipeline_bytes
+                + budget.template_plan_cache_bytes
+                + budget.dag_queue_bytes
+                + budget.invalidation_ring_bytes,
+            budget.total_bytes
+        );
+        assert_eq!(budget.change_buffer_bytes, budget.total_bytes);
+        assert_eq!(budget.window_state_bytes, budget.total_bytes);
+    }
+
+    #[test]
+    fn budget_clamps_and_composes_stricter_overrides() {
+        let budget = MemoryBudget::from_mb(1).expect("clamped budget");
+        assert_eq!(budget.total_bytes, 16 * MemoryBudget::MIB);
+        assert_eq!(budget.stricter_limit(MemoryComponent::DagQueue, Some(1)), 1);
+        assert_eq!(
+            budget.stricter_limit(MemoryComponent::DagQueue, Some(u64::MAX)),
+            budget.dag_queue_bytes
+        );
+    }
+}

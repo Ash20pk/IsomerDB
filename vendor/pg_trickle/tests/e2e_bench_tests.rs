@@ -1,0 +1,3309 @@
+//! Database-level benchmarks — PLAN.md §11.4.
+//!
+//! Measures differential vs full refresh performance across table sizes,
+//! change rates, and query complexities.
+//!
+//! These tests are `#[ignore]`d to skip in normal CI. Run explicitly:
+//!
+//! ```bash
+//! cargo test --test e2e_bench_tests --features pg18 -- --ignored --nocapture
+//! ```
+//!
+//! Prerequisites: `./tests/build_e2e_image.sh`
+
+mod e2e;
+
+use e2e::E2eDb;
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering},
+    },
+    time::{Duration, Instant},
+};
+
+// ── Configuration ──────────────────────────────────────────────────────
+
+/// Table sizes to benchmark.
+const TABLE_SIZES: &[usize] = &[10_000, 100_000];
+
+/// Change rates (fraction of rows mutated per cycle).
+const CHANGE_RATES: &[f64] = &[0.01, 0.10, 0.50];
+
+/// Number of refresh cycles per (size, rate, query, mode) combination.
+const CYCLES: usize = 10;
+
+/// Number of throw-away warm-up cycles before measured cycles.
+/// Eliminates cache-warming effects from the first measured iteration.
+const WARMUP_CYCLES: usize = 2;
+
+// ── Data generation helpers ────────────────────────────────────────────
+
+/// Generate SQL to bulk-insert `n` rows into a single source table.
+///
+/// Schema: `src(id SERIAL PK, region TEXT, category TEXT, amount INT, score INT)`
+fn bulk_insert_single(n: usize) -> String {
+    // Use generate_series for fast bulk loading
+    format!(
+        "INSERT INTO src (region, category, amount, score)
+         SELECT
+             CASE (i % 5)
+                 WHEN 0 THEN 'north'
+                 WHEN 1 THEN 'south'
+                 WHEN 2 THEN 'east'
+                 WHEN 3 THEN 'west'
+                 ELSE 'central'
+             END,
+             CASE (i % 4)
+                 WHEN 0 THEN 'A'
+                 WHEN 1 THEN 'B'
+                 WHEN 2 THEN 'C'
+                 ELSE 'D'
+             END,
+             (i * 17 + 13) % 10000,
+             (i * 31 + 7) % 100
+         FROM generate_series(1, {n}) AS s(i)"
+    )
+}
+
+async fn apply_vector_aggregate_changes(db: &E2eDb, cycle: usize) {
+    let delete_start = 70_001 + cycle * 15_000;
+    let delete_end = delete_start + 14_999;
+    let insert_start = 1_000_001 + cycle * 15_000;
+    let insert_end = insert_start + 14_999;
+    db.execute(
+        "UPDATE vector_agg_source SET amount = amount + 1 \
+         WHERE id BETWEEN 1 AND 70000",
+    )
+    .await;
+    db.execute(&format!(
+        "DELETE FROM vector_agg_source WHERE id BETWEEN {delete_start} AND {delete_end}"
+    ))
+    .await;
+    db.execute(&format!(
+        "INSERT INTO vector_agg_source (id, group_id, amount) \
+         SELECT i, (i % 10000)::int, ((i * 17 + 13) % 100000)::int \
+         FROM generate_series({insert_start}, {insert_end}) AS rows(i)"
+    ))
+    .await;
+}
+
+async fn refresh_vector_aggregate(db: &E2eDb) {
+    db.execute_seq(&[
+        "SET pg_trickle.aggregate_fast_path = on",
+        "SET pg_trickle.refresh_strategy = 'differential'",
+        "SELECT pgtrickle.refresh_stream_table('vector_agg_result')",
+    ])
+    .await;
+}
+
+async fn vector_aggregate_matches(db: &E2eDb, query: &str) -> bool {
+    db.query_scalar(&format!(
+        "SELECT NOT EXISTS (SELECT 1 FROM (\
+           (SELECT group_id, amount_sum, row_count, amount_avg FROM vector_agg_result \
+            EXCEPT ALL SELECT * FROM ({query}) expected) \
+           UNION ALL \
+           (SELECT * FROM ({query}) expected \
+            EXCEPT ALL SELECT group_id, amount_sum, row_count, amount_avg FROM vector_agg_result)\
+         ) mismatch)"
+    ))
+    .await
+}
+
+/// Frozen v0.88.0 vector-aggregate gate. Keep these dimensions synchronized
+/// with benchmarks/vector-aggregate-v0.88/contract.json.
+#[tokio::test]
+#[ignore]
+async fn bench_vector_aggregate_v088() {
+    const SOURCE_ROWS: usize = 1_000_000;
+    const CHANGED_ROWS: f64 = 100_000.0;
+    const QUERY: &str = "SELECT group_id, SUM(amount) AS amount_sum, \
+                         COUNT(*) AS row_count, AVG(amount) AS amount_avg \
+                         FROM vector_agg_source GROUP BY group_id";
+
+    let db = E2eDb::new_bench().await.with_extension().await;
+    db.execute(
+        "CREATE TABLE vector_agg_source (\
+             id BIGINT PRIMARY KEY, group_id INT NOT NULL, amount INT\
+         )",
+    )
+    .await;
+    db.execute(
+        "INSERT INTO vector_agg_source (id, group_id, amount) \
+         SELECT i, (i % 10000)::int, ((i * 17 + 13) % 100000)::int \
+         FROM generate_series(1, 1000000) AS rows(i)",
+    )
+    .await;
+    db.execute("ANALYZE vector_agg_source").await;
+    db.create_st("vector_agg_result", QUERY, "1m", "DIFFERENTIAL")
+        .await;
+    let extension_version: String = db.query_scalar("SELECT pgtrickle.version()").await;
+    let require_exact = extension_version == "0.88.0";
+
+    apply_vector_aggregate_changes(&db, 0).await;
+    refresh_vector_aggregate(&db).await;
+    let mut exact_checks = vec![vector_aggregate_matches(&db, QUERY).await];
+    assert!(!require_exact || exact_checks[0]);
+
+    let mut refresh_ms = Vec::with_capacity(5);
+    let mut vector_profiles = Vec::with_capacity(5);
+    let temp_bytes_before: i64 = db
+        .query_scalar(
+            "SELECT temp_bytes::bigint FROM pg_stat_database WHERE datname = current_database()",
+        )
+        .await;
+    for cycle in 1..=5 {
+        apply_vector_aggregate_changes(&db, cycle).await;
+        let start = Instant::now();
+        refresh_vector_aggregate(&db).await;
+        refresh_ms.push(start.elapsed().as_secs_f64() * 1000.0);
+        vector_profiles.push(e2e::extract_last_vector_profile(db.container_id()).await);
+        let exact = vector_aggregate_matches(&db, QUERY).await;
+        exact_checks.push(exact);
+        assert!(
+            !require_exact || exact,
+            "exact oracle failed in cycle {cycle}"
+        );
+    }
+
+    refresh_ms.sort_by(|left, right| left.total_cmp(right));
+    let median_ms = refresh_ms[refresh_ms.len() / 2];
+    let temp_bytes_after: i64 = db
+        .query_scalar(
+            "SELECT temp_bytes::bigint FROM pg_stat_database WHERE datname = current_database()",
+        )
+        .await;
+    let memory_peak_bytes = e2e::container_memory_peak_bytes(db.container_id()).await;
+    let merge_strategy: String = db
+        .query_scalar(
+            "SELECT COALESCE(h.merge_strategy_used, '') \
+             FROM pgtrickle.pgt_refresh_history h \
+             JOIN pgtrickle.pgt_stream_tables st USING (pgt_id) \
+             WHERE st.pgt_name = 'vector_agg_result' \
+             ORDER BY h.refresh_id DESC LIMIT 1",
+        )
+        .await;
+    if require_exact {
+        assert_eq!(merge_strategy, "vector_agg");
+    }
+    let baseline = std::env::var("PGS_VECTOR_BENCH_BASELINE_JSON")
+        .ok()
+        .and_then(|path| std::fs::read(path).ok())
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok());
+    let throughput_ratio = baseline.as_ref().and_then(|value| {
+        value["median_ms"]
+            .as_f64()
+            .map(|baseline_ms| baseline_ms / median_ms)
+    });
+    if require_exact && baseline.is_some() {
+        assert!(
+            throughput_ratio.is_some_and(|ratio| ratio >= 5.0),
+            "v0.88 vector throughput ratio {throughput_ratio:?} is below 5x"
+        );
+    }
+    let result = serde_json::json!({
+        "format_version": 1,
+        "extension_version": extension_version,
+        "source_rows": SOURCE_ROWS,
+        "changed_rows": CHANGED_ROWS as u64,
+        "measured_refreshes": refresh_ms.len(),
+        "refresh_ms": refresh_ms,
+        "median_ms": median_ms,
+        "p95_ms": percentile(&refresh_ms, 95.0),
+        "median_changed_rows_per_second": CHANGED_ROWS * 1000.0 / median_ms,
+        "exact_checks": exact_checks,
+        "exact_multiset_validated": exact_checks.iter().all(|passed| *passed),
+        "merge_strategy": merge_strategy,
+        "vector_profiles": vector_profiles,
+        "temp_bytes": temp_bytes_after.saturating_sub(temp_bytes_before),
+        "memory_peak_bytes": memory_peak_bytes,
+        "throughput_ratio_vs_baseline": throughput_ratio,
+    });
+    eprintln!("[VECTOR_AGG_V088] {result}");
+    if let Ok(path) = std::env::var("PGS_VECTOR_BENCH_JSON") {
+        std::fs::write(path, serde_json::to_vec_pretty(&result).unwrap()).unwrap();
+    }
+}
+
+/// Generate SQL to create the second source table for join benchmarks.
+fn create_join_table() -> &'static str {
+    "CREATE TABLE dim (
+         id SERIAL PRIMARY KEY,
+         region TEXT NOT NULL,
+         region_name TEXT NOT NULL,
+         multiplier NUMERIC NOT NULL DEFAULT 1.0
+     )"
+}
+
+/// Populate the dimension table with 5 regions.
+fn populate_dim() -> &'static str {
+    "INSERT INTO dim (region, region_name, multiplier) VALUES
+     ('north', 'Northern Region', 1.1),
+     ('south', 'Southern Region', 0.9),
+     ('east', 'Eastern Region', 1.0),
+     ('west', 'Western Region', 1.2),
+     ('central', 'Central Region', 1.05)"
+}
+
+/// Apply random changes to `change_pct` fraction of rows.
+/// Returns separate SQL statements (sqlx cannot execute multi-statement strings).
+fn apply_changes_stmts(table_size: usize, change_pct: f64) -> Vec<String> {
+    let n_changes = ((table_size as f64) * change_pct).max(1.0) as usize;
+    // Mix of updates (70%), deletes (15%), inserts (15%)
+    let n_updates = (n_changes as f64 * 0.70).max(1.0) as usize;
+    let n_deletes = (n_changes as f64 * 0.15).max(1.0) as usize;
+    let n_inserts = (n_changes as f64 * 0.15).max(1.0) as usize;
+
+    vec![
+        format!(
+            "UPDATE src SET amount = amount + 1
+             WHERE id IN (
+                 SELECT id FROM src ORDER BY random() LIMIT {n_updates}
+             )"
+        ),
+        format!(
+            "DELETE FROM src
+             WHERE id IN (
+                 SELECT id FROM src ORDER BY random() LIMIT {n_deletes}
+             )"
+        ),
+        format!(
+            "INSERT INTO src (region, category, amount, score)
+             SELECT
+                 CASE (i % 5)
+                     WHEN 0 THEN 'north' WHEN 1 THEN 'south'
+                     WHEN 2 THEN 'east' WHEN 3 THEN 'west' ELSE 'central'
+                 END,
+                 CASE (i % 4) WHEN 0 THEN 'A' WHEN 1 THEN 'B' WHEN 2 THEN 'C' ELSE 'D' END,
+                 (random() * 10000)::int,
+                 (random() * 100)::int
+             FROM generate_series(1, {n_inserts}) AS s(i)"
+        ),
+    ]
+}
+
+/// Execute all change statements for a benchmark cycle.
+async fn apply_changes(db: &E2eDb, table_size: usize, change_pct: f64) {
+    for stmt in apply_changes_stmts(table_size, change_pct) {
+        db.execute(&stmt).await;
+    }
+}
+
+// ── Query complexity definitions ───────────────────────────────────────
+
+/// Benchmark scenario: a named query template + whether it needs a join table.
+///
+/// `max_table_size`: when `Some(n)`, the scenario is skipped for table sizes
+/// larger than `n` in the full/large matrix benchmarks.  Use this for queries
+/// that fall back to FULL refresh and have super-linear (e.g. O(n²)) cost at
+/// large scales — notably correlated LATERAL sub-selects and window functions.
+struct QueryScenario {
+    name: &'static str,
+    query: &'static str,
+    needs_dim: bool,
+    /// Skip in matrix benchmarks when `table_size > max_table_size`.
+    max_table_size: Option<usize>,
+}
+
+fn query_scenarios() -> Vec<QueryScenario> {
+    vec![
+        QueryScenario {
+            name: "scan",
+            query: "SELECT id, region, category, amount, score FROM src",
+            needs_dim: false,
+            max_table_size: None,
+        },
+        QueryScenario {
+            name: "filter",
+            query: "SELECT id, region, amount FROM src WHERE amount > 5000",
+            needs_dim: false,
+            max_table_size: None,
+        },
+        QueryScenario {
+            name: "aggregate",
+            query: "SELECT region, SUM(amount) AS total, COUNT(*) AS cnt FROM src GROUP BY region",
+            needs_dim: false,
+            max_table_size: None,
+        },
+        QueryScenario {
+            name: "join",
+            query: "SELECT s.id, s.region, s.amount, d.region_name \
+                    FROM src s INNER JOIN dim d ON s.region = d.region",
+            needs_dim: true,
+            max_table_size: None,
+        },
+        QueryScenario {
+            name: "join_agg",
+            query: "SELECT d.region_name, SUM(s.amount) AS total, COUNT(*) AS cnt \
+                    FROM src s INNER JOIN dim d ON s.region = d.region \
+                    GROUP BY d.region_name",
+            needs_dim: true,
+            max_table_size: None,
+        },
+        // I-7: Window / lateral / CTE / UNION ALL operator scenarios
+        //
+        // window: falls back to FULL refresh (window functions not differentiable).
+        //         O(n log n) FULL refresh becomes expensive at 100K rows.
+        // lateral: correlated sub-select is O(n²/regions) per FULL refresh;
+        //          at 100K rows this took ~60 min in CI — cap at 10K.
+        QueryScenario {
+            name: "window",
+            query: "SELECT id, region, amount, \
+                    ROW_NUMBER() OVER (PARTITION BY region ORDER BY amount DESC, id) AS rn \
+                    FROM src",
+            needs_dim: false,
+            max_table_size: Some(10_000),
+        },
+        QueryScenario {
+            name: "lateral",
+            query: "SELECT s.id, s.region, s.amount, l.top_score \
+                    FROM src s, \
+                    LATERAL (SELECT MAX(score) AS top_score FROM src s2 \
+                             WHERE s2.region = s.region) l",
+            needs_dim: false,
+            max_table_size: Some(10_000),
+        },
+        QueryScenario {
+            name: "cte",
+            query: "WITH regional AS ( \
+                        SELECT region, SUM(amount) AS total FROM src GROUP BY region \
+                    ) \
+                    SELECT s.id, s.region, s.amount, r.total \
+                    FROM src s JOIN regional r ON s.region = r.region",
+            needs_dim: false,
+            max_table_size: None,
+        },
+        QueryScenario {
+            name: "union_all",
+            query: "SELECT id, amount, 'high' AS tier FROM src WHERE amount > 5000 \
+                    UNION ALL \
+                    SELECT id, amount, 'low' AS tier FROM src WHERE amount <= 5000",
+            needs_dim: false,
+            max_table_size: None,
+        },
+    ]
+}
+
+// ── Result reporting ───────────────────────────────────────────────────
+
+// ProfileData, extract_last_profile, and parse_profile_line are shared
+// utilities defined in tests/e2e/mod.rs.
+use e2e::{ProfileData, extract_last_profile};
+
+/// A single benchmark measurement.
+#[derive(Clone)]
+struct BenchResult {
+    scenario: String,
+    table_size: usize,
+    change_pct: f64,
+    mode: String,
+    cycle: usize,
+    refresh_ms: f64,
+    st_row_count: i64,
+    profile: Option<ProfileData>,
+}
+
+/// Compute a percentile from a sorted slice using linear interpolation.
+fn percentile(sorted: &[f64], pct: f64) -> f64 {
+    if sorted.is_empty() {
+        return 0.0;
+    }
+    if sorted.len() == 1 {
+        return sorted[0];
+    }
+    let rank = pct / 100.0 * (sorted.len() - 1) as f64;
+    let lo = rank.floor() as usize;
+    let hi = (lo + 1).min(sorted.len() - 1);
+    let frac = rank - rank.floor();
+    sorted[lo] * (1.0 - frac) + sorted[hi] * frac
+}
+
+/// I-4: Write benchmark results to a JSON file for cross-run comparison.
+///
+/// Output path determined by `PGS_BENCH_JSON` env var, or defaults to
+/// `target/bench_results/<timestamp>.json`.
+fn write_results_json(results: &[BenchResult]) {
+    use std::io::Write;
+
+    let out_dir =
+        std::env::var("PGS_BENCH_JSON_DIR").unwrap_or_else(|_| "target/bench_results".to_string());
+    let _ = std::fs::create_dir_all(&out_dir);
+
+    let timestamp = chrono::Utc::now().format("%Y-%m-%dT%H%M%S");
+    let path = format!("{}/{}.json", out_dir, timestamp);
+
+    // Build JSON manually to avoid serde dependency
+    let mut entries = Vec::new();
+    for r in results {
+        let profile_json = if let Some(ref p) = r.profile {
+            format!(
+                r#"{{"decision_ms":{:.3},"generate_ms":{:.3},"merge_ms":{:.3},"cleanup_ms":{:.3},"total_ms":{:.3},"affected":{},"path":"{}"}}"#,
+                p.decision_ms,
+                p.generate_ms,
+                p.merge_ms,
+                p.cleanup_ms,
+                p.total_ms,
+                p.affected,
+                p.path,
+            )
+        } else {
+            "null".to_string()
+        };
+        entries.push(format!(
+            r#"  {{"scenario":"{}","table_size":{},"change_pct":{},"mode":"{}","cycle":{},"refresh_ms":{:.3},"st_row_count":{},"profile":{}}}"#,
+            r.scenario, r.table_size, r.change_pct, r.mode, r.cycle,
+            r.refresh_ms, r.st_row_count, profile_json,
+        ));
+    }
+
+    let json = format!("[\n{}\n]\n", entries.join(",\n"));
+    match std::fs::File::create(&path) {
+        Ok(mut f) => {
+            let _ = f.write_all(json.as_bytes());
+            eprintln!("[BENCH_JSON] Results written to {}", path);
+        }
+        Err(e) => {
+            eprintln!("[BENCH_JSON] WARN: Could not write {}: {}", path, e);
+        }
+    }
+}
+
+fn print_results_table(results: &[BenchResult]) {
+    // ── Per-cycle machine-parseable output (I-2) ───────────────────
+    // Format: [BENCH_CYCLE] scenario=X rows=N pct=P cycle=C mode=M ms=T
+    // Enables external analysis (histograms, trend detection) without changing
+    // the human-readable tables below.
+    for r in results {
+        eprintln!(
+            "[BENCH_CYCLE] scenario={} rows={} pct={:.2} cycle={} mode={} ms={:.3}{}",
+            r.scenario,
+            r.table_size,
+            r.change_pct,
+            r.cycle,
+            r.mode,
+            r.refresh_ms,
+            if let Some(ref p) = r.profile {
+                format!(
+                    " decision={:.2} gen_build={:.2} merge={:.2} cleanup={:.2} path={}",
+                    p.decision_ms, p.generate_ms, p.merge_ms, p.cleanup_ms, p.path
+                )
+            } else {
+                String::new()
+            },
+        );
+    }
+    eprintln!();
+
+    println!();
+    println!(
+        "╔══════════════════════════════════════════════════════════════════════════════════════╗"
+    );
+    println!("║                    pg_trickle Refresh Benchmark Results                      ║");
+    println!(
+        "╠════════════╤══════════╤════════╤═════════════╤═══════╤════════════╤═════════════════╣"
+    );
+    println!(
+        "║ Scenario   │ Rows     │ Chg %  │ Mode        │ Cycle │ Refresh ms │ ST Rows         ║"
+    );
+    println!(
+        "╠════════════╪══════════╪════════╪═════════════╪═══════╪════════════╪═════════════════╣"
+    );
+
+    for r in results {
+        println!(
+            "║ {:10} │ {:>8} │ {:>5.0}% │ {:11} │ {:>5} │ {:>10.1} │ {:>15} ║",
+            r.scenario,
+            r.table_size,
+            r.change_pct * 100.0,
+            r.mode,
+            r.cycle,
+            r.refresh_ms,
+            r.st_row_count,
+        );
+    }
+    println!(
+        "╚════════════╧══════════╧════════╧═════════════╧═══════╧════════════╧═════════════════╝"
+    );
+    println!();
+
+    // Print summary: avg refresh time per (scenario, size, rate, mode)
+    print_summary(results);
+
+    // I-4: Write JSON results for cross-run comparison
+    write_results_json(results);
+}
+
+/// Benchmark summary grouped by scenario key.
+type SummaryMap = std::collections::BTreeMap<(String, usize, String), (Vec<f64>, Vec<f64>)>;
+
+fn print_summary(results: &[BenchResult]) {
+    println!(
+        "┌──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐"
+    );
+    println!(
+        "│                                    Summary (avg ms per cycle)                                                          │"
+    );
+    println!(
+        "├────────────┬──────────┬────────┬─────────────────┬──────────────────────┬─────────┬─────────┬─────────┬─────────┤"
+    );
+    println!(
+        "│ Scenario   │ Rows     │ Chg %  │ FULL avg ms     │ INCR avg ms          │ INCR c1 │ INCR 2+ │ INCR med│ INCR P95│"
+    );
+    println!(
+        "├────────────┼──────────┼────────┼─────────────────┼──────────────────────┼─────────┼─────────┼─────────┼─────────┤"
+    );
+
+    // Group results by (scenario, size, rate)
+    let mut groups: SummaryMap = std::collections::BTreeMap::new();
+
+    for r in results {
+        let key = (
+            r.scenario.clone(),
+            r.table_size,
+            format!("{:.0}%", r.change_pct * 100.0),
+        );
+        let entry = groups.entry(key).or_insert_with(|| (vec![], vec![]));
+        if r.mode == "FULL" {
+            entry.0.push(r.refresh_ms);
+        } else {
+            entry.1.push(r.refresh_ms);
+        }
+    }
+
+    for ((scenario, size, rate), (full_times, inc_times)) in &groups {
+        let full_avg = if full_times.is_empty() {
+            0.0
+        } else {
+            full_times.iter().sum::<f64>() / full_times.len() as f64
+        };
+        let inc_avg = if inc_times.is_empty() {
+            0.0
+        } else {
+            inc_times.iter().sum::<f64>() / inc_times.len() as f64
+        };
+        let speedup = if inc_avg > 0.0 {
+            format!("{:.1}x", full_avg / inc_avg)
+        } else {
+            "N/A".to_string()
+        };
+
+        // Compute cycle-1 vs cycle-2+ breakdown for DIFFERENTIAL
+        let (c1_str, c2n_str) = if inc_times.len() >= 2 {
+            let c1 = inc_times[0];
+            let c2n_avg = inc_times[1..].iter().sum::<f64>() / (inc_times.len() - 1) as f64;
+            (format!("{c1:>7.1}"), format!("{c2n_avg:>7.1}"))
+        } else if inc_times.len() == 1 {
+            (format!("{:>7.1}", inc_times[0]), "    N/A".to_string())
+        } else {
+            ("    N/A".to_string(), "    N/A".to_string())
+        };
+
+        // Compute median for DIFFERENTIAL
+        let inc_median_str = if !inc_times.is_empty() {
+            let mut sorted = inc_times.clone();
+            sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let median = if sorted.len() % 2 == 0 {
+                (sorted[sorted.len() / 2 - 1] + sorted[sorted.len() / 2]) / 2.0
+            } else {
+                sorted[sorted.len() / 2]
+            };
+            format!("{median:>7.1}")
+        } else {
+            "    N/A".to_string()
+        };
+
+        // Compute P95 for DIFFERENTIAL
+        let inc_p95_str = if !inc_times.is_empty() {
+            let mut sorted = inc_times.clone();
+            sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let p95 = percentile(&sorted, 95.0);
+            format!("{p95:>7.1}")
+        } else {
+            "    N/A".to_string()
+        };
+
+        println!(
+            "│ {:10} │ {:>8} │ {:>6} │ {:>10.1}       │ {:>10.1} ({:>6}) │ {} │ {} │ {} │ {} │",
+            scenario,
+            size,
+            rate,
+            full_avg,
+            inc_avg,
+            speedup,
+            c1_str,
+            c2n_str,
+            inc_median_str,
+            inc_p95_str,
+        );
+    }
+
+    println!(
+        "└────────────┴──────────┴────────┴─────────────────┴──────────────────────┴─────────┴─────────┴─────────┴─────────┘"
+    );
+    println!();
+
+    // Print per-phase timing breakdown for DIFFERENTIAL results
+    print_phase_breakdown(results);
+}
+
+/// Per-phase timing breakdown for DIFFERENTIAL refreshes.
+///
+/// Extracts `[PGS_PROFILE]` data from results and displays average
+/// decision / generate+build / merge / cleanup breakdown per scenario.
+fn print_phase_breakdown(results: &[BenchResult]) {
+    // Collect profile data grouped by (scenario, size, rate)
+    let mut groups: std::collections::BTreeMap<(String, usize, String), Vec<&ProfileData>> =
+        std::collections::BTreeMap::new();
+
+    for r in results {
+        if r.mode == "DIFFERENTIAL"
+            && let Some(ref p) = r.profile
+        {
+            let key = (
+                r.scenario.clone(),
+                r.table_size,
+                format!("{:.0}%", r.change_pct * 100.0),
+            );
+            groups.entry(key).or_default().push(p);
+        }
+    }
+
+    if groups.is_empty() {
+        return;
+    }
+
+    println!(
+        "┌──────────────────────────────────────────────────────────────────────────────────────────────────────┐"
+    );
+    println!(
+        "│                     Per-Phase Timing Breakdown (DIFFERENTIAL avg ms)                                 │"
+    );
+    println!(
+        "├────────────┬──────────┬────────┬──────────┬───────────────┬───────────┬──────────┬──────────────────┤"
+    );
+    println!(
+        "│ Scenario   │ Rows     │ Chg %  │ Decision │ Gen+Build     │ Merge     │ Cleanup  │ Path             │"
+    );
+    println!(
+        "├────────────┼──────────┼────────┼──────────┼───────────────┼───────────┼──────────┼──────────────────┤"
+    );
+
+    for ((scenario, size, rate), profiles) in &groups {
+        let n = profiles.len() as f64;
+        let avg =
+            |f: fn(&ProfileData) -> f64| -> f64 { profiles.iter().map(|p| f(p)).sum::<f64>() / n };
+
+        let decision = avg(|p| p.decision_ms);
+        let generate = avg(|p| p.generate_ms);
+        let merge = avg(|p| p.merge_ms);
+        let cleanup = avg(|p| p.cleanup_ms);
+
+        // Determine dominant path (most common)
+        let hit_count = profiles.iter().filter(|p| p.path == "cache_hit").count();
+        let path = if hit_count > profiles.len() / 2 {
+            "cache_hit"
+        } else {
+            "cache_miss"
+        };
+
+        println!(
+            "│ {:10} │ {:>8} │ {:>6} │ {:>8.2} │ {:>13.2} │ {:>9.2} │ {:>8.2} │ {:16} │",
+            scenario, size, rate, decision, generate, merge, cleanup, path,
+        );
+    }
+
+    println!(
+        "└────────────┴──────────┴────────┴──────────┴───────────────┴───────────┴──────────┴──────────────────┘"
+    );
+    println!();
+}
+
+// ── Benchmark runner ───────────────────────────────────────────────────
+
+/// Whether EXPLAIN ANALYZE plan capture is enabled via `PGS_BENCH_EXPLAIN=true`.
+fn explain_capture_enabled() -> bool {
+    std::env::var("PGS_BENCH_EXPLAIN")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+/// Capture EXPLAIN ANALYZE output for a stream table's defining query.
+///
+/// Runs `EXPLAIN (ANALYZE, BUFFERS, FORMAT TEXT)` on the defining query
+/// and writes the plan to `/tmp/bench_plans/<scenario>_<size>_<pct>.txt`.
+async fn capture_explain_plan(
+    db: &E2eDb,
+    scenario_name: &str,
+    table_size: usize,
+    change_pct: f64,
+    defining_query: &str,
+) {
+    let plan_dir = "/tmp/bench_plans";
+    let _ = std::fs::create_dir_all(plan_dir);
+    let plan_file = format!(
+        "{}/{}_{}_{}pct.txt",
+        plan_dir,
+        scenario_name,
+        table_size,
+        (change_pct * 100.0) as u32
+    );
+
+    let explain_sql = format!("EXPLAIN (ANALYZE, BUFFERS) {defining_query}");
+    match db.query_text(&explain_sql).await {
+        Some(plan_text) => {
+            let _ = std::fs::write(&plan_file, &plan_text);
+            eprintln!(
+                "[BENCH_EXPLAIN] scenario={} rows={} pct={:.2} plan_file={}",
+                scenario_name, table_size, change_pct, plan_file
+            );
+            // Print first 20 lines to console for quick inspection
+            for (i, line) in plan_text.lines().take(20).enumerate() {
+                eprintln!("[BENCH_EXPLAIN]   {}: {}", i + 1, line);
+            }
+        }
+        None => {
+            eprintln!(
+                "[BENCH_EXPLAIN] WARN: Could not capture plan for {}",
+                scenario_name
+            );
+        }
+    }
+}
+
+/// Run one full benchmark for a given (scenario, table_size, change_rate).
+///
+/// Creates one container with bench-tuned resource constraints, sets up
+/// the schema, runs warm-up cycles, and then measures FULL/DIFFERENTIAL
+/// refreshes for fair comparison. Captures `[PGS_PROFILE]` data for
+/// DIFFERENTIAL cycles.
+async fn run_benchmark(
+    scenario: &QueryScenario,
+    table_size: usize,
+    change_pct: f64,
+) -> Vec<BenchResult> {
+    let db = E2eDb::new_bench().await.with_extension().await;
+    let cid = db.container_id().to_string();
+
+    // Create source table
+    db.execute(
+        "CREATE TABLE src (
+             id SERIAL PRIMARY KEY,
+             region TEXT NOT NULL,
+             category TEXT NOT NULL,
+             amount INT NOT NULL,
+             score INT NOT NULL
+         )",
+    )
+    .await;
+
+    // Populate source
+    db.execute(&bulk_insert_single(table_size)).await;
+
+    // Create dimension table if needed
+    if scenario.needs_dim {
+        db.execute(create_join_table()).await;
+        db.execute(populate_dim()).await;
+    }
+
+    // ANALYZE for stable query plans
+    db.execute("ANALYZE src").await;
+    if scenario.needs_dim {
+        db.execute("ANALYZE dim").await;
+    }
+
+    let mut results = Vec::new();
+
+    // ── FULL mode benchmark ────────────────────────────────────────
+    let full_pgt_name = format!("bench_{}_full", scenario.name);
+    db.create_st(&full_pgt_name, scenario.query, "1m", "FULL")
+        .await;
+
+    // Warm-up cycles (throw-away, not measured)
+    for _ in 0..WARMUP_CYCLES {
+        apply_changes(&db, table_size, change_pct).await;
+        db.execute("ANALYZE src").await;
+        db.refresh_st(&full_pgt_name).await;
+    }
+
+    // Measured cycles
+    for cycle in 1..=CYCLES {
+        apply_changes(&db, table_size, change_pct).await;
+        db.execute("ANALYZE src").await;
+
+        let start = Instant::now();
+        db.refresh_st(&full_pgt_name).await;
+        let elapsed = start.elapsed();
+
+        let row_count = db.count(&format!("public.{full_pgt_name}")).await;
+
+        results.push(BenchResult {
+            scenario: scenario.name.to_string(),
+            table_size,
+            change_pct,
+            mode: "FULL".to_string(),
+            cycle,
+            refresh_ms: elapsed.as_secs_f64() * 1000.0,
+            st_row_count: row_count,
+            profile: None,
+        });
+    }
+
+    // Verify smoke correctness of the FULL refresh final state
+    db.assert_st_matches_query(&full_pgt_name, scenario.query)
+        .await;
+
+    db.drop_st(&full_pgt_name).await;
+
+    // ── Re-populate source for DIFFERENTIAL (to have same starting point) ──
+    db.execute("TRUNCATE src RESTART IDENTITY").await;
+    db.execute(&bulk_insert_single(table_size)).await;
+    db.execute("ANALYZE src").await;
+
+    // ── DIFFERENTIAL mode benchmark ─────────────────────────────────
+    let inc_pgt_name = format!("bench_{}_inc", scenario.name);
+    db.create_st(&inc_pgt_name, scenario.query, "1m", "DIFFERENTIAL")
+        .await;
+
+    // Warm-up cycles (throw-away, not measured)
+    for _ in 0..WARMUP_CYCLES {
+        apply_changes(&db, table_size, change_pct).await;
+        db.execute("ANALYZE src").await;
+        db.refresh_st(&inc_pgt_name).await;
+    }
+
+    // I-3: Capture EXPLAIN ANALYZE plan on first measured cycle if enabled
+    if explain_capture_enabled() {
+        apply_changes(&db, table_size, change_pct).await;
+        db.execute("ANALYZE src").await;
+        capture_explain_plan(&db, scenario.name, table_size, change_pct, scenario.query).await;
+        db.refresh_st(&inc_pgt_name).await;
+    }
+
+    // Measured cycles with profile capture
+    for cycle in 1..=CYCLES {
+        apply_changes(&db, table_size, change_pct).await;
+        db.execute("ANALYZE src").await;
+
+        let start = Instant::now();
+        db.refresh_st(&inc_pgt_name).await;
+        let elapsed = start.elapsed();
+
+        let row_count = db.count(&format!("public.{inc_pgt_name}")).await;
+
+        // Capture [PGS_PROFILE] from container logs
+        let profile = extract_last_profile(&cid).await;
+
+        results.push(BenchResult {
+            scenario: scenario.name.to_string(),
+            table_size,
+            change_pct,
+            mode: "DIFFERENTIAL".to_string(),
+            cycle,
+            refresh_ms: elapsed.as_secs_f64() * 1000.0,
+            st_row_count: row_count,
+            profile,
+        });
+    }
+
+    // Verify smoke correctness of the final ST state
+    // Note: since DIFFERENTIAL mode is the last one run, this verifies
+    // that after multi-cycle DML, the ST correctly holds the expected multiset.
+    db.assert_st_matches_query(&inc_pgt_name, scenario.query)
+        .await;
+
+    results
+}
+
+// ── Individual benchmark tests ─────────────────────────────────────────
+//
+// Each test is #[ignore] so it doesn't run in normal CI.
+// Run all benches: cargo test --test e2e_bench_tests --features pg18 -- --ignored --nocapture
+
+#[tokio::test]
+#[ignore]
+async fn bench_scan_10k_1pct() {
+    let scenarios = query_scenarios();
+    let s = &scenarios[0]; // scan
+    let results = run_benchmark(s, 10_000, 0.01).await;
+    print_results_table(&results);
+}
+
+#[tokio::test]
+#[ignore]
+async fn bench_scan_10k_10pct() {
+    let scenarios = query_scenarios();
+    let s = &scenarios[0];
+    let results = run_benchmark(s, 10_000, 0.10).await;
+    print_results_table(&results);
+}
+
+#[tokio::test]
+#[ignore]
+async fn bench_scan_10k_50pct() {
+    let scenarios = query_scenarios();
+    let s = &scenarios[0];
+    let results = run_benchmark(s, 10_000, 0.50).await;
+    print_results_table(&results);
+}
+
+#[tokio::test]
+#[ignore]
+async fn bench_filter_10k_1pct() {
+    let scenarios = query_scenarios();
+    let s = &scenarios[1]; // filter
+    let results = run_benchmark(s, 10_000, 0.01).await;
+    print_results_table(&results);
+}
+
+#[tokio::test]
+#[ignore]
+async fn bench_aggregate_10k_1pct() {
+    let scenarios = query_scenarios();
+    let s = &scenarios[2]; // aggregate
+    let results = run_benchmark(s, 10_000, 0.01).await;
+    print_results_table(&results);
+}
+
+#[tokio::test]
+#[ignore]
+async fn bench_join_10k_1pct() {
+    let scenarios = query_scenarios();
+    let s = &scenarios[3]; // join
+    let results = run_benchmark(s, 10_000, 0.01).await;
+    print_results_table(&results);
+}
+
+#[tokio::test]
+#[ignore]
+async fn bench_join_agg_10k_1pct() {
+    let scenarios = query_scenarios();
+    let s = &scenarios[4]; // join_agg
+    let results = run_benchmark(s, 10_000, 0.01).await;
+    print_results_table(&results);
+}
+
+// ── I-7: Window / lateral / CTE / UNION ALL benchmarks (10K) ──────────
+
+#[tokio::test]
+#[ignore]
+async fn bench_window_10k_1pct() {
+    let scenarios = query_scenarios();
+    let s = &scenarios[5]; // window
+    let results = run_benchmark(s, 10_000, 0.01).await;
+    print_results_table(&results);
+}
+
+#[tokio::test]
+#[ignore]
+async fn bench_lateral_10k_1pct() {
+    let scenarios = query_scenarios();
+    let s = &scenarios[6]; // lateral
+    let results = run_benchmark(s, 10_000, 0.01).await;
+    print_results_table(&results);
+}
+
+#[tokio::test]
+#[ignore]
+async fn bench_lateral_100k_1pct() {
+    let scenarios = query_scenarios();
+    let s = &scenarios[6]; // lateral
+    let results = run_benchmark(s, 100_000, 0.01).await;
+    print_results_table(&results);
+}
+
+#[tokio::test]
+#[ignore]
+async fn bench_cte_10k_1pct() {
+    let scenarios = query_scenarios();
+    let s = &scenarios[7]; // cte
+    let results = run_benchmark(s, 10_000, 0.01).await;
+    print_results_table(&results);
+}
+
+#[tokio::test]
+#[ignore]
+async fn bench_union_all_10k_1pct() {
+    let scenarios = query_scenarios();
+    let s = &scenarios[8]; // union_all
+    let results = run_benchmark(s, 10_000, 0.01).await;
+    print_results_table(&results);
+}
+
+// ── 100K row benchmarks ────────────────────────────────────────────────
+
+#[tokio::test]
+#[ignore]
+async fn bench_scan_100k_1pct() {
+    let scenarios = query_scenarios();
+    let s = &scenarios[0];
+    let results = run_benchmark(s, 100_000, 0.01).await;
+    print_results_table(&results);
+}
+
+#[tokio::test]
+#[ignore]
+async fn bench_scan_100k_10pct() {
+    let scenarios = query_scenarios();
+    let s = &scenarios[0];
+    let results = run_benchmark(s, 100_000, 0.10).await;
+    print_results_table(&results);
+}
+
+#[tokio::test]
+#[ignore]
+async fn bench_scan_100k_50pct() {
+    let scenarios = query_scenarios();
+    let s = &scenarios[0];
+    let results = run_benchmark(s, 100_000, 0.50).await;
+    print_results_table(&results);
+}
+
+#[tokio::test]
+#[ignore]
+async fn bench_aggregate_100k_1pct() {
+    let scenarios = query_scenarios();
+    let s = &scenarios[2];
+    let results = run_benchmark(s, 100_000, 0.01).await;
+    print_results_table(&results);
+}
+
+#[tokio::test]
+#[ignore]
+async fn bench_aggregate_100k_10pct() {
+    let scenarios = query_scenarios();
+    let s = &scenarios[2];
+    let results = run_benchmark(s, 100_000, 0.10).await;
+    print_results_table(&results);
+}
+
+#[tokio::test]
+#[ignore]
+async fn bench_join_100k_1pct() {
+    let scenarios = query_scenarios();
+    let s = &scenarios[3]; // join
+    let results = run_benchmark(s, 100_000, 0.01).await;
+    print_results_table(&results);
+}
+
+#[tokio::test]
+#[ignore]
+async fn bench_join_agg_100k_1pct() {
+    let scenarios = query_scenarios();
+    let s = &scenarios[4];
+    let results = run_benchmark(s, 100_000, 0.01).await;
+    print_results_table(&results);
+}
+
+#[tokio::test]
+#[ignore]
+async fn bench_join_agg_100k_10pct() {
+    let scenarios = query_scenarios();
+    let s = &scenarios[4];
+    let results = run_benchmark(s, 100_000, 0.10).await;
+    print_results_table(&results);
+}
+
+// ── 1M row benchmarks (I-6) ───────────────────────────────────────────
+//
+// Tests at production-scale table sizes. The delta is larger (10K changes
+// at 1% of 1M rows) and MERGE touches more stream table rows.
+// Run separately from the standard suite due to longer run time.
+
+#[tokio::test]
+#[ignore]
+async fn bench_scan_1m_1pct() {
+    let scenarios = query_scenarios();
+    let s = &scenarios[0]; // scan
+    let results = run_benchmark(s, 1_000_000, 0.01).await;
+    print_results_table(&results);
+}
+
+#[tokio::test]
+#[ignore]
+async fn bench_filter_1m_1pct() {
+    let scenarios = query_scenarios();
+    let s = &scenarios[1]; // filter
+    let results = run_benchmark(s, 1_000_000, 0.01).await;
+    print_results_table(&results);
+}
+
+#[tokio::test]
+#[ignore]
+async fn bench_aggregate_1m_1pct() {
+    let scenarios = query_scenarios();
+    let s = &scenarios[2]; // aggregate
+    let results = run_benchmark(s, 1_000_000, 0.01).await;
+    print_results_table(&results);
+}
+
+#[tokio::test]
+#[ignore]
+async fn bench_join_1m_1pct() {
+    let scenarios = query_scenarios();
+    let s = &scenarios[3]; // join
+    let results = run_benchmark(s, 1_000_000, 0.01).await;
+    print_results_table(&results);
+}
+
+#[tokio::test]
+#[ignore]
+async fn bench_join_agg_1m_1pct() {
+    let scenarios = query_scenarios();
+    let s = &scenarios[4]; // join_agg
+    let results = run_benchmark(s, 1_000_000, 0.01).await;
+    print_results_table(&results);
+}
+
+// ── Large matrix benchmark (I-6) ──────────────────────────────────────
+//
+// Includes the 1M-row tier in addition to 10K and 100K. Uses only 1% change
+// rate at 1M to keep run time reasonable. Expect ~45-90 minutes total.
+
+#[tokio::test]
+#[ignore]
+async fn bench_large_matrix() {
+    let scenarios = query_scenarios();
+    let mut all_results = Vec::new();
+    let large_sizes: &[usize] = &[10_000, 100_000, 1_000_000];
+    let large_rates: &[f64] = &[0.01, 0.10];
+
+    for &table_size in large_sizes {
+        // At 1M rows, only test 1% change rate to keep run time sane
+        let rates: &[f64] = if table_size >= 1_000_000 {
+            &[0.01]
+        } else {
+            large_rates
+        };
+        for &change_pct in rates {
+            for scenario in &scenarios {
+                if let Some(max) = scenario.max_table_size
+                    && table_size > max
+                {
+                    eprintln!(
+                        "↷ Skipping: {} | {}rows (capped at {}rows — FULL-refresh O(n²))",
+                        scenario.name, table_size, max,
+                    );
+                    continue;
+                }
+                eprintln!(
+                    "▶ Benchmarking: {} | {} rows | {:.0}% changes ...",
+                    scenario.name,
+                    table_size,
+                    change_pct * 100.0,
+                );
+                let results = run_benchmark(scenario, table_size, change_pct).await;
+                all_results.extend(results);
+            }
+        }
+    }
+
+    print_results_table(&all_results);
+}
+
+// ── Full matrix benchmark ──────────────────────────────────────────────
+//
+// Runs ALL combinations of dimensions: 9 queries × 2 sizes × 3 rates,
+// skipping scenarios whose `max_table_size` cap would be exceeded.
+// Each run does CYCLES full + CYCLES differential refreshes.
+// Expect ~30-60 minutes depending on hardware.
+//
+// Scenarios capped at 10K rows (lateral, window) are excluded at 100K
+// because their FULL-refresh cost is O(n²) / prohibitively slow in CI.
+
+#[tokio::test]
+#[ignore]
+async fn bench_full_matrix() {
+    let scenarios = query_scenarios();
+    let mut all_results = Vec::new();
+
+    for table_size in TABLE_SIZES {
+        for change_pct in CHANGE_RATES {
+            for scenario in &scenarios {
+                if let Some(max) = scenario.max_table_size
+                    && *table_size > max
+                {
+                    eprintln!(
+                        "↷ Skipping: {} | {}rows (capped at {}rows — FULL-refresh O(n²))",
+                        scenario.name, table_size, max,
+                    );
+                    continue;
+                }
+                eprintln!(
+                    "▶ Benchmarking: {} | {}rows | {:.0}% changes ...",
+                    scenario.name,
+                    table_size,
+                    change_pct * 100.0,
+                );
+                let results = run_benchmark(scenario, *table_size, *change_pct).await;
+                all_results.extend(results);
+            }
+        }
+    }
+
+    print_results_table(&all_results);
+}
+
+// ── NO_DATA refresh latency benchmark ──────────────────────────────────
+
+#[tokio::test]
+#[ignore]
+async fn bench_no_data_refresh_latency() {
+    let db = E2eDb::new_bench().await.with_extension().await;
+
+    db.execute("CREATE TABLE src_nd (id SERIAL PRIMARY KEY, val INT NOT NULL)")
+        .await;
+    db.execute("INSERT INTO src_nd (val) SELECT i FROM generate_series(1, 10000) AS s(i)")
+        .await;
+
+    db.create_st("nd_st", "SELECT id, val FROM src_nd", "1m", "DIFFERENTIAL")
+        .await;
+
+    // No changes → refresh should be near-zero cost
+    let mut times = Vec::new();
+    for _ in 0..10 {
+        let start = Instant::now();
+        db.refresh_st("nd_st").await;
+        times.push(start.elapsed().as_secs_f64() * 1000.0);
+    }
+
+    let avg = times.iter().sum::<f64>() / times.len() as f64;
+    let max_ms = times.iter().cloned().fold(0.0f64, f64::max);
+
+    println!();
+    println!("┌──────────────────────────────────────────────┐");
+    println!("│ NO_DATA Refresh Latency (10 iterations)      │");
+    println!("├──────────────────────────────────────────────┤");
+    println!("│ Avg: {:>8.2} ms                             │", avg);
+    println!("│ Max: {:>8.2} ms                             │", max_ms);
+    println!("│ Target: < 10 ms                              │");
+    println!(
+        "│ Status: {}                              │",
+        if avg < 10.0 {
+            "✅ PASS"
+        } else {
+            "⚠️ SLOW"
+        }
+    );
+    println!("└──────────────────────────────────────────────┘");
+    println!();
+
+    // Verify smoke correctness
+    db.assert_st_matches_query("nd_st", "SELECT id, val FROM src_nd")
+        .await;
+}
+// ═══════════════════════════════════════════════════════════════════════
+// F50 / G7.3 — Covering index overhead benchmark
+//
+// Compares change buffer query performance with and without the INCLUDE
+// (action) clause on the (lsn, row_probe_v1(__pgt_row_id), change_id) index.
+// ═══════════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+#[ignore]
+async fn bench_covering_index_overhead() {
+    let db = E2eDb::new_bench().await.with_extension().await;
+
+    // Create a source table and stream table to get the change buffer
+    db.execute("CREATE TABLE ci_src (id SERIAL PRIMARY KEY, grp TEXT, val INT)")
+        .await;
+    db.execute(
+        "INSERT INTO ci_src (grp, val) \
+         SELECT CASE (i % 10) WHEN 0 THEN 'a' WHEN 1 THEN 'b' WHEN 2 THEN 'c' \
+                WHEN 3 THEN 'd' WHEN 4 THEN 'e' ELSE 'f' END, \
+                (i * 17 + 13) % 10000 \
+         FROM generate_series(1, 50000) AS s(i)",
+    )
+    .await;
+
+    let q = "SELECT grp, SUM(val) AS total, COUNT(*) AS cnt FROM ci_src GROUP BY grp";
+    db.create_st("ci_st", q, "1m", "DIFFERENTIAL").await;
+
+    // Find the change buffer table OID
+    let src_oid: i64 = db
+        .query_scalar(
+            "SELECT oid::bigint FROM pg_class WHERE relname = 'ci_src' AND relnamespace = 'public'::regnamespace",
+        )
+        .await;
+    let buf_table = format!("pgtrickle_changes.changes_{}", src_oid);
+
+    // Generate a significant number of changes in the buffer
+    // (don't refresh — let them accumulate)
+    for _round in 0..3 {
+        db.execute("UPDATE ci_src SET val = val + 1 WHERE id <= 5000")
+            .await;
+    }
+
+    let change_count: i64 = db
+        .query_scalar(&format!("SELECT COUNT(*) FROM {buf_table}"))
+        .await;
+    println!();
+    println!("Change buffer has {} pending rows", change_count);
+
+    // Typical change buffer query pattern (mirrors what refresh does):
+    let bench_query = format!(
+        "SELECT __pgt_row_id, action, change_id \
+         FROM {buf_table} \
+         WHERE lsn > '0/0' \
+         ORDER BY pgtrickle.row_probe_v1(__pgt_row_id), change_id"
+    );
+
+    // ── Phase 1: WITH covering index (default) ───────────────────
+
+    // Warm up
+    for _ in 0..3 {
+        db.execute(&format!("SELECT COUNT(*) FROM ({}) sub", bench_query))
+            .await;
+    }
+
+    let mut with_include_ms = Vec::new();
+    for _ in 0..20 {
+        let start = Instant::now();
+        db.execute(&format!("SELECT COUNT(*) FROM ({}) sub", bench_query))
+            .await;
+        with_include_ms.push(start.elapsed().as_secs_f64() * 1000.0);
+    }
+
+    // ── Phase 2: WITHOUT covering index ──────────────────────────
+
+    // Drop the covering index and create a plain one
+    let idx_name = format!("idx_changes_{}_lsn_pk_cid", src_oid);
+    db.execute(&format!(
+        "DROP INDEX IF EXISTS pgtrickle_changes.{idx_name}"
+    ))
+    .await;
+    db.execute(&format!(
+        "CREATE INDEX {idx_name}_plain ON {buf_table} (lsn, pgtrickle.row_probe_v1(__pgt_row_id), change_id)"
+    ))
+    .await;
+    db.execute("ANALYZE").await;
+
+    // Warm up
+    for _ in 0..3 {
+        db.execute(&format!("SELECT COUNT(*) FROM ({}) sub", bench_query))
+            .await;
+    }
+
+    let mut without_include_ms = Vec::new();
+    for _ in 0..20 {
+        let start = Instant::now();
+        db.execute(&format!("SELECT COUNT(*) FROM ({}) sub", bench_query))
+            .await;
+        without_include_ms.push(start.elapsed().as_secs_f64() * 1000.0);
+    }
+
+    // ── Results ──────────────────────────────────────────────────
+
+    let avg_with = with_include_ms.iter().sum::<f64>() / with_include_ms.len() as f64;
+    let avg_without = without_include_ms.iter().sum::<f64>() / without_include_ms.len() as f64;
+    let p95_with = percentile(&with_include_ms, 0.95);
+    let p95_without = percentile(&without_include_ms, 0.95);
+    let diff_pct = ((avg_with - avg_without) / avg_without) * 100.0;
+
+    println!();
+    println!("┌─────────────────────────────────────────────────────────┐");
+    println!("│ F50: Covering Index (INCLUDE action) Overhead Benchmark │");
+    println!("├─────────────────────────────────────────────────────────┤");
+    println!(
+        "│ Change buffer rows: {:>8}                            │",
+        change_count
+    );
+    println!("│                                                         │");
+    println!("│           WITH INCLUDE    WITHOUT INCLUDE               │");
+    println!(
+        "│  Avg:     {:>8.2} ms     {:>8.2} ms                   │",
+        avg_with, avg_without
+    );
+    println!(
+        "│  P95:     {:>8.2} ms     {:>8.2} ms                   │",
+        p95_with, p95_without
+    );
+    println!("│                                                         │");
+    println!(
+        "│  Overhead: {:>+.1}%                                       │",
+        diff_pct
+    );
+    println!(
+        "│  Verdict:  {}                                      │",
+        if diff_pct.abs() < 15.0 {
+            "✅ Acceptable"
+        } else if diff_pct > 0.0 {
+            "⚠️ Significant overhead"
+        } else {
+            "✅ INCLUDE is faster"
+        }
+    );
+    println!("└─────────────────────────────────────────────────────────┘");
+    println!();
+
+    db.assert_st_matches_query(
+        "ci_st",
+        "SELECT grp, SUM(val) AS total, COUNT(*) AS cnt FROM ci_src GROUP BY grp",
+    )
+    .await;
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// E: CDC Trigger Overhead Benchmark
+//
+// Measures write-side overhead introduced by row-level AFTER triggers used
+// for change-data-capture. Compares INSERT/UPDATE/DELETE throughput on a
+// table that is a stream table source (has CDC triggers) versus an
+// identical table with no triggers.
+// ═══════════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+#[ignore]
+async fn bench_cdc_trigger_overhead() {
+    let db = E2eDb::new_bench().await.with_extension().await;
+
+    let rows = 50_000usize;
+    let batch = 5_000usize;
+    let iterations = 10usize;
+
+    // ── Setup: two identical tables ──────────────────────────────
+
+    // Table WITH CDC triggers (source of a stream table)
+    db.execute("CREATE TABLE cdc_src (id SERIAL PRIMARY KEY, region TEXT, amount INT)")
+        .await;
+    db.execute(&format!(
+        "INSERT INTO cdc_src (region, amount) \
+         SELECT CASE (i % 5) WHEN 0 THEN 'n' WHEN 1 THEN 's' WHEN 2 THEN 'e' \
+                WHEN 3 THEN 'w' ELSE 'c' END, (i * 17) % 10000 \
+         FROM generate_series(1, {rows}) AS s(i)"
+    ))
+    .await;
+
+    // Create a stream table so CDC triggers are installed on cdc_src
+    db.create_st(
+        "cdc_bench_st",
+        "SELECT id, region, amount FROM cdc_src",
+        "1m",
+        "DIFFERENTIAL",
+    )
+    .await;
+
+    // Table WITHOUT CDC triggers (control)
+    db.execute("CREATE TABLE nocdc_src (id SERIAL PRIMARY KEY, region TEXT, amount INT)")
+        .await;
+    db.execute(&format!(
+        "INSERT INTO nocdc_src (region, amount) \
+         SELECT CASE (i % 5) WHEN 0 THEN 'n' WHEN 1 THEN 's' WHEN 2 THEN 'e' \
+                WHEN 3 THEN 'w' ELSE 'c' END, (i * 17) % 10000 \
+         FROM generate_series(1, {rows}) AS s(i)"
+    ))
+    .await;
+
+    db.execute("ANALYZE cdc_src").await;
+    db.execute("ANALYZE nocdc_src").await;
+
+    // Verify CDC trigger exists on the source
+    let trig_count: i64 = db
+        .query_scalar(
+            "SELECT count(*) FROM pg_trigger t \
+             JOIN pg_class c ON c.oid = t.tgrelid \
+                         WHERE c.relname = 'cdc_src' \
+                             AND (t.tgname LIKE 'pg_trickle_%' OR t.tgname LIKE 'pgt_%')",
+        )
+        .await;
+    assert!(
+        trig_count > 0,
+        "CDC triggers should be installed on cdc_src"
+    );
+
+    // ── Benchmark: INSERT ────────────────────────────────────────
+
+    let mut cdc_insert_ms = Vec::new();
+    let mut nocdc_insert_ms = Vec::new();
+
+    for i in 0..iterations {
+        let offset = rows + i * batch;
+
+        let start = Instant::now();
+        db.execute(&format!(
+            "INSERT INTO cdc_src (region, amount) \
+             SELECT 'n', (i * 13) % 10000 \
+             FROM generate_series(1, {batch}) AS s(i)"
+        ))
+        .await;
+        cdc_insert_ms.push(start.elapsed().as_secs_f64() * 1000.0);
+
+        let start = Instant::now();
+        db.execute(&format!(
+            "INSERT INTO nocdc_src (region, amount) \
+             SELECT 'n', (i * 13) % 10000 \
+             FROM generate_series(1, {batch}) AS s(i)"
+        ))
+        .await;
+        nocdc_insert_ms.push(start.elapsed().as_secs_f64() * 1000.0);
+
+        // Drain the change buffer periodically to avoid bloat
+        if i % 3 == 2 {
+            db.refresh_st("cdc_bench_st").await;
+        }
+
+        let _ = offset;
+    }
+
+    // ── Benchmark: UPDATE ────────────────────────────────────────
+
+    let mut cdc_update_ms = Vec::new();
+    let mut nocdc_update_ms = Vec::new();
+
+    for _ in 0..iterations {
+        let start = Instant::now();
+        db.execute(&format!(
+            "UPDATE cdc_src SET amount = amount + 1 \
+             WHERE id IN (SELECT id FROM cdc_src ORDER BY id LIMIT {batch})"
+        ))
+        .await;
+        cdc_update_ms.push(start.elapsed().as_secs_f64() * 1000.0);
+
+        let start = Instant::now();
+        db.execute(&format!(
+            "UPDATE nocdc_src SET amount = amount + 1 \
+             WHERE id IN (SELECT id FROM nocdc_src ORDER BY id LIMIT {batch})"
+        ))
+        .await;
+        nocdc_update_ms.push(start.elapsed().as_secs_f64() * 1000.0);
+
+        db.refresh_st("cdc_bench_st").await;
+    }
+
+    // ── Benchmark: DELETE ────────────────────────────────────────
+
+    let mut cdc_delete_ms = Vec::new();
+    let mut nocdc_delete_ms = Vec::new();
+
+    for i in 0..iterations {
+        // Delete a batch of rows (from the end to avoid conflicting with updates)
+        let start = Instant::now();
+        db.execute(&format!(
+            "DELETE FROM cdc_src \
+             WHERE id IN (SELECT id FROM cdc_src ORDER BY id DESC LIMIT {})",
+            batch / 5
+        ))
+        .await;
+        cdc_delete_ms.push(start.elapsed().as_secs_f64() * 1000.0);
+
+        let start = Instant::now();
+        db.execute(&format!(
+            "DELETE FROM nocdc_src \
+             WHERE id IN (SELECT id FROM nocdc_src ORDER BY id DESC LIMIT {})",
+            batch / 5
+        ))
+        .await;
+        nocdc_delete_ms.push(start.elapsed().as_secs_f64() * 1000.0);
+
+        if i % 3 == 2 {
+            db.refresh_st("cdc_bench_st").await;
+        }
+    }
+
+    // ── Results ──────────────────────────────────────────────────
+
+    let avg = |v: &[f64]| v.iter().sum::<f64>() / v.len() as f64;
+    let overhead = |cdc: &[f64], nocdc: &[f64]| {
+        let a = avg(cdc);
+        let b = avg(nocdc);
+        if b > 0.0 { ((a - b) / b) * 100.0 } else { 0.0 }
+    };
+
+    let ins_oh = overhead(&cdc_insert_ms, &nocdc_insert_ms);
+    let upd_oh = overhead(&cdc_update_ms, &nocdc_update_ms);
+    let del_oh = overhead(&cdc_delete_ms, &nocdc_delete_ms);
+    let avg_oh = (ins_oh + upd_oh + del_oh) / 3.0;
+
+    println!();
+    println!("┌───────────────────────────────────────────────────────────┐");
+    println!("│ E: CDC Trigger Overhead Benchmark                        │");
+    println!("├───────────────────────────────────────────────────────────┤");
+    println!(
+        "│ Config: {} base rows, {} rows/batch, {} iterations       │",
+        rows, batch, iterations
+    );
+    println!("│                                                           │");
+    println!("│ Operation    CDC (avg)    No-CDC (avg)    Overhead        │");
+    println!(
+        "│ INSERT    {:>8.2} ms    {:>8.2} ms    {:>+6.1}%          │",
+        avg(&cdc_insert_ms),
+        avg(&nocdc_insert_ms),
+        ins_oh,
+    );
+    println!(
+        "│ UPDATE    {:>8.2} ms    {:>8.2} ms    {:>+6.1}%          │",
+        avg(&cdc_update_ms),
+        avg(&nocdc_update_ms),
+        upd_oh,
+    );
+    println!(
+        "│ DELETE    {:>8.2} ms    {:>8.2} ms    {:>+6.1}%          │",
+        avg(&cdc_delete_ms),
+        avg(&nocdc_delete_ms),
+        del_oh,
+    );
+    println!("│                                                           │");
+    println!(
+        "│ Average overhead: {:>+.1}%                                 │",
+        avg_oh
+    );
+    println!(
+        "│ Verdict: {}                                           │",
+        if avg_oh < 20.0 {
+            "✅ Acceptable (<20%)"
+        } else if avg_oh < 50.0 {
+            "⚠️  Moderate (20-50%)"
+        } else {
+            "❌ High (>50%)       "
+        }
+    );
+    println!("└───────────────────────────────────────────────────────────┘");
+    println!();
+
+    // Verify smoke correctness after operations
+    db.refresh_st("cdc_bench_st").await;
+    db.assert_st_matches_query("cdc_bench_st", "SELECT id, region, amount FROM cdc_src")
+        .await;
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// B3: Statement-Level vs Row-Level CDC Trigger Write-Side Benchmark
+//
+// Measures the write-side overhead reduction from statement-level triggers
+// (v0.4.0 default) vs the legacy row-level triggers.
+//
+// Matrix: 3 table widths × 3 DML types × bulk + single-row = 18 cells.
+//
+// Table widths:
+//   narrow  — 3 columns (id PK, grp TEXT, val INT)
+//   medium  — 8 columns (id PK, a–f TEXT/INT, val INT)
+//   wide    — 20 columns (id PK + 19 data columns)
+//
+// DML types: bulk INSERT (5 000 rows), bulk UPDATE (5 000 rows), single-row
+// INSERT (1 row).
+//
+// Expected outcome: 50–80% write overhead reduction for bulk DML with
+// statement-level triggers; neutral for single-row DML.
+//
+// Run explicitly:
+//   cargo test --test e2e_bench_tests -- --ignored bench_stmt_vs_row_cdc_matrix --nocapture
+// ═══════════════════════════════════════════════════════════════════════
+
+/// Schema descriptor for one table-width variant.
+struct TableWidth {
+    name: &'static str,
+    cols: usize,
+    create_ddl: &'static str,
+    insert_bulk_sql: &'static str,
+    /// Stream-table defining query (must be a SELECT on the source).
+    st_query: &'static str,
+}
+
+fn table_widths() -> Vec<TableWidth> {
+    vec![
+        TableWidth {
+            name: "narrow",
+            cols: 3,
+            create_ddl: "CREATE TABLE {src} (id SERIAL PRIMARY KEY, grp TEXT NOT NULL, val INT NOT NULL)",
+            insert_bulk_sql: "INSERT INTO {src} (grp, val) \
+                SELECT CASE (i%5) WHEN 0 THEN 'a' WHEN 1 THEN 'b' WHEN 2 THEN 'c' \
+                WHEN 3 THEN 'd' ELSE 'e' END, (i*17)%10000 \
+                FROM generate_series(1,{n}) AS s(i)",
+            st_query: "SELECT id, grp, val FROM {src}",
+        },
+        TableWidth {
+            name: "medium",
+            cols: 8,
+            create_ddl: "CREATE TABLE {src} (id SERIAL PRIMARY KEY, \
+                a TEXT NOT NULL, b TEXT NOT NULL, c TEXT NOT NULL, \
+                d INT NOT NULL, e INT NOT NULL, f INT NOT NULL, val INT NOT NULL)",
+            insert_bulk_sql: "INSERT INTO {src} (a,b,c,d,e,f,val) \
+                SELECT CASE (i%3) WHEN 0 THEN 'x' WHEN 1 THEN 'y' ELSE 'z' END, \
+                       CASE (i%4) WHEN 0 THEN 'p' WHEN 1 THEN 'q' WHEN 2 THEN 'r' ELSE 's' END, \
+                       CASE (i%5) WHEN 0 THEN 'a' WHEN 1 THEN 'b' WHEN 2 THEN 'c' WHEN 3 THEN 'd' ELSE 'e' END, \
+                       (i*3)%100, (i*7)%100, (i*13)%100, (i*17)%10000 \
+                FROM generate_series(1,{n}) AS s(i)",
+            st_query: "SELECT id, a, b, c, d, e, f, val FROM {src}",
+        },
+        TableWidth {
+            name: "wide",
+            cols: 20,
+            create_ddl: "CREATE TABLE {src} (id SERIAL PRIMARY KEY, \
+                c1 TEXT, c2 TEXT, c3 TEXT, c4 TEXT, c5 TEXT, \
+                c6 INT, c7 INT, c8 INT, c9 INT, c10 INT, \
+                c11 TEXT, c12 TEXT, c13 TEXT, c14 TEXT, c15 TEXT, \
+                c16 INT, c17 INT, c18 INT, c19 INT)",
+            insert_bulk_sql: "INSERT INTO {src} (c1,c2,c3,c4,c5,c6,c7,c8,c9,c10,c11,c12,c13,c14,c15,c16,c17,c18,c19) \
+                SELECT CASE (i%3) WHEN 0 THEN 'x' WHEN 1 THEN 'y' ELSE 'z' END, \
+                       CASE (i%4) WHEN 0 THEN 'p' WHEN 1 THEN 'q' WHEN 2 THEN 'r' ELSE 's' END, \
+                       CASE (i%5) WHEN 0 THEN 'a' WHEN 1 THEN 'b' WHEN 2 THEN 'c' WHEN 3 THEN 'd' ELSE 'e' END, \
+                       CASE (i%2) WHEN 0 THEN 'foo' ELSE 'bar' END, \
+                       CASE (i%6) WHEN 0 THEN 'alpha' WHEN 1 THEN 'beta' WHEN 2 THEN 'gamma' \
+                       WHEN 3 THEN 'delta' WHEN 4 THEN 'epsilon' ELSE 'zeta' END, \
+                       (i*2)%100, (i*3)%100, (i*5)%100, (i*7)%100, (i*11)%100, \
+                       CASE (i%3) WHEN 0 THEN 'u' WHEN 1 THEN 'v' ELSE 'w' END, \
+                       CASE (i%4) WHEN 0 THEN 'i' WHEN 1 THEN 'j' WHEN 2 THEN 'k' ELSE 'l' END, \
+                       CASE (i%5) WHEN 0 THEN 'f' WHEN 1 THEN 'g' WHEN 2 THEN 'h' WHEN 3 THEN 'i' ELSE 'j' END, \
+                       CASE (i%2) WHEN 0 THEN 'cat' ELSE 'dog' END, \
+                       CASE (i%3) WHEN 0 THEN 'red' WHEN 1 THEN 'green' ELSE 'blue' END, \
+                       (i*13)%100, (i*17)%100, (i*19)%100, (i*23)%100 \
+                FROM generate_series(1,{n}) AS s(i)",
+            st_query: "SELECT id, c1, c6, c11, c16 FROM {src}",
+        },
+    ]
+}
+
+/// A single CDC trigger mode benchmark cell result.
+#[derive(Clone)]
+struct TriggerBenchResult {
+    width: String,
+    mode: String,
+    dml: String,
+    batch_size: usize,
+    timings_ms: Vec<f64>,
+}
+
+impl TriggerBenchResult {
+    fn avg(&self) -> f64 {
+        self.timings_ms.iter().sum::<f64>() / self.timings_ms.len() as f64
+    }
+    fn p50(&self) -> f64 {
+        let mut v = self.timings_ms.clone();
+        v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        percentile(&v, 50.0)
+    }
+    fn p95(&self) -> f64 {
+        let mut v = self.timings_ms.clone();
+        v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        percentile(&v, 95.0)
+    }
+}
+
+fn speedup_str(row_avg: f64, stmt_avg: f64) -> String {
+    if row_avg <= 0.0 || stmt_avg <= 0.0 {
+        return "   n/a".to_string();
+    }
+    let ratio = row_avg / stmt_avg;
+    if ratio >= 1.0 {
+        format!("{:.2}x⬇", ratio)
+    } else {
+        format!("{:.2}x⬆", ratio)
+    }
+}
+
+/// Run the full B3 benchmark matrix.
+///
+/// For each table width, enables row-level mode and statement-level mode in
+/// turn, measures bulk INSERT / bulk UPDATE / single INSERT, then prints the
+/// comparison table.
+async fn run_stmt_vs_row_matrix() {
+    const BASE_ROWS: usize = 50_000;
+    const BULK_BATCH: usize = 5_000;
+    const SINGLE_BATCH: usize = 1;
+    const ITERATIONS: usize = 10;
+    const WARMUP: usize = 2;
+
+    let mut all_results: Vec<TriggerBenchResult> = Vec::new();
+
+    for width in table_widths() {
+        eprintln!(
+            "▶ B3: {} table ({} cols) — row vs statement mode ...",
+            width.name, width.cols
+        );
+
+        for trigger_mode in &["row", "statement"] {
+            let db = E2eDb::new_bench().await.with_extension().await;
+
+            // Switch to the requested trigger mode
+            db.alter_system_set_and_wait(
+                "pg_trickle.cdc_trigger_mode",
+                &format!("'{trigger_mode}'"),
+                trigger_mode,
+            )
+            .await;
+
+            let src = format!("cdc_b3_{}", width.name);
+            let st_name = format!("b3_st_{}", width.name);
+
+            // Create source table
+            let ddl = width.create_ddl.replace("{src}", &src);
+            db.execute(&ddl).await;
+
+            // Populate base rows
+            let ins = width
+                .insert_bulk_sql
+                .replace("{src}", &src)
+                .replace("{n}", &BASE_ROWS.to_string());
+            db.execute(&ins).await;
+            db.execute(&format!("ANALYZE {src}")).await;
+
+            // Create stream table (installs CDC trigger in current mode)
+            let st_query = width.st_query.replace("{src}", &src);
+            db.create_st(&st_name, &st_query, "1m", "DIFFERENTIAL")
+                .await;
+
+            // ── DML helper closures ─────────────────────────────────────
+
+            // bulk INSERT
+            let bulk_ins = |n: usize| {
+                width
+                    .insert_bulk_sql
+                    .replace("{src}", &src)
+                    .replace("{n}", &n.to_string())
+            };
+
+            // bulk UPDATE of the first `n` rows — update c6/d/val depending on width
+            let bulk_upd_sql = format!(
+                "UPDATE {src} SET id = id WHERE id IN \
+                 (SELECT id FROM {src} ORDER BY id LIMIT {BULK_BATCH})"
+            );
+
+            // ── Warm-up ─────────────────────────────────────────────────
+            for _ in 0..WARMUP {
+                db.execute(&bulk_ins(BULK_BATCH)).await;
+                db.execute(&bulk_upd_sql).await;
+                db.refresh_st(&st_name).await;
+            }
+
+            // ── Bulk INSERT timings ──────────────────────────────────────
+            let mut bulk_insert_ms = Vec::new();
+            for _ in 0..ITERATIONS {
+                let sql = bulk_ins(BULK_BATCH);
+                let start = Instant::now();
+                db.execute(&sql).await;
+                bulk_insert_ms.push(start.elapsed().as_secs_f64() * 1000.0);
+                db.refresh_st(&st_name).await; // drain buffer
+            }
+
+            // ── Bulk UPDATE timings ──────────────────────────────────────
+            let mut bulk_update_ms = Vec::new();
+            for _ in 0..ITERATIONS {
+                let start = Instant::now();
+                db.execute(&bulk_upd_sql).await;
+                bulk_update_ms.push(start.elapsed().as_secs_f64() * 1000.0);
+                db.refresh_st(&st_name).await;
+            }
+
+            // ── Single-row INSERT timings ────────────────────────────────
+            let mut single_insert_ms = Vec::new();
+            for _ in 0..ITERATIONS {
+                let sql = bulk_ins(SINGLE_BATCH);
+                let start = Instant::now();
+                db.execute(&sql).await;
+                single_insert_ms.push(start.elapsed().as_secs_f64() * 1000.0);
+                db.refresh_st(&st_name).await;
+            }
+
+            all_results.push(TriggerBenchResult {
+                width: width.name.to_string(),
+                mode: trigger_mode.to_string(),
+                dml: "bulk_insert".to_string(),
+                batch_size: BULK_BATCH,
+                timings_ms: bulk_insert_ms,
+            });
+            all_results.push(TriggerBenchResult {
+                width: width.name.to_string(),
+                mode: trigger_mode.to_string(),
+                dml: "bulk_update".to_string(),
+                batch_size: BULK_BATCH,
+                timings_ms: bulk_update_ms,
+            });
+            all_results.push(TriggerBenchResult {
+                width: width.name.to_string(),
+                mode: trigger_mode.to_string(),
+                dml: "single_insert".to_string(),
+                batch_size: SINGLE_BATCH,
+                timings_ms: single_insert_ms,
+            });
+
+            // Verify smoke correctness
+            db.refresh_st(&st_name).await;
+            db.assert_st_matches_query(&st_name, &st_query).await;
+        }
+    }
+
+    // ── Print comparison table ─────────────────────────────────────────────
+
+    println!();
+    println!(
+        "┌───────────────────────────────────────────────────────────────────────────────────────────────────┐"
+    );
+    println!(
+        "│  B3: Statement-Level vs Row-Level CDC Trigger — Write-Side Benchmark                              │"
+    );
+    println!(
+        "│  Base rows: 50 000 · Bulk batch: 5 000 · Iterations: 10                                          │"
+    );
+    println!(
+        "├──────────┬───────────────┬───────────────┬──────────────────────────────────────────────────────┤"
+    );
+    println!(
+        "│ Width    │ DML           │ Batch         │ row avg   row p50   row p95  stmt avg  stmt p50  stmt p95  Speedup │"
+    );
+    println!(
+        "├──────────┼───────────────┼───────────────┼──────────────────────────────────────────────────────┤"
+    );
+
+    let widths = ["narrow", "medium", "wide"];
+    let dmls = ["bulk_insert", "bulk_update", "single_insert"];
+
+    for w in &widths {
+        for dml in &dmls {
+            let find = |mode: &str| {
+                all_results
+                    .iter()
+                    .find(|r| r.width == *w && r.dml == *dml && r.mode == mode)
+            };
+            let row_r = find("row");
+            let stmt_r = find("statement");
+
+            match (row_r, stmt_r) {
+                (Some(row), Some(stmt)) => {
+                    let batch = row.batch_size;
+                    let speedup = speedup_str(row.avg(), stmt.avg());
+                    println!(
+                        "│ {:8} │ {:13} │ {:>13} │ {:>8.2}  {:>8.2}  {:>8.2}  {:>8.2}  {:>8.2}  {:>8.2}  {:>7} │",
+                        w,
+                        dml,
+                        batch,
+                        row.avg(),
+                        row.p50(),
+                        row.p95(),
+                        stmt.avg(),
+                        stmt.p50(),
+                        stmt.p95(),
+                        speedup,
+                    );
+                }
+                _ => {
+                    println!(
+                        "│ {:8} │ {:13} │         n/a │ (data missing)                                                       │",
+                        w, dml
+                    );
+                }
+            }
+        }
+        println!(
+            "├──────────┼───────────────┼───────────────┼──────────────────────────────────────────────────────┤"
+        );
+    }
+
+    println!(
+        "└──────────┴───────────────┴───────────────┴──────────────────────────────────────────────────────┘"
+    );
+
+    // ── Summary verdict ────────────────────────────────────────────────────
+    println!();
+    println!("Summary (bulk DML speedup):");
+    for w in &widths {
+        for dml in &["bulk_insert", "bulk_update"] {
+            let row_r = all_results
+                .iter()
+                .find(|r| r.width == *w && r.dml == *dml && r.mode == "row");
+            let stmt_r = all_results
+                .iter()
+                .find(|r| r.width == *w && r.dml == *dml && r.mode == "statement");
+            if let (Some(row), Some(stmt)) = (row_r, stmt_r) {
+                let reduction_pct = if row.avg() > 0.0 {
+                    (row.avg() - stmt.avg()) / row.avg() * 100.0
+                } else {
+                    0.0
+                };
+                let verdict = if reduction_pct >= 50.0 {
+                    "✅ ≥50% reduction (better than target)"
+                } else if reduction_pct >= 20.0 {
+                    "✅ 20–50% reduction (within target)"
+                } else if reduction_pct >= 0.0 {
+                    "⚠️  <20% reduction (below target)"
+                } else {
+                    "❌ regression (statement slower than row)"
+                };
+                println!(
+                    "  {w:6} × {dml:12} → row {:.2}ms  stmt {:.2}ms  {:+.1}%  {verdict}",
+                    row.avg(),
+                    stmt.avg(),
+                    reduction_pct,
+                );
+            }
+        }
+    }
+    println!();
+
+    // Single-row DML: statement should be neutral (within ±10%)
+    println!("Single-row INSERT neutrality check:");
+    for w in &widths {
+        let row_r = all_results
+            .iter()
+            .find(|r| r.width == *w && r.dml == "single_insert" && r.mode == "row");
+        let stmt_r = all_results
+            .iter()
+            .find(|r| r.width == *w && r.dml == "single_insert" && r.mode == "statement");
+        if let (Some(row), Some(stmt)) = (row_r, stmt_r) {
+            let delta_pct = if row.avg() > 0.0 {
+                (stmt.avg() - row.avg()) / row.avg() * 100.0
+            } else {
+                0.0
+            };
+            let verdict = if delta_pct.abs() <= 10.0 {
+                "✅ neutral (±10%)"
+            } else if delta_pct > 0.0 {
+                "⚠️  statement slower for single-row"
+            } else {
+                "✅ statement faster for single-row"
+            };
+            println!(
+                "  {w:6} → row {:.2}ms  stmt {:.2}ms  {:+.1}%  {verdict}",
+                row.avg(),
+                stmt.avg(),
+                delta_pct,
+            );
+        }
+    }
+    println!();
+}
+
+/// B3: Statement-Level vs Row-Level CDC trigger write-side benchmark matrix.
+///
+/// Compares write-side overhead of `pg_trickle.cdc_trigger_mode = 'row'`
+/// (legacy) vs `'statement'` (v0.4.0 default) across narrow/medium/wide
+/// tables and bulk/single-row DML.
+///
+/// Run explicitly:
+/// ```bash
+/// cargo test --test e2e_bench_tests -- --ignored bench_stmt_vs_row_cdc_matrix --nocapture
+/// ```
+#[tokio::test]
+#[ignore]
+async fn bench_stmt_vs_row_cdc_matrix() {
+    run_stmt_vs_row_matrix().await;
+}
+
+/// B3 quick: narrowing smoke-check — narrow table, bulk INSERT only.
+///
+/// Completes in ~60s instead of the full 15–20 min matrix run.
+///
+/// Run explicitly:
+/// ```bash
+/// cargo test --test e2e_bench_tests -- --ignored bench_stmt_vs_row_cdc_quick --nocapture
+/// ```
+#[tokio::test]
+#[ignore]
+async fn bench_stmt_vs_row_cdc_quick() {
+    const BASE_ROWS: usize = 20_000;
+    const BULK_BATCH: usize = 2_000;
+    const ITERATIONS: usize = 5;
+    const WARMUP: usize = 1;
+
+    let widths = table_widths();
+    let narrow = &widths[0]; // narrow only
+
+    let mut results: [Option<TriggerBenchResult>; 2] = [None, None];
+
+    for (idx, trigger_mode) in ["row", "statement"].iter().enumerate() {
+        let db = E2eDb::new_bench().await.with_extension().await;
+
+        db.alter_system_set_and_wait(
+            "pg_trickle.cdc_trigger_mode",
+            &format!("'{trigger_mode}'"),
+            trigger_mode,
+        )
+        .await;
+
+        let src = "b3q_src".to_string();
+        let st_name = "b3q_st".to_string();
+        let ddl = narrow.create_ddl.replace("{src}", &src);
+        db.execute(&ddl).await;
+        let ins_base = narrow
+            .insert_bulk_sql
+            .replace("{src}", &src)
+            .replace("{n}", &BASE_ROWS.to_string());
+        db.execute(&ins_base).await;
+        db.execute(&format!("ANALYZE {src}")).await;
+        let st_query = narrow.st_query.replace("{src}", &src);
+        db.create_st(&st_name, &st_query, "1m", "DIFFERENTIAL")
+            .await;
+
+        // warm-up
+        for _ in 0..WARMUP {
+            let s = narrow
+                .insert_bulk_sql
+                .replace("{src}", &src)
+                .replace("{n}", &BULK_BATCH.to_string());
+            db.execute(&s).await;
+            db.refresh_st(&st_name).await;
+        }
+
+        let mut ms = Vec::new();
+        for _ in 0..ITERATIONS {
+            let s = narrow
+                .insert_bulk_sql
+                .replace("{src}", &src)
+                .replace("{n}", &BULK_BATCH.to_string());
+            let start = Instant::now();
+            db.execute(&s).await;
+            ms.push(start.elapsed().as_secs_f64() * 1000.0);
+            db.refresh_st(&st_name).await;
+        }
+
+        results[idx] = Some(TriggerBenchResult {
+            width: "narrow".to_string(),
+            mode: trigger_mode.to_string(),
+            dml: "bulk_insert".to_string(),
+            batch_size: BULK_BATCH,
+            timings_ms: ms,
+        });
+
+        // Verify smoke correctness
+        db.refresh_st(&st_name).await;
+        db.assert_st_matches_query(&st_name, &st_query).await;
+    }
+
+    let row = results[0].as_ref().unwrap();
+    let stmt = results[1].as_ref().unwrap();
+    let reduction_pct = if row.avg() > 0.0 {
+        (row.avg() - stmt.avg()) / row.avg() * 100.0
+    } else {
+        0.0
+    };
+
+    println!();
+    println!("┌──────────────────────────────────────────────────────────┐");
+    println!("│  B3 Quick: Statement vs Row CDC — Narrow Bulk INSERT      │");
+    println!("├──────────────────────────────────────────────────────────┤");
+    println!(
+        "│  row mode  avg: {:>8.2} ms  p95: {:>8.2} ms              │",
+        row.avg(),
+        row.p95()
+    );
+    println!(
+        "│  stmt mode avg: {:>8.2} ms  p95: {:>8.2} ms              │",
+        stmt.avg(),
+        stmt.p95()
+    );
+    println!(
+        "│  Reduction: {:>+.1}%  {}                   │",
+        reduction_pct,
+        if reduction_pct >= 20.0 {
+            "✅"
+        } else {
+            "⚠️ "
+        },
+    );
+    println!("└──────────────────────────────────────────────────────────┘");
+    println!();
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// I-5: Concurrent Writer Benchmarks
+//
+// Measures CDC trigger overhead under concurrent writer load. Multiple
+// tokio tasks perform DML simultaneously on the same source table,
+// stress-testing BIGSERIAL contention, change buffer index lock
+// contention, and WAL write serialization.
+//
+// Writer concurrency sweep: 1, 2, 4, 8 connections.
+// ═══════════════════════════════════════════════════════════════════════
+
+/// Run concurrent writer benchmark for a given writer count.
+///
+/// Each writer performs `iterations` INSERT batches of `batch_size` rows.
+/// Returns (total_elapsed_ms, per_writer_avg_ms).
+async fn run_concurrent_writers(
+    db: &E2eDb,
+    n_writers: usize,
+    batch_size: usize,
+    iterations: usize,
+) -> (f64, Vec<f64>) {
+    let conn_str = db.connection_string().to_string();
+
+    let total_start = Instant::now();
+
+    let handles: Vec<_> = (0..n_writers)
+        .map(|writer_id| {
+            let cs = conn_str.clone();
+            tokio::spawn(async move {
+                let pool = sqlx::postgres::PgPoolOptions::new()
+                    .max_connections(1)
+                    .connect(&cs)
+                    .await
+                    .expect("writer pool connect");
+
+                let mut times_ms = Vec::new();
+                for _ in 0..iterations {
+                    let sql = format!(
+                        "INSERT INTO cw_src (region, amount) \
+                         SELECT CASE (i % 5) WHEN 0 THEN 'n' WHEN 1 THEN 's' WHEN 2 THEN 'e' \
+                                WHEN 3 THEN 'w' ELSE 'c' END, \
+                                (i * {} + 13) % 10000 \
+                         FROM generate_series(1, {}) AS s(i)",
+                        17 + writer_id,
+                        batch_size,
+                    );
+                    let start = Instant::now();
+                    sqlx::query(sqlx::AssertSqlSafe(sql))
+                        .execute(&pool)
+                        .await
+                        .expect("writer insert");
+                    times_ms.push(start.elapsed().as_secs_f64() * 1000.0);
+                }
+                pool.close().await;
+                times_ms
+            })
+        })
+        .collect();
+
+    let mut all_writer_avgs = Vec::new();
+    for handle in handles {
+        let times = handle.await.expect("writer task");
+        let avg = times.iter().sum::<f64>() / times.len() as f64;
+        all_writer_avgs.push(avg);
+    }
+
+    let total_ms = total_start.elapsed().as_secs_f64() * 1000.0;
+    (total_ms, all_writer_avgs)
+}
+
+/// I-5: Concurrent writer benchmark — sweep 1, 2, 4, 8 writers.
+///
+/// Run explicitly:
+/// ```bash
+/// cargo test --test e2e_bench_tests -- --ignored bench_concurrent_writers --nocapture
+/// ```
+#[tokio::test]
+#[ignore]
+async fn bench_concurrent_writers() {
+    let db = E2eDb::new_bench().await.with_extension().await;
+
+    let base_rows = 50_000usize;
+    let batch_size = 1_000usize;
+    let iterations = 10usize;
+    let writer_counts: &[usize] = &[1, 2, 4, 8];
+
+    // Setup: source table + stream table (installs CDC triggers)
+    db.execute(
+        "CREATE TABLE cw_src (id SERIAL PRIMARY KEY, region TEXT NOT NULL, amount INT NOT NULL)",
+    )
+    .await;
+    db.execute(&format!(
+        "INSERT INTO cw_src (region, amount) \
+         SELECT CASE (i % 5) WHEN 0 THEN 'n' WHEN 1 THEN 's' WHEN 2 THEN 'e' \
+                WHEN 3 THEN 'w' ELSE 'c' END, (i * 17) % 10000 \
+         FROM generate_series(1, {base_rows}) AS s(i)"
+    ))
+    .await;
+    db.create_st(
+        "cw_st",
+        "SELECT id, region, amount FROM cw_src",
+        "1m",
+        "DIFFERENTIAL",
+    )
+    .await;
+    db.execute("ANALYZE cw_src").await;
+
+    println!();
+    println!("┌───────────────────────────────────────────────────────────────┐");
+    println!("│ I-5: Concurrent Writer CDC Overhead Benchmark                 │");
+    println!("├───────────────────────────────────────────────────────────────┤");
+    println!(
+        "│ Base rows: {} · Batch: {} · Iterations: {}                │",
+        base_rows, batch_size, iterations
+    );
+    println!("│                                                               │");
+    println!("│ Writers  Total ms    Per-writer avg ms   Throughput rows/s     │");
+    println!("├───────────────────────────────────────────────────────────────┤");
+
+    let mut baseline_throughput = 0.0f64;
+
+    for &n_writers in writer_counts {
+        // Drain change buffer before each run
+        db.refresh_st("cw_st").await;
+
+        let (total_ms, writer_avgs) =
+            run_concurrent_writers(&db, n_writers, batch_size, iterations).await;
+
+        let per_writer_avg = writer_avgs.iter().sum::<f64>() / writer_avgs.len() as f64;
+        let total_rows = (n_writers * batch_size * iterations) as f64;
+        let throughput = total_rows / (total_ms / 1000.0);
+
+        if n_writers == 1 {
+            baseline_throughput = throughput;
+        }
+        let scaling = if baseline_throughput > 0.0 {
+            throughput / baseline_throughput
+        } else {
+            1.0
+        };
+
+        println!(
+            "│ {:>7}  {:>10.1}  {:>18.1}  {:>10.0} ({:.2}x)     │",
+            n_writers, total_ms, per_writer_avg, throughput, scaling,
+        );
+
+        // Drain after each run
+        db.refresh_st("cw_st").await;
+    }
+
+    println!("└───────────────────────────────────────────────────────────────┘");
+    println!();
+
+    // Verify smoke correctness after operations
+    db.refresh_st("cw_st").await;
+    db.assert_st_matches_query("cw_st", "SELECT id, region, amount FROM cw_src")
+        .await;
+}
+
+// ── B-2: Predicate Pushdown Performance ────────────────────────────────────
+
+/// B-2: Verify that delta predicate pushdown keeps differential refresh
+/// time proportional to delta size (not source table size) for selective
+/// queries.
+///
+/// Setup:
+/// - 100,000-row source table with a `category TEXT` column holding 100
+///   distinct category values (each category has ~1,000 rows).
+/// - Two stream tables:
+///   A) `b2_full_st`  — `SELECT * FROM b2_src`           (no WHERE, no pushdown benefit)
+///   B) `b2_filt_st`  — `SELECT * FROM b2_src WHERE category = 'cat_001'` (~1,000 rows)
+///
+/// Per cycle: 10 source rows are mutated (1% of category 'cat_001'),
+/// meaning the predicate matches the entire delta.  The pushed-down scan
+/// should read **only** the matching change-buffer rows, not all 100,000
+/// source rows.
+///
+/// Assertion: median differential refresh time for `b2_filt_st` must not
+/// exceed 3× the time for `b2_full_st` at the same delta rate. In practice,
+/// pushdown typically makes filtered refresh *faster*.
+///
+/// Run:
+/// ```bash
+/// cargo test --test e2e_bench_tests -- bench_b2_predicate_pushdown --ignored --nocapture
+/// ```
+#[tokio::test]
+#[ignore]
+async fn bench_b2_predicate_pushdown() {
+    const ROWS: usize = 100_000;
+    const CATEGORIES: usize = 100;
+    const DELTA_ROWS: usize = 10; // rows changed per cycle
+    const WARMUP: usize = 2;
+    const CYCLES: usize = 20;
+
+    let db = E2eDb::new().await.with_extension().await;
+
+    // ── Setup ─────────────────────────────────────────────────────────
+    db.execute(
+        "CREATE TABLE b2_src (
+            id       BIGINT PRIMARY KEY,
+            category TEXT   NOT NULL,
+            value    INT    NOT NULL
+        )",
+    )
+    .await;
+
+    // Insert ROWS rows spread across CATEGORIES categories
+    db.execute(&format!(
+        "INSERT INTO b2_src \
+         SELECT g, 'cat_' || LPAD((g % {cats})::text, 3, '0'), g % 1000 \
+         FROM generate_series(1, {rows}) g",
+        cats = CATEGORIES,
+        rows = ROWS,
+    ))
+    .await;
+
+    // Unfiltered stream table (no pushdown benefit)
+    db.create_st(
+        "b2_full_st",
+        "SELECT id, category, value FROM b2_src",
+        "1m",
+        "DIFFERENTIAL",
+    )
+    .await;
+    db.refresh_st("b2_full_st").await;
+
+    // Filtered stream table (predicate pushdown: only cat_001)
+    db.create_st(
+        "b2_filt_st",
+        "SELECT id, category, value FROM b2_src WHERE category = 'cat_001'",
+        "1m",
+        "DIFFERENTIAL",
+    )
+    .await;
+    db.refresh_st("b2_filt_st").await;
+
+    // Helper: mutate DELTA_ROWS rows in cat_001
+    let mutate = |cycle: usize| {
+        let db = &db;
+        async move {
+            db.execute(&format!(
+                "UPDATE b2_src SET value = value + 1 \
+                 WHERE id IN (\
+                   SELECT id FROM b2_src WHERE category = 'cat_001' \
+                   ORDER BY id LIMIT {delta} OFFSET {offset}\
+                 )",
+                delta = DELTA_ROWS,
+                offset = (cycle * DELTA_ROWS) % (ROWS / CATEGORIES),
+            ))
+            .await;
+        }
+    };
+
+    // ── Warm-up ───────────────────────────────────────────────────────
+    for i in 0..WARMUP {
+        mutate(i).await;
+        db.refresh_st("b2_full_st").await;
+        db.refresh_st("b2_filt_st").await;
+    }
+
+    // ── Measured cycles ───────────────────────────────────────────────
+    let mut full_times: Vec<f64> = Vec::with_capacity(CYCLES);
+    let mut filt_times: Vec<f64> = Vec::with_capacity(CYCLES);
+
+    for i in 0..CYCLES {
+        mutate(WARMUP + i).await;
+
+        let t0 = Instant::now();
+        db.refresh_st("b2_full_st").await;
+        full_times.push(t0.elapsed().as_secs_f64() * 1000.0);
+
+        let t1 = Instant::now();
+        db.refresh_st("b2_filt_st").await;
+        filt_times.push(t1.elapsed().as_secs_f64() * 1000.0);
+    }
+
+    // ── Report ────────────────────────────────────────────────────────
+    full_times.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    filt_times.sort_by(|a, b| a.partial_cmp(b).unwrap());
+
+    let median_full = full_times[CYCLES / 2];
+    let median_filt = filt_times[CYCLES / 2];
+
+    println!();
+    println!("┌─────────────────────────────────────────────────────────┐");
+    println!("│  B-2: Delta Predicate Pushdown — {ROWS} rows, {DELTA_ROWS} δ/cycle       │");
+    println!("├────────────────────────┬────────────────────────────────┤");
+    println!("│ Stream table           │  Median refresh (ms)           │");
+    println!("├────────────────────────┼────────────────────────────────┤");
+    println!(
+        "│ b2_full_st (no filter) │  {:>8.1} ms                  │",
+        median_full
+    );
+    println!(
+        "│ b2_filt_st (WHERE cat) │  {:>8.1} ms                  │",
+        median_filt
+    );
+    println!(
+        "│ Ratio filt/full        │  {:>8.2}×                    │",
+        median_filt / median_full
+    );
+    println!("└────────────────────────┴────────────────────────────────┘");
+    println!();
+
+    // Correctness: both STs must match ground truth
+    db.assert_st_matches_query(
+        "public.b2_full_st",
+        "SELECT id, category, value FROM b2_src",
+    )
+    .await;
+    db.assert_st_matches_query(
+        "public.b2_filt_st",
+        "SELECT id, category, value FROM b2_src WHERE category = 'cat_001'",
+    )
+    .await;
+
+    // B-2 gate: filtered ST must not be more than 3× slower than unfiltered.
+    // In practice pushdown makes filtered refresh faster or equivalent.
+    assert!(
+        median_filt <= median_full * 3.0,
+        "B-2 FAILED: filtered refresh ({:.1}ms) is more than 3× unfiltered ({:.1}ms) — \
+         predicate pushdown may not be active",
+        median_filt,
+        median_full,
+    );
+
+    println!(
+        "B-2 PASSED: filtered refresh {:.1}ms vs unfiltered {:.1}ms ({:.2}× ratio ≤ 3.0×)",
+        median_filt,
+        median_full,
+        median_filt / median_full
+    );
+}
+
+// ── v0.106.0 packaged source-write, freshness, and resource qualification ──
+
+const RELEASE_WARMUP_BATCHES: usize = 3;
+const RELEASE_MEASURED_BATCHES: usize = 60;
+const RELEASE_REPETITIONS: usize = 3;
+const RELEASE_BATCH_INTERVAL: Duration = Duration::from_millis(25);
+const RELEASE_REFRESH_INTERVAL: Duration = Duration::from_millis(1000);
+const RELEASE_RESOURCE_SAMPLE_INTERVAL: Duration = Duration::from_millis(250);
+const RELEASE_BATCH_ROWS: usize = 120;
+
+#[path = "conformance/reference_clients.rs"]
+#[allow(dead_code)]
+mod release_clients;
+
+struct ReleaseCaseSetup {
+    source: String,
+    root: String,
+    root_query: String,
+    stream_tables: Vec<String>,
+    graph: bool,
+    graph_digest: Vec<u8>,
+    consumer_id: Option<String>,
+    consumer_relation: Option<String>,
+}
+
+fn release_percentile(values: &[f64], percentile: f64) -> f64 {
+    if values.is_empty() {
+        return 0.0;
+    }
+    let mut sorted = values.to_vec();
+    sorted.sort_by(f64::total_cmp);
+    let index = ((sorted.len() as f64 * percentile / 100.0).ceil() as usize)
+        .saturating_sub(1)
+        .min(sorted.len() - 1);
+    sorted[index]
+}
+
+fn parse_release_container_metrics(output: &str) -> Option<(f64, u64)> {
+    let (cpu, memory) = output.trim().split_once('|')?;
+    let cpu_percent = cpu.trim().trim_end_matches('%').parse().ok()?;
+    let memory_usage = memory.split('/').next()?.trim();
+    let unit_start = memory_usage.find(|ch: char| !ch.is_ascii_digit() && ch != '.')?;
+    let (number, unit) = memory_usage.split_at(unit_start);
+    let multiplier = match unit.trim() {
+        "B" => 1.0,
+        "kB" | "KB" => 1_000.0,
+        "KiB" => 1_024.0,
+        "MB" => 1_000_000.0,
+        "MiB" => 1_048_576.0,
+        "GB" => 1_000_000_000.0,
+        "GiB" => 1_073_741_824.0,
+        _ => return None,
+    };
+    Some((
+        cpu_percent,
+        (number.parse::<f64>().ok()? * multiplier) as u64,
+    ))
+}
+
+async fn release_container_metrics(container_id: &str) -> Option<(f64, u64)> {
+    let output = tokio::process::Command::new("docker")
+        .args([
+            "stats",
+            "--no-stream",
+            "--format",
+            "{{.CPUPerc}}|{{.MemUsage}}",
+            container_id,
+        ])
+        .output()
+        .await
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    parse_release_container_metrics(&String::from_utf8_lossy(&output.stdout))
+}
+
+#[test]
+fn test_release_container_metrics_parses_docker_stats() {
+    assert_eq!(
+        parse_release_container_metrics("6.67%|55.46MiB / 7.748GiB\n"),
+        Some((6.67, (55.46_f64 * 1_048_576.0) as u64))
+    );
+}
+
+type ReleaseResourceSampler = (
+    Arc<AtomicBool>,
+    Arc<AtomicU64>,
+    Arc<AtomicU64>,
+    Arc<AtomicU64>,
+    tokio::task::JoinHandle<()>,
+);
+
+fn start_release_resource_sampler(container_id: String) -> ReleaseResourceSampler {
+    let stop = Arc::new(AtomicBool::new(false));
+    let cpu_peak = Arc::new(AtomicU64::new(0.0_f64.to_bits()));
+    let memory_peak = Arc::new(AtomicU64::new(0));
+    let samples = Arc::new(AtomicU64::new(0));
+    let task_stop = Arc::clone(&stop);
+    let task_cpu_peak = Arc::clone(&cpu_peak);
+    let task_memory_peak = Arc::clone(&memory_peak);
+    let task_samples = Arc::clone(&samples);
+    let task = tokio::spawn(async move {
+        while !task_stop.load(Ordering::Relaxed) {
+            if let Some((cpu, memory)) = release_container_metrics(&container_id).await {
+                task_cpu_peak.fetch_max(cpu.to_bits(), Ordering::Relaxed);
+                task_memory_peak.fetch_max(memory, Ordering::Relaxed);
+                task_samples.fetch_add(1, Ordering::Relaxed);
+            }
+            tokio::time::sleep(RELEASE_RESOURCE_SAMPLE_INTERVAL).await;
+        }
+    });
+    (stop, cpu_peak, memory_peak, samples, task)
+}
+
+async fn release_graph_refresh(
+    pool: &sqlx::PgPool,
+    root: &str,
+    digest: &[u8],
+    consumer_id: Option<&str>,
+) {
+    let mut tx = pool
+        .begin()
+        .await
+        .expect("begin Graph V1 refresh transaction");
+    sqlx::query("SET LOCAL pg_trickle.refresh_strategy = 'differential'")
+        .execute(&mut *tx)
+        .await
+        .expect("force differential Graph V1 refresh");
+    release_clients::refresh_graph(&mut *tx, root, digest).await;
+    if let Some(consumer_id) = consumer_id {
+        let next_batch: Option<i64> = sqlx::query_scalar(
+            "SELECT batch_token FROM pgtrickle.output_delta_batches($1::uuid, NULL::bigint) \
+             ORDER BY batch_token LIMIT 1",
+        )
+        .bind(consumer_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .expect("read pending output batch");
+        if let Some(batch_token) = next_batch {
+            assert_eq!(
+                release_clients::ack(&mut *tx, consumer_id, batch_token).await,
+                "APPLIED"
+            );
+        }
+    }
+    tx.commit().await.expect("commit Graph V1 refresh");
+}
+
+async fn setup_release_case(
+    db: &E2eDb,
+    workload: &str,
+    case_id: &str,
+    sequence: usize,
+) -> ReleaseCaseSetup {
+    let source = format!("release_{sequence}_source");
+    db.execute(&format!(
+        "CREATE TABLE {source} (id bigint PRIMARY KEY, grp integer NOT NULL, \
+         val bigint NOT NULL, payload text NOT NULL)"
+    ))
+    .await;
+    let group_expr = if workload == "join-skew-aggregate" {
+        "CASE WHEN i % 10 < 8 THEN 0 ELSE (i % 20)::integer END"
+    } else {
+        "(i % 20)::integer"
+    };
+    db.execute(&format!(
+        "INSERT INTO {source} (id, grp, val, payload) \
+         SELECT i, {group_expr}, ((i * 31 + 17) % 10000)::bigint, \
+                'release-wide-' || repeat('x', 256) \
+         FROM generate_series(1, 10000) AS rows(i)"
+    ))
+    .await;
+
+    if workload == "small-dependency-graph" && case_id == "no-maintenance" {
+        return ReleaseCaseSetup {
+            source,
+            root: String::new(),
+            root_query: String::new(),
+            stream_tables: Vec::new(),
+            graph: false,
+            graph_digest: Vec::new(),
+            consumer_id: None,
+            consumer_relation: None,
+        };
+    }
+
+    let query = if workload == "join-skew-aggregate" {
+        let dim = format!("release_{sequence}_dim");
+        db.execute(&format!(
+            "CREATE TABLE {dim} (grp integer PRIMARY KEY, multiplier integer NOT NULL)"
+        ))
+        .await;
+        db.execute(&format!(
+            "INSERT INTO {dim} SELECT i, i + 1 FROM generate_series(0, 19) AS rows(i)"
+        ))
+        .await;
+        format!(
+            "SELECT s.grp, SUM(s.val)::bigint AS total, COUNT(*)::bigint AS n \
+             FROM {source} s JOIN {dim} d ON d.grp = s.grp GROUP BY s.grp"
+        )
+    } else if workload == "small-dependency-graph" {
+        let middle = format!("release_{sequence}_middle");
+        let leaf = format!("release_{sequence}_leaf");
+        db.execute(&format!(
+            "SELECT pgtrickle.create_stream_table( \
+                 name => '{middle}', \
+                 query => 'SELECT grp, SUM(val)::bigint AS total, \
+                           COUNT(*)::bigint AS n \
+                           FROM {source} GROUP BY grp', \
+                 schedule => '1h', refresh_mode => 'DIFFERENTIAL', \
+                 initialize => false, orchestration_mode => 'EXTERNAL')"
+        ))
+        .await;
+        db.execute(&format!(
+            "SELECT pgtrickle.create_stream_table( \
+                 name => '{leaf}', \
+                 query => 'SELECT grp, total, n FROM {middle}', \
+                 schedule => '1h', refresh_mode => 'DIFFERENTIAL', \
+                 initialize => false, orchestration_mode => 'EXTERNAL')"
+        ))
+        .await;
+        let root = format!("public.{leaf}");
+        let digest = release_clients::graph_digest(&db.pool, &root).await;
+        let consumer = if case_id == "active-refresh-consumers-active" {
+            Some(
+                release_clients::register(
+                    &db.pool,
+                    &root,
+                    &format!("release_consumer_{sequence}"),
+                    &release_clients::stream_contract_digest(&db.pool, &root).await,
+                )
+                .await,
+            )
+        } else {
+            None
+        };
+        release_graph_refresh(&db.pool, &root, &digest, None).await;
+        let consumer_id = if let Some(consumer) = consumer {
+            let mut tx = db.pool.begin().await.expect("begin output resnapshot");
+            let (token, _) =
+                release_clients::begin_resnapshot(&mut *tx, &consumer.consumer_id).await;
+            assert_eq!(
+                release_clients::ack_resnapshot(&mut *tx, &consumer.consumer_id, &token).await,
+                "ACTIVE"
+            );
+            tx.commit().await.expect("commit output resnapshot");
+            Some((consumer.consumer_id, consumer.delta_relation))
+        } else {
+            None
+        };
+        let (consumer_id, consumer_relation) = consumer_id
+            .map(|(id, relation)| (Some(id), Some(relation)))
+            .unwrap_or((None, None));
+        return ReleaseCaseSetup {
+            source: source.clone(),
+            root,
+            root_query: format!(
+                "SELECT grp, SUM(val)::bigint AS total, COUNT(*)::bigint AS n \
+                 FROM {source} GROUP BY grp"
+            ),
+            stream_tables: vec![middle, leaf],
+            graph: true,
+            graph_digest: digest,
+            consumer_id,
+            consumer_relation,
+        };
+    } else {
+        format!(
+            "SELECT grp, SUM(val)::bigint AS total, \
+             COUNT(*)::bigint AS n FROM {source} GROUP BY grp"
+        )
+    };
+
+    let view = format!("release_{sequence}_view");
+    if case_id != "no-maintenance" {
+        db.create_st(&view, &query, "1h", "DIFFERENTIAL").await;
+    }
+    ReleaseCaseSetup {
+        source,
+        root: format!("public.{view}"),
+        root_query: query,
+        stream_tables: if case_id == "no-maintenance" {
+            Vec::new()
+        } else {
+            vec![view]
+        },
+        graph: false,
+        graph_digest: Vec::new(),
+        consumer_id: None,
+        consumer_relation: None,
+    }
+}
+
+async fn apply_release_write_batch(db: &E2eDb, source: &str, cycle: usize) -> f64 {
+    let update_start = (cycle % 40) * 100 + 1;
+    let delete_start = 5001 + cycle * 10;
+    let insert_start = 10001 + cycle * 10;
+    let started = Instant::now();
+    let mut tx = db.pool.begin().await.expect("begin source write batch");
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "UPDATE {source} SET val = val + 1 WHERE id BETWEEN {update_start} AND {}",
+        update_start + 99
+    )))
+    .execute(&mut *tx)
+    .await
+    .expect("update source rows");
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "DELETE FROM {source} WHERE id BETWEEN {delete_start} AND {}",
+        delete_start + 9
+    )))
+    .execute(&mut *tx)
+    .await
+    .expect("delete source rows");
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "INSERT INTO {source} (id, grp, val, payload) \
+         SELECT i, (i % 20)::integer, ((i * 31 + 17) % 10000)::bigint, \
+                'release-wide-' || repeat('x', 256) \
+         FROM generate_series({insert_start}, {}) AS rows(i)",
+        insert_start + 9
+    )))
+    .execute(&mut *tx)
+    .await
+    .expect("insert source rows");
+    tx.commit().await.expect("commit source write batch");
+    started.elapsed().as_secs_f64() * 1000.0
+}
+
+async fn run_release_batches(
+    db: &E2eDb,
+    source: &str,
+    first_cycle: usize,
+    count: usize,
+) -> Vec<f64> {
+    let started = Instant::now();
+    let mut timings = Vec::with_capacity(count);
+    for index in 0..count {
+        let due = started + RELEASE_BATCH_INTERVAL * (index as u32 + 1);
+        tokio::time::sleep_until(due.into()).await;
+        timings.push(apply_release_write_batch(db, source, first_cycle + index).await);
+    }
+    timings
+}
+
+async fn release_refresh_once(db: &E2eDb, setup: &ReleaseCaseSetup) {
+    if setup.graph {
+        release_graph_refresh(
+            &db.pool,
+            &setup.root,
+            &setup.graph_digest,
+            setup.consumer_id.as_deref(),
+        )
+        .await;
+    } else {
+        release_single_refresh(&db.pool, &setup.root).await;
+    }
+}
+
+async fn release_single_refresh(pool: &sqlx::PgPool, root: &str) {
+    let mut tx = pool.begin().await.expect("begin differential refresh");
+    sqlx::query("SET LOCAL pg_trickle.refresh_strategy = 'differential'")
+        .execute(&mut *tx)
+        .await
+        .expect("force differential stream-table refresh");
+    sqlx::query("SELECT pgtrickle.refresh_stream_table($1)")
+        .bind(root)
+        .execute(&mut *tx)
+        .await
+        .expect("run active stream-table refresh");
+    tx.commit().await.expect("commit differential refresh");
+}
+
+async fn release_backlog_rows(pool: &sqlx::PgPool, source: &str) -> i64 {
+    let stable_name: String =
+        sqlx::query_scalar("SELECT pgtrickle.source_stable_name($1::regclass)")
+            .bind(source)
+            .fetch_one(pool)
+            .await
+            .expect("read CDC buffer name");
+    assert!(
+        stable_name
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+    );
+    sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+        "SELECT count(*)::bigint FROM pgtrickle_changes.\"changes_{stable_name}\""
+    )))
+    .fetch_one(pool)
+    .await
+    .expect("read CDC buffer row count")
+}
+
+async fn run_release_database_case(
+    db: &E2eDb,
+    workload: &str,
+    case_id: &str,
+    sequence: usize,
+) -> serde_json::Value {
+    let active = case_id.starts_with("active-refresh");
+    let maintained = case_id != "no-maintenance";
+    let setup = setup_release_case(db, workload, case_id, sequence).await;
+    let mut refresh_task = None;
+    let refresh_stop = Arc::new(AtomicBool::new(false));
+    if active {
+        let pool = db.pool.clone();
+        let root = setup.root.clone();
+        let digest = setup.graph_digest.clone();
+        let consumer = setup.consumer_id.clone();
+        let graph = setup.graph;
+        let stop = Arc::clone(&refresh_stop);
+        refresh_task = Some(tokio::spawn(async move {
+            while !stop.load(Ordering::Relaxed) {
+                if graph {
+                    release_graph_refresh(&pool, &root, &digest, consumer.as_deref()).await;
+                } else {
+                    release_single_refresh(&pool, &root).await;
+                }
+                tokio::time::sleep(RELEASE_REFRESH_INTERVAL).await;
+            }
+        }));
+    }
+
+    let backlog_stop = Arc::new(AtomicBool::new(false));
+    let backlog_peak = Arc::new(AtomicI64::new(0));
+    let backlog_task = if maintained {
+        let source = setup.source.clone();
+        let pool = db.pool.clone();
+        let stop = Arc::clone(&backlog_stop);
+        let peak = Arc::clone(&backlog_peak);
+        Some(tokio::spawn(async move {
+            while !stop.load(Ordering::Relaxed) {
+                peak.fetch_max(
+                    release_backlog_rows(&pool, &source).await,
+                    Ordering::Relaxed,
+                );
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+        }))
+    } else {
+        None
+    };
+
+    let temp_bytes_before: i64 = db
+        .query_scalar(
+            "SELECT temp_bytes::bigint FROM pg_stat_database WHERE datname = current_database()",
+        )
+        .await;
+    let database_bytes_before: i64 = db
+        .query_scalar("SELECT pg_database_size(current_database())::bigint")
+        .await;
+    let wal_lsn_before: String = db.query_scalar("SELECT pg_current_wal_lsn()::text").await;
+    let consumer_bytes_before: i64 = if let Some(relation) = &setup.consumer_relation {
+        sqlx::query_scalar("SELECT pg_total_relation_size($1::regclass)::bigint")
+            .bind(relation)
+            .fetch_one(&db.pool)
+            .await
+            .expect("read initial output log size")
+    } else {
+        0
+    };
+    let (resource_stop, cpu_peak, memory_peak, resource_samples, resource_task) =
+        start_release_resource_sampler(db.container_id().into());
+    let measurement_start: String = db.query_scalar("SELECT clock_timestamp()::text").await;
+
+    let mut all_write_times = Vec::with_capacity(RELEASE_REPETITIONS * RELEASE_MEASURED_BATCHES);
+    let mut cycle = 0_usize;
+    for _ in 0..RELEASE_REPETITIONS {
+        let _ = run_release_batches(db, &setup.source, cycle, RELEASE_WARMUP_BATCHES).await;
+        cycle += RELEASE_WARMUP_BATCHES;
+        if case_id == "capture-only" {
+            release_refresh_once(db, &setup).await;
+        }
+        let times = run_release_batches(db, &setup.source, cycle, RELEASE_MEASURED_BATCHES).await;
+        cycle += RELEASE_MEASURED_BATCHES;
+        all_write_times.extend(times);
+        if case_id == "capture-only" {
+            release_refresh_once(db, &setup).await;
+        }
+    }
+
+    refresh_stop.store(true, Ordering::Relaxed);
+    if let Some(task) = refresh_task {
+        task.await.expect("Graph V1 refresh worker task");
+    }
+    if maintained {
+        release_refresh_once(db, &setup).await;
+    }
+    backlog_stop.store(true, Ordering::Relaxed);
+    if let Some(task) = backlog_task {
+        task.await.expect("CDC backlog sampler task");
+    }
+    let measurement_end: String = db.query_scalar("SELECT clock_timestamp()::text").await;
+    resource_stop.store(true, Ordering::Relaxed);
+    resource_task
+        .await
+        .expect("container resource sampler task");
+    assert!(
+        resource_samples.load(Ordering::Relaxed) > 0,
+        "container sampler collected no samples"
+    );
+    let cpu_percent_peak = f64::from_bits(cpu_peak.load(Ordering::Relaxed));
+    if maintained {
+        if setup.graph {
+            let middle = setup.root.replace("_leaf", "_middle");
+            let middle_query = format!(
+                "SELECT grp, SUM(val)::bigint AS total, COUNT(*)::bigint AS n \
+                 FROM {} GROUP BY grp",
+                setup.source
+            );
+            db.assert_st_matches_query(&middle, &middle_query).await;
+        }
+        db.assert_st_matches_query(&setup.root, &setup.root_query)
+            .await;
+    }
+
+    let refresh_latency_ms: Vec<f64> = if maintained {
+        sqlx::query_scalar(
+            "SELECT duration_ms FROM pgtrickle.pgt_refresh_history h \
+             JOIN pgtrickle.pgt_stream_tables st USING (pgt_id) \
+             WHERE st.pgt_name = ANY($1) AND h.status = 'COMPLETED' \
+               AND h.duration_ms IS NOT NULL \
+               AND h.end_time BETWEEN $2::timestamptz AND $3::timestamptz \
+             ORDER BY h.refresh_id",
+        )
+        .bind(&setup.stream_tables)
+        .bind(&measurement_start)
+        .bind(&measurement_end)
+        .fetch_all(&db.pool)
+        .await
+        .expect("read refresh latency samples")
+    } else {
+        Vec::new()
+    };
+    let freshness_ms: Vec<f64> = if maintained {
+        sqlx::query_scalar(
+            "SELECT COALESCE(h.commit_to_visible_ms, \
+                    GREATEST(0, EXTRACT(EPOCH FROM (h.end_time - h.data_timestamp)) * 1000))::float8 \
+             FROM pgtrickle.pgt_refresh_history h \
+             JOIN pgtrickle.pgt_stream_tables st USING (pgt_id) \
+             WHERE st.pgt_name = ANY($1) AND h.status = 'COMPLETED' \
+               AND h.end_time BETWEEN $2::timestamptz AND $3::timestamptz \
+               AND h.data_timestamp IS NOT NULL \
+             ORDER BY h.refresh_id",
+        )
+        .bind(&setup.stream_tables)
+        .bind(&measurement_start)
+        .bind(&measurement_end)
+        .fetch_all(&db.pool)
+        .await
+        .expect("read end-to-end freshness samples")
+    } else {
+        Vec::new()
+    };
+    let differential_count: i64 = if maintained {
+        sqlx::query_scalar(
+            "SELECT count(*)::bigint FROM pgtrickle.pgt_refresh_history h \
+             JOIN pgtrickle.pgt_stream_tables st USING (pgt_id) \
+             WHERE st.pgt_name = ANY($1) AND h.action = 'DIFFERENTIAL' \
+               AND h.was_full_fallback = false \
+               AND h.end_time BETWEEN $2::timestamptz AND $3::timestamptz",
+        )
+        .bind(&setup.stream_tables)
+        .bind(&measurement_start)
+        .bind(&measurement_end)
+        .fetch_one(&db.pool)
+        .await
+        .expect("read effective refresh strategy")
+    } else {
+        0
+    };
+    let full_fallback_count: i64 = if maintained {
+        sqlx::query_scalar(
+            "SELECT count(*)::bigint FROM pgtrickle.pgt_refresh_history h \
+             JOIN pgtrickle.pgt_stream_tables st USING (pgt_id) \
+             WHERE st.pgt_name = ANY($1) \
+               AND (h.action = 'FULL' OR h.was_full_fallback) \
+               AND h.end_time BETWEEN $2::timestamptz AND $3::timestamptz",
+        )
+        .bind(&setup.stream_tables)
+        .bind(&measurement_start)
+        .bind(&measurement_end)
+        .fetch_one(&db.pool)
+        .await
+        .expect("read full-refresh fallback count")
+    } else {
+        0
+    };
+    if maintained
+        && (differential_count == 0 || full_fallback_count > 0 || refresh_latency_ms.is_empty())
+    {
+        type RefreshHistoryDiagnosticRow = (String, String, bool, Option<String>, Option<String>);
+        let history: Vec<RefreshHistoryDiagnosticRow> = sqlx::query_as(
+            "SELECT h.action, h.status, h.was_full_fallback, \
+                    h.refresh_reason, h.refresh_reason_detail \
+             FROM pgtrickle.pgt_refresh_history h \
+             JOIN pgtrickle.pgt_stream_tables st USING (pgt_id) \
+             WHERE st.pgt_name = ANY($1) ORDER BY h.refresh_id",
+        )
+        .bind(&setup.stream_tables)
+        .fetch_all(&db.pool)
+        .await
+        .expect("read refresh diagnostic history");
+        panic!("{workload}/{case_id} did not execute a differential refresh; history={history:?}");
+    }
+    assert!(
+        !maintained || (differential_count > 0 && !refresh_latency_ms.is_empty()),
+        "{workload}/{case_id} did not execute a differential refresh"
+    );
+    let effective_strategy = if !maintained || (differential_count > 0 && full_fallback_count == 0)
+    {
+        if maintained { "DIFFERENTIAL" } else { "NONE" }
+    } else {
+        "FULL"
+    };
+
+    let write_total_ms = all_write_times.iter().sum::<f64>();
+    let source_write_p95_ms = release_percentile(&all_write_times, 95.0);
+    let rows_written = (all_write_times.len() * RELEASE_BATCH_ROWS) as f64;
+    let throughput_rows_per_second = rows_written / (write_total_ms / 1000.0);
+    let temp_bytes_after: i64 = db
+        .query_scalar(
+            "SELECT temp_bytes::bigint FROM pg_stat_database WHERE datname = current_database()",
+        )
+        .await;
+    let temp_spill_bytes = temp_bytes_after.saturating_sub(temp_bytes_before).max(0) as u64;
+    let database_bytes_after: i64 = db
+        .query_scalar("SELECT pg_database_size(current_database())::bigint")
+        .await;
+    let wal_bytes: i64 = db
+        .query_scalar(&format!(
+            "SELECT pg_wal_lsn_diff(pg_current_wal_lsn(), '{wal_lsn_before}'::pg_lsn)::bigint"
+        ))
+        .await;
+    let consumer_bytes_after: i64 = if let Some(relation) = &setup.consumer_relation {
+        sqlx::query_scalar("SELECT pg_total_relation_size($1::regclass)::bigint")
+            .bind(relation)
+            .fetch_one(&db.pool)
+            .await
+            .expect("read typed output log size")
+    } else {
+        0
+    };
+    let memory_peak = memory_peak.load(Ordering::Relaxed);
+    assert!(memory_peak > 0, "container memory use was not recorded");
+    let measurement_window_ms: f64 = sqlx::query_scalar(
+        "SELECT greatest(0, extract(epoch FROM ($2::timestamptz - $1::timestamptz)) * 1000)::float8",
+    )
+    .bind(&measurement_start)
+    .bind(&measurement_end)
+    .fetch_one(&db.pool)
+    .await
+    .expect("measure workload duration");
+    serde_json::json!({
+        "source_write_p50_ms": release_percentile(&all_write_times, 50.0),
+        "source_write_p95_ms": source_write_p95_ms,
+        "source_write_p99_ms": release_percentile(&all_write_times, 99.0),
+        "throughput_rows_per_second": throughput_rows_per_second,
+        "write_errors": 0,
+        "writer_concurrency": 1,
+        "batch_interval_ms": RELEASE_BATCH_INTERVAL.as_millis(),
+        "refresh_interval_ms": RELEASE_REFRESH_INTERVAL.as_millis(),
+        "resource_sample_interval_ms": RELEASE_RESOURCE_SAMPLE_INTERVAL.as_millis(),
+        "warmup_batches_per_repetition": RELEASE_WARMUP_BATCHES,
+        "measured_batches_per_repetition": RELEASE_MEASURED_BATCHES,
+        "repetitions": RELEASE_REPETITIONS,
+        "refresh_p50_ms": release_percentile(&refresh_latency_ms, 50.0),
+        "refresh_p95_ms": release_percentile(&refresh_latency_ms, 95.0),
+        "refresh_p99_ms": release_percentile(&refresh_latency_ms, 99.0),
+        "freshness_p50_ms": release_percentile(&freshness_ms, 50.0),
+        "freshness_p95_ms": release_percentile(&freshness_ms, 95.0),
+        "freshness_p99_ms": release_percentile(&freshness_ms, 99.0),
+        "cpu_percent_peak": cpu_percent_peak,
+        "memory_peak_bytes": memory_peak,
+        "wal_bytes": wal_bytes.max(0),
+        "change_backlog_rows": backlog_peak.load(Ordering::Relaxed),
+        "temp_spill_bytes": temp_spill_bytes,
+        "output_log_bytes": consumer_bytes_after.saturating_sub(consumer_bytes_before).max(0),
+        "storage_growth_bytes": database_bytes_after.saturating_sub(database_bytes_before).max(0),
+        "exact_result": maintained,
+        "effective_strategy": effective_strategy,
+        "full_fallback_count": full_fallback_count,
+        "measurement_started_at": measurement_start,
+        "measurement_ended_at": measurement_end,
+        "measurement_window_ms": measurement_window_ms,
+    })
+}
+
+#[tokio::test]
+#[ignore = "v0.106.0 package qualification; runs against the candidate PostgreSQL image"]
+async fn bench_release_database_workloads() {
+    let workload_cases = [
+        (
+            "keyed-scan-aggregate",
+            vec!["no-maintenance", "capture-only", "active-refresh"],
+        ),
+        (
+            "join-skew-aggregate",
+            vec!["no-maintenance", "capture-only", "active-refresh"],
+        ),
+        (
+            "small-dependency-graph",
+            vec![
+                "no-maintenance",
+                "capture-only",
+                "active-refresh-consumers-disabled",
+                "active-refresh-consumers-active",
+            ],
+        ),
+    ];
+    let mut workloads = Vec::new();
+    let mut postgres_version = None;
+    let mut durability_settings = None;
+    let mut sequence = 0;
+    for (workload, cases) in workload_cases {
+        let mut measured_cases = serde_json::Map::new();
+        for case_id in cases {
+            sequence += 1;
+            let db = E2eDb::new_bench().await.with_extension().await;
+            db.execute("ALTER SYSTEM SET synchronous_commit = 'on'")
+                .await;
+            db.reload_config_and_wait().await;
+            let case_postgres_version: String = db.query_scalar("SHOW server_version").await;
+            if postgres_version.is_none() {
+                eprintln!("PGT_ACTUAL_POSTGRESQL_VERSION={case_postgres_version}");
+                postgres_version = Some(case_postgres_version.clone());
+            } else {
+                assert_eq!(
+                    postgres_version.as_deref(),
+                    Some(case_postgres_version.as_str())
+                );
+            }
+            let case_durability_settings: serde_json::Value = sqlx::query_scalar(
+                "SELECT jsonb_build_object(\
+                     'fsync', current_setting('fsync'), \
+                     'synchronous_commit', current_setting('synchronous_commit'), \
+                     'full_page_writes', current_setting('full_page_writes'))",
+            )
+            .fetch_one(&db.pool)
+            .await
+            .expect("read PostgreSQL durability settings");
+            if let Some(expected) = &durability_settings {
+                assert_eq!(expected, &case_durability_settings);
+            } else {
+                durability_settings = Some(case_durability_settings);
+            }
+            measured_cases.insert(
+                case_id.to_string(),
+                run_release_database_case(&db, workload, case_id, sequence).await,
+            );
+        }
+        workloads.push(serde_json::json!({
+            "id": workload,
+            "population_rows": 10000,
+            "batch_rows": RELEASE_BATCH_ROWS,
+            "offered_load": {
+                "writer_concurrency": 1,
+                "batch_interval_ms": RELEASE_BATCH_INTERVAL.as_millis(),
+                "refresh_interval_ms": RELEASE_REFRESH_INTERVAL.as_millis(),
+                "resource_sample_interval_ms": RELEASE_RESOURCE_SAMPLE_INTERVAL.as_millis(),
+                "warmup_batches_per_repetition": RELEASE_WARMUP_BATCHES,
+                "measured_batches_per_repetition": RELEASE_MEASURED_BATCHES,
+                "repetitions": RELEASE_REPETITIONS
+            },
+            "cases": measured_cases,
+        }));
+    }
+    let measurement = serde_json::json!({
+        "kind": "database-workloads",
+        "postgresql_version": postgres_version.expect("at least one workload case ran"),
+        "durability_settings": durability_settings.expect("workload settings were recorded"),
+        "workloads": workloads,
+    });
+    let output = std::env::var("PGS_RELEASE_MEASUREMENT_JSON")
+        .expect("release runner must set PGS_RELEASE_MEASUREMENT_JSON");
+    std::fs::write(
+        &output,
+        serde_json::to_vec_pretty(&measurement).expect("serialize workload evidence"),
+    )
+    .expect("write raw workload evidence");
+    eprintln!("[PGS_RELEASE_WORKLOADS] {measurement}");
+}

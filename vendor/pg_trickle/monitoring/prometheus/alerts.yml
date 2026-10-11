@@ -1,0 +1,376 @@
+groups:
+  - name: pg_trickle
+    interval: 60s
+    rules:
+
+      # ── Staleness ────────────────────────────────────────────────────────
+
+      # A stream table's data is more than (schedule + 5 min) old.
+      # Fires once per affected table so alerting rules can route per-table.
+      - alert: PgTrickleTableStale
+        expr: pg_trickle_table_stats_staleness_seconds > 300
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Stream table {{ $labels.schema }}.{{ $labels.name }} is stale"
+          description: >
+            Stream table {{ $labels.schema }}.{{ $labels.name }} has not been
+            refreshed for {{ $value | humanizeDuration }}. Expected interval:
+            {{ $labels.refresh_mode }}.
+
+      # Simpler form: any table whose staleness flag is set for > 5 minutes.
+      - alert: PgTrickleTableStaleFlag
+        expr: pg_trickle_table_stats_stale == 1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Stream table {{ $labels.schema }}.{{ $labels.name }} data is overdue"
+          description: >
+            Stream table {{ $labels.schema }}.{{ $labels.name }} has data
+            older than its configured schedule. Staleness:
+            {{ $value | humanizeDuration }}.
+
+      # ── Consecutive refresh failures ─────────────────────────────────────
+
+      # 3 or more consecutive failures — table approaching auto-suspend.
+      - alert: PgTrickleConsecutiveErrors
+        expr: pg_trickle_table_stats_consecutive_errors >= 3
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Stream table {{ $labels.schema }}.{{ $labels.name }} has {{ $value }} consecutive errors"
+          description: >
+            {{ $labels.schema }}.{{ $labels.name }} has experienced
+            {{ $value }} consecutive refresh failures. The table will be
+            automatically suspended after 5 failures. Investigate the last
+            error via:
+              SELECT * FROM pgtrickle.pgt_refresh_history
+              WHERE pgt_id = (SELECT pgt_id FROM pgtrickle.pgt_stream_tables
+                              WHERE pgt_schema='{{ $labels.schema }}'
+                                AND pgt_name='{{ $labels.name }}')
+              ORDER BY refresh_id DESC LIMIT 5;
+
+      # Table has been auto-suspended due to repeated failures.
+      - alert: PgTrickleTableSuspended
+        expr: pg_trickle_status_counts_stream_tables_total{status="SUSPENDED"} > 0
+        for: 0m
+        labels:
+          severity: critical
+        annotations:
+          summary: "{{ $value }} stream table(s) are SUSPENDED"
+          description: >
+            One or more stream tables have been automatically suspended due to
+            repeated refresh failures. Resume with:
+              SELECT pgtrickle.alter_stream_table(name, status => 'ACTIVE');
+
+      # ── CDC change buffer size ────────────────────────────────────────────
+
+      # CDC buffer exceeds 1 GB — scheduler may be stalled or throughput
+      # cannot keep up with write volume.
+      - alert: PgTrickleCdcBufferLarge
+        expr: pg_trickle_cdc_buffers_buffer_bytes > 1073741824
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: >
+            CDC buffer for {{ $labels.stream_table }} ←
+            {{ $labels.source_table }} exceeds 1 GB
+          description: >
+            The CDC change buffer for stream table {{ $labels.stream_table }}
+            (source: {{ $labels.source_table }}, mode: {{ $labels.cdc_mode }})
+            currently holds {{ $value | humanize1024 }}B of unprocessed changes.
+            This may indicate a scheduler stall or sustained high write volume.
+            Check pg_trickle.enabled and the scheduler health:
+              SELECT * FROM pgtrickle.health_check();
+
+      # ── Scheduler availability ───────────────────────────────────────────
+
+      # Scheduler background worker not detected in pg_stat_activity.
+      - alert: PgTrickleSchedulerDown
+        expr: pg_trickle_health_scheduler_running == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "pg_trickle scheduler is not running"
+          description: >
+            The pg_trickle scheduler background worker has not been detected
+            for at least 2 minutes. Stream tables are NOT being refreshed.
+            Check PostgreSQL logs for worker crash messages. Verify:
+              SHOW pg_trickle.enabled;
+              SELECT * FROM pg_stat_activity
+              WHERE backend_type = 'pg_trickle scheduler';
+
+      # ── Refresh duration ─────────────────────────────────────────────────
+
+      # Average refresh taking longer than 30 seconds — may indicate a
+      # table that should switch to DIFFERENTIAL mode, or a query needing
+      # an index.
+      - alert: PgTrickleHighRefreshDuration
+        expr: pg_trickle_table_stats_avg_duration_ms > 30000
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: >
+            Stream table {{ $labels.schema }}.{{ $labels.name }} has high
+            avg refresh duration ({{ $value | humanizePercentage }}ms)
+          description: >
+            {{ $labels.schema }}.{{ $labels.name }} average refresh duration
+            is {{ $value }}ms (mode: {{ $labels.refresh_mode }}).
+            Consider switching to DIFFERENTIAL mode or adding indexes on the
+            source table. Run:
+              SELECT pgtrickle.explain_refresh_mode('{{ $labels.schema }}.{{ $labels.name }}');
+
+      # ── Overall health ───────────────────────────────────────────────────
+
+      # quick_health view shows CRITICAL (score = 2).
+      - alert: PgTrickleClusterCritical
+        expr: pg_trickle_health_health_status_code == 2
+        for: 0m
+        labels:
+          severity: critical
+        annotations:
+          summary: "pg_trickle cluster health is CRITICAL"
+          description: >
+            The overall pg_trickle health check reports CRITICAL status.
+            One or more stream tables are SUSPENDED. Check:
+              SELECT * FROM pgtrickle.quick_health;
+              SELECT * FROM pgtrickle.health_check();
+
+      # quick_health view shows WARNING (score = 1).
+      - alert: PgTrickleClusterWarning
+        expr: pg_trickle_health_health_status_code == 1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "pg_trickle cluster health is WARNING"
+          description: >
+            The overall pg_trickle health check reports WARNING status.
+            Some tables may have errors or stale data. Check:
+              SELECT * FROM pgtrickle.quick_health;
+
+      # ── Freshness lag (O40-4) ────────────────────────────────────────────
+
+      # A stream table's p99 end-to-end freshness lag exceeds 10 minutes.
+      # Indicates the scheduler is falling behind or there is CDC backpressure.
+      - alert: PgTrickleFreshnessLagHigh
+        expr: pg_trickle_table_stats_staleness_seconds > 600
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: >
+            Stream table {{ $labels.schema }}.{{ $labels.name }} freshness lag
+            exceeds 10 minutes
+          description: >
+            {{ $labels.schema }}.{{ $labels.name }} data is
+            {{ $value | humanizeDuration }} stale (p99 lag threshold: 10 min).
+            Check scheduler health and CDC buffer depth.
+
+      - alert: PgTrickleFreshnessBreach
+        expr: pg_trickle_sla_breach_duration_seconds > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: >
+            Stream table freshness target is breaching for
+            {{ $labels.schema }}.{{ $labels.name }}
+          description: >
+            Exact source-commit-to-visible freshness has exceeded its target
+            for {{ $value | humanizeDuration }}. Check pg_trickle.freshness()
+            and pg_trickle.health_check().
+
+      - alert: PgTrickleFreshnessInfeasible
+        expr: pg_trickle_sla_infeasible_tables > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $value }} stream table freshness target(s) are infeasible"
+          description: >
+            The fastest compatible observed refresh cost still exceeds the
+            declared target. Check pg_trickle.freshness() and
+            pgtrickle.explain() for the bounded diagnosis.
+
+      # ── Refresh p99 duration (O40-4) ─────────────────────────────────────
+
+      # Refresh p99 latency exceeds 60 seconds — may indicate runaway query
+      # or excessive row delta.
+      - alert: PgTrickleRefreshP99High
+        expr: pg_trickle_table_stats_avg_duration_ms > 60000
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: >
+            Stream table {{ $labels.schema }}.{{ $labels.name }} p99 refresh
+            latency exceeds 60 s
+          description: >
+            {{ $labels.schema }}.{{ $labels.name }} avg refresh duration is
+            {{ $value }}ms. A FULL fallback or pathological delta may be the
+            cause. Run:
+              SELECT pgtrickle.explain_stream_table('{{ $labels.schema }}.{{ $labels.name }}');
+
+      # ── CDC buffer depth (O40-4) ─────────────────────────────────────────
+
+      # CDC buffer pending row count exceeds 500 000 rows for > 5 minutes.
+      # The scheduler may not be keeping pace with the write volume.
+      - alert: PgTrickleCdcBufferDepthHigh
+        expr: pg_trickle_cdc_buffers_pending_rows > 500000
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: >
+            CDC buffer for {{ $labels.source_table }} has
+            {{ $value | humanize }} pending rows
+          description: >
+            The change buffer for {{ $labels.source_table }} (stream table:
+            {{ $labels.stream_table }}) holds {{ $value | humanize }} unprocessed
+            rows. The scheduler is not keeping up with the write volume or is
+            stalled. Check pg_trickle.health_check() and increase
+            pg_trickle.max_concurrent_refreshes if needed.
+
+      # ── WAL slot lag (O40-4) ─────────────────────────────────────────────
+
+      # WAL-mode CDC slot retaining more than the warning threshold.
+      - alert: PgTrickleWalSlotLagHigh
+        expr: pg_trickle_slot_health_retained_wal_mb > 200
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: >
+            WAL slot {{ $labels.slot_name }} retaining
+            {{ $value | humanize }}MB of WAL
+          description: >
+            The pg_trickle replication slot {{ $labels.slot_name }} for
+            {{ $labels.source_table }} is retaining {{ $value }}MB of WAL.
+            This will grow disk usage and bloat the WAL directory.
+            Check that the scheduler is consuming changes regularly:
+              SELECT * FROM pgtrickle.slot_health();
+
+      # WAL slot retention exceeds critical threshold (1 GB).
+      - alert: PgTrickleWalSlotLagCritical
+        expr: pg_trickle_slot_health_retained_wal_mb > 1024
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: >
+            WAL slot {{ $labels.slot_name }} retaining > 1 GB of WAL —
+            disk exhaustion risk
+          description: >
+            The WAL slot {{ $labels.slot_name }} is retaining
+            {{ $value }}MB of WAL. Disk exhaustion may occur.
+            If the stream table cannot catch up, consider dropping and
+            recreating the slot to prevent disk exhaustion:
+              SELECT pgtrickle.drop_stream_table('schema.table');
+              -- Then recreate after freeing disk space.
+
+      # ── Worker saturation (O40-4) ─────────────────────────────────────────
+
+      # Active dynamic refresh workers approach the cluster limit.
+      - alert: PgTrickleWorkerPoolSaturated
+        expr: >
+          pg_trickle_parallel_job_status_active_workers
+          >= 0.9 * pg_trickle_parallel_job_status_pool_size
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: >
+            pg_trickle refresh worker pool is {{ $value | humanizePercentage }}
+            saturated
+          description: >
+            The dynamic refresh worker pool is near capacity. Stream tables
+            may be queued rather than refreshing on schedule. Consider raising
+            pg_trickle.max_dynamic_refresh_workers or
+            pg_trickle.per_database_worker_quota.
+
+      # ── Citus lease health (O40-4) ───────────────────────────────────────
+
+      # Citus distributed scheduling lease is not held — distributed
+      # stream tables may not refresh across workers.
+      - alert: PgTrickleCitusLeaseUnhealthy
+        expr: pg_trickle_citus_st_lock_lease_held == 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "pg_trickle Citus scheduling lease is not held"
+          description: >
+            The pg_trickle Citus scheduling lease (pgt_st_locks) is not
+            held. Distributed stream table refreshes may be stalled or
+            uncoordinated. Check for lock contention or coordinator failures:
+              SELECT * FROM pgtrickle.citus_status();
+
+      # ── v0.97 assurance signals ─────────────────────────────────────────
+
+      - alert: PgTrickleDiskPressure
+        expr: pg_trickle_disk_projected_bytes >= pg_trickle_disk_headroom_bytes
+          and pg_trickle_disk_headroom_bytes > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.stream_table }} is at its projected disk headroom"
+          description: >
+            The projected stream-table and CDC-buffer footprint has reached the
+            configured forecast headroom. Review pgtrickle.disk_usage() before
+            storage pressure becomes an outage.
+
+      - alert: PgTrickleFullFallbackRate
+        expr: pg_trickle_full_fallbacks_1h >= 3
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.schema }}.{{ $labels.name }} is repeatedly falling back to FULL"
+          description: >
+            Differential refresh admission fell back to FULL at least three
+            times in the last hour. Inspect the defining query and
+            pgtrickle.explain_refresh_mode().
+
+      - alert: PgTrickleExternalGraphFailures
+        expr: pg_trickle_external_graph_failures_1h > 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "External graph refresh failed for {{ $labels.schema }}.{{ $labels.name }}"
+          description: >
+            An externally orchestrated stream table has a failed refresh in the
+            last hour. The coordinator should inspect the graph result and
+            retry only after resolving the reported error.
+
+      - alert: PgTrickleOutputDeltaConsumerLag
+        expr: pg_trickle_output_delta_consumer_lag_batches > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Output-delta consumer lagging for {{ $labels.schema }}.{{ $labels.name }}"
+          description: >
+            At least one output consumer is behind the durable delta log head.
+            Check pgtrickle.output_delta_consumer_status() and acknowledge or
+            resnapshot the consumer as appropriate.
+
+      - alert: PgTrickleCleanupBacklog
+        expr: pg_trickle_cleanup_backlog_rows > 0
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "CDC cleanup backlog is growing"
+          description: >
+            Cleanup has recorded {{ $value | humanize }} rows awaiting retry.
+            Check pgtrickle.health_check() for the source and last cleanup
+            error before retained change buffers consume disk headroom.

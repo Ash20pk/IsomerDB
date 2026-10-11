@@ -1,0 +1,64 @@
+[profile.default]
+retries = 2
+
+[profile.ci]
+retries = 2
+junit = { path = "junit.xml" }
+
+[[profile.ci.overrides]]
+# Stability tests (soak, MDB) must NOT be retried: each test runs for
+# 10+ minutes, and retries = 2 would push total runtime to 30 min,
+# exceeding the 20-minute step timeout in stability-tests.yml.
+filter = 'test(test_soak_stability) | test(test_multi_database_isolation)'
+retries = 0
+
+[[profile.ci.overrides]]
+# TPC-H tests run for 10–90+ minutes each at high scale factors.
+# retries = 2 would multiply the already-long runtime by 3×.
+# The 90-minute slow-timeout with terminate-after=1 kills any test that
+# hangs longer than 90 minutes (e.g., WAL/disk exhaustion during SF-10
+# bulk initial materialisation with 6M lineitems).
+filter = 'binary(/^e2e_tpch_tests/)'
+retries = 0
+slow-timeout = { period = "90m", terminate-after = 1 }
+
+[[profile.ci.overrides]]
+# Each e2e test gets its own database, so moderate parallelism is safe.
+# filter matches both test function names (e2e_*) and binary names (e2e_*_tests)
+filter = 'test(/e2e_/) | binary(/^e2e_/)'
+test-group = "e2e-serial"
+
+[[profile.ci.overrides]]
+# Integration tests need to run sequentially
+filter = 'test(/catalog_tests/) | test(/catalog_compat_tests/) | test(/extension_tests/) | test(/monitoring_tests/) | test(/smoke_tests/) | test(/resilience_tests/) | test(/scenario_tests/) | test(/trigger_detection_tests/) | test(/workflow_tests/) | test(/property_tests/)'
+test-group = "integration-serial"
+
+[test-groups]
+# All e2e tests share a single externally-managed container (see
+# run_light_e2e_tests.sh).  Each test gets its own database, so tests
+# can run in parallel safely.  Limit to 4 threads to avoid PostgreSQL
+# connection saturation from many simultaneous property-test databases.
+e2e-serial = { max-threads = 4 }
+integration-serial = { max-threads = 1 }
+
+[[profile.default.overrides]]
+# Stability tests must NOT be retried — they run 10+ minutes each.
+filter = 'test(test_soak_stability) | test(test_multi_database_isolation)'
+retries = 0
+
+[[profile.default.overrides]]
+# TPC-H tests must not be retried — they run 10–90+ minutes each.
+filter = 'binary(/^e2e_tpch_tests/)'
+retries = 0
+
+[[profile.default.overrides]]
+# Each e2e test gets its own database, so moderate parallelism is safe.
+# filter matches both test function names (e2e_*) and binary names (e2e_*_tests)
+filter = 'test(/e2e_/) | binary(/^e2e_/)'
+test-group = "e2e-serial"
+
+[[profile.default.overrides]]
+# Integration tests need to run sequentially
+# These test names come from the binaries we explicitly call
+filter = 'test(/catalog_tests/) | test(/catalog_compat_tests/) | test(/extension_tests/) | test(/monitoring_tests/) | test(/smoke_tests/) | test(/resilience_tests/) | test(/scenario_tests/) | test(/trigger_detection_tests/) | test(/workflow_tests/) | test(/property_tests/)'
+test-group = "integration-serial"

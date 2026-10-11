@@ -1,0 +1,2387 @@
+//! pg_trickle — Stream Tables for PostgreSQL 18.
+//!
+//! This extension provides declarative Stream Tables with automated
+//! schedule-driven refresh and differential view maintenance (DVM).
+//!
+//! # Theoretical Basis
+//!
+//! - **DBSP**: Budiu et al., "DBSP: Automatic Differential View Maintenance
+//!   for Rich Query Languages", PVLDB 2023. <https://arxiv.org/abs/2203.16684>
+//! - **Gupta & Mumick (1995)**: "Maintenance of Materialized Views: Problems,
+//!   Techniques, and Applications", IEEE Data Engineering Bulletin.
+//! - **PostgreSQL REFRESH MATERIALIZED VIEW CONCURRENTLY** (since 9.4, Dec 2014).
+//!
+//! # Safety
+//! This extension uses `unsafe` code for PostgreSQL FFI calls via pgrx.
+//! All unsafe blocks are documented with `// SAFETY:` comments.
+
+#![deny(unsafe_op_in_unsafe_fn)]
+// Q-3 (v0.79.0): Global #![allow(dead_code)] replaced with per-module
+// allowances on pgrx/export boundaries — modules where items are
+// intentionally visible to SQL (via pg_extern) or pgrx infrastructure
+// (pg_shmem_init!, BackgroundWorkerBuilder) but appear dead to Rust's
+// static call-graph analysis.
+// SAF-3: Deny .unwrap() in non-test production code.
+// Tests are explicitly exempt (cfg(test) blocks allow free use of unwrap).
+#![cfg_attr(not(test), deny(clippy::unwrap_used))]
+
+use pgrx::prelude::*;
+
+// ── pgrx/export-boundary modules (may have intentional dead items) ────────
+// Items in these modules are exposed to PostgreSQL via pg_extern, pgrx macros,
+// or trigger/hook registration — not via Rust call-graph paths.
+#[allow(dead_code)]
+pub mod api;
+#[allow(dead_code)]
+mod catalog;
+#[allow(dead_code)]
+mod cdc;
+#[allow(dead_code)]
+pub mod citus;
+#[allow(dead_code)]
+pub mod config;
+// dag and dvm contain utility/helper functions that may not be called from
+// the main production path but are retained for future use or test support.
+#[allow(dead_code)]
+pub mod dag;
+pub(crate) mod diagnostics;
+#[allow(dead_code)]
+pub mod dvm;
+pub mod dvm_trace;
+pub mod error;
+#[cfg(feature = "pg18")]
+#[allow(dead_code)]
+mod explain_hook;
+pub mod fuzz_pub;
+mod hash;
+#[allow(dead_code)]
+mod hooks;
+#[allow(dead_code)]
+pub(crate) mod integration_contract;
+#[allow(dead_code)]
+mod ivm;
+#[path = "../verification/lsn.rs"]
+pub(crate) mod lsn;
+#[allow(dead_code)]
+pub(crate) mod metrics_server;
+#[allow(dead_code)]
+mod monitor;
+pub mod otel;
+#[allow(dead_code)]
+mod refresh;
+#[allow(dead_code)]
+pub mod scheduler;
+#[allow(dead_code)]
+pub(crate) mod setop_state;
+#[allow(dead_code)]
+mod shmem;
+pub mod sql_builder;
+#[allow(dead_code)]
+mod template_cache;
+pub mod version;
+#[allow(dead_code)]
+pub mod wal_decoder;
+#[allow(dead_code)]
+pub(crate) mod window_state;
+
+::pgrx::pg_module_magic!();
+
+// Declare the `pgtrickle` schema so pgrx's SQL entity graph recognises it
+// for `#[pg_extern(schema = "pgtrickle")]` annotations.
+#[pg_schema]
+mod pgtrickle {}
+
+/// Extension initialization — called when the shared library is loaded.
+///
+/// Registers GUC variables, shared memory, and background workers.
+/// Must be loaded via `shared_preload_libraries` for full functionality.
+#[allow(non_snake_case)]
+#[pg_guard]
+pub extern "C-unwind" fn _PG_init() {
+    // Check if loaded via shared_preload_libraries
+    // SAFETY: Reading a global boolean set by PostgreSQL during startup.
+    // This is safe because the value is set before any extension code runs.
+    let in_shared_preload = unsafe { pg_sys::process_shared_preload_libraries_in_progress };
+    // PGC_POSTMASTER variables can only be created during shared preload.
+    config::register_gucs(in_shared_preload);
+    #[cfg(feature = "pg18")]
+    explain_hook::register();
+
+    if in_shared_preload {
+        // Register shared memory allocations
+        shmem::init_shared_memory();
+
+        // Register the launcher background worker.
+        // The launcher auto-discovers all databases on this server and
+        // spawns a per-database scheduler for each one with pg_trickle installed.
+        scheduler::register_launcher_worker();
+
+        log!("pg_trickle: initialized (shared_preload_libraries)");
+    } else {
+        warning!(
+            "pg_trickle: loaded without shared_preload_libraries. \
+             Background scheduler and shared memory are disabled. \
+             Add 'pg_trickle' to shared_preload_libraries in \
+             postgresql.conf for full functionality."
+        );
+    }
+}
+
+#[cfg(any(test, feature = "pg_test"))]
+pub mod pg_test {
+    pub fn setup(_options: Vec<&str>) {}
+
+    pub fn postgresql_conf_options() -> Vec<&'static str> {
+        Vec::new()
+    }
+}
+
+// ── SQL migration for catalog tables ──────────────────────────────────
+
+extension_sql!(
+    r#"
+-- Extension schemas
+CREATE SCHEMA IF NOT EXISTS pgtrickle;
+CREATE SCHEMA IF NOT EXISTS pgtrickle_changes;
+
+-- F51: Restrict change buffer schema access to prevent unauthorized
+-- injection of bogus changes that would be applied on next refresh.
+REVOKE ALL ON SCHEMA pgtrickle_changes FROM PUBLIC;
+
+-- User-declared refresh groups for snapshot consistency
+CREATE TABLE IF NOT EXISTS pgtrickle.pgt_refresh_groups (
+    group_id    SERIAL PRIMARY KEY,
+    group_name  TEXT NOT NULL UNIQUE,
+    member_oids OID[] NOT NULL,
+    isolation   TEXT NOT NULL DEFAULT 'read_committed'
+                CHECK (isolation IN ('read_committed', 'repeatable_read')),
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- Core ST metadata
+CREATE TABLE IF NOT EXISTS pgtrickle.pgt_stream_tables (
+    pgt_id           BIGSERIAL PRIMARY KEY,
+    pgt_relid        OID NOT NULL UNIQUE,
+    pgt_name         TEXT NOT NULL,
+    pgt_schema       TEXT NOT NULL,
+    defining_query  TEXT NOT NULL,
+    original_query  TEXT,
+    schedule      TEXT,
+    refresh_mode    TEXT NOT NULL DEFAULT 'DIFFERENTIAL'
+                     CHECK (refresh_mode IN ('FULL', 'DIFFERENTIAL', 'IMMEDIATE')),
+    requested_refresh_mode TEXT NOT NULL DEFAULT 'DIFFERENTIAL'
+                     CHECK (requested_refresh_mode IN ('AUTO', 'FULL', 'DIFFERENTIAL', 'IMMEDIATE')),
+    status          TEXT NOT NULL DEFAULT 'INITIALIZING'
+                     CHECK (status IN ('INITIALIZING', 'ACTIVE', 'SUSPENDED', 'ERROR')),
+    is_populated    BOOLEAN NOT NULL DEFAULT FALSE,
+    data_timestamp  TIMESTAMPTZ,
+    frontier        JSONB,
+    tentative_frontier JSONB,
+    last_refresh_at TIMESTAMPTZ,
+    consecutive_errors INT NOT NULL DEFAULT 0,
+    needs_reinit    BOOLEAN NOT NULL DEFAULT FALSE,
+    auto_threshold  DOUBLE PRECISION,
+    last_full_ms    DOUBLE PRECISION,
+    functions_used  TEXT[],
+    topk_limit      INT,
+    topk_order_by   TEXT,
+    topk_offset     INT,
+    diamond_consistency TEXT NOT NULL DEFAULT 'atomic'
+                     CHECK (diamond_consistency IN ('none', 'atomic')),
+    diamond_schedule_policy TEXT NOT NULL DEFAULT 'fastest'
+                     CHECK (diamond_schedule_policy IN ('fastest', 'slowest')),
+    has_keyless_source BOOLEAN NOT NULL DEFAULT FALSE,
+    function_hashes TEXT,
+    requested_cdc_mode TEXT
+                     CHECK (requested_cdc_mode IN ('auto', 'trigger', 'wal')),
+    is_append_only  BOOLEAN NOT NULL DEFAULT FALSE,
+    scc_id          INT,
+    last_fixpoint_iterations INT,
+    max_differential_joins   INT
+        CHECK (max_differential_joins IS NULL OR max_differential_joins >= 0),
+    max_delta_fraction       DOUBLE PRECISION
+        CHECK (max_delta_fraction IS NULL OR
+               (max_delta_fraction >= 0.0 AND max_delta_fraction <= 1.0)),
+    pooler_compatibility_mode BOOLEAN NOT NULL DEFAULT FALSE,
+    refresh_tier    TEXT NOT NULL DEFAULT 'hot'
+                     CHECK (refresh_tier IN ('hot', 'warm', 'cold', 'frozen')),
+    effective_refresh_mode TEXT,
+    fuse_mode       TEXT NOT NULL DEFAULT 'off'
+                     CHECK (fuse_mode IN ('off', 'on', 'auto')),
+    fuse_state      TEXT NOT NULL DEFAULT 'armed'
+                     CHECK (fuse_state IN ('armed', 'blown', 'disabled')),
+    fuse_ceiling    BIGINT,
+    fuse_sensitivity INT,
+    blown_at        TIMESTAMPTZ,
+    blow_reason     TEXT,
+    last_error_message TEXT,
+    last_error_at   TIMESTAMPTZ,
+    self_heal_work_mem_percent SMALLINT NOT NULL DEFAULT 100
+        CHECK (self_heal_work_mem_percent BETWEEN 25 AND 100),
+    self_heal_lock_backoff_exponent SMALLINT NOT NULL DEFAULT 0
+        CHECK (self_heal_lock_backoff_exponent BETWEEN 0 AND 6),
+    self_heal_success_streak SMALLINT NOT NULL DEFAULT 0
+        CHECK (self_heal_success_streak BETWEEN 0 AND 3),
+    last_error_code TEXT CHECK (last_error_code IS NULL OR last_error_code IN
+                     ('LOCK_TIMEOUT', 'STATEMENT_TIMEOUT', 'DEADLOCK',
+                      'SERIALIZATION', 'OUT_OF_MEMORY', 'CANCELLED',
+                      'PERMANENT', 'UNKNOWN_RETRYABLE')),
+    last_error_retryable BOOLEAN,
+    downstream_publication_name TEXT,
+    freshness_deadline_ms BIGINT,
+    target_freshness_mode TEXT
+        CHECK (target_freshness_mode IS NULL OR target_freshness_mode IN ('INTERVAL', 'ON_COMMIT', 'MANUAL')),
+    refresh_reason TEXT,
+    refresh_reason_detail TEXT,
+    st_partition_key TEXT,
+    in_shadow_build BOOLEAN NOT NULL DEFAULT FALSE,
+    shadow_table_name TEXT,
+    -- CITUS-3: Placement of this stream table's storage in a Citus cluster.
+    st_placement    TEXT NOT NULL DEFAULT 'local',
+    -- v0.36.0: temporal IVM flag (CORR-1/UX-1)
+    temporal_mode   BOOLEAN NOT NULL DEFAULT FALSE,
+    -- v0.36.0: columnar storage backend (CORR-2/UX-3)
+    storage_backend TEXT NOT NULL DEFAULT 'heap',
+    -- v0.47.0: post-refresh action hooks (VP-1/VP-2)
+    post_refresh_action TEXT NOT NULL DEFAULT 'none'
+                     CHECK (post_refresh_action IN ('none', 'analyze', 'reindex', 'reindex_if_drift')),
+    reindex_drift_threshold DOUBLE PRECISION
+                     CHECK (reindex_drift_threshold IS NULL OR (reindex_drift_threshold > 0 AND reindex_drift_threshold <= 1.0)),
+    rows_changed_since_last_reindex BIGINT NOT NULL DEFAULT 0,
+    last_reindex_at TIMESTAMPTZ,
+    -- v0.36.0: column lineage metadata (F12)
+    column_lineage  JSONB,
+    -- v0.59.0 PERF-2: hash of defining_query to skip recomputation on every refresh
+    defining_query_hash BIGINT NOT NULL DEFAULT 0,
+    -- v0.73.0 HOT-1: fillfactor for storage heap (NULL = PG default 100). Range 10-100.
+    storage_fillfactor INT DEFAULT NULL CHECK (storage_fillfactor IS NULL OR (storage_fillfactor >= 10 AND storage_fillfactor <= 100)),
+    -- v0.78.0 P-2: OpTree-derived complexity label, back-filled lazily on first refresh.
+    query_complexity_class TEXT,
+    -- v0.83.0: Composite row-identity encoding version. NULL is an
+    -- unclassified pre-upgrade row; fresh objects are written explicitly.
+    row_identity_version SMALLINT,
+    -- v0.87.16: bounded identity probe encoding version.
+    row_probe_version SMALLINT,
+    -- v0.89.0: analyzed incremental-window strategy. Private state OIDs live
+    -- in pgt_window_states, never in this durable plan.
+    window_strategy JSONB
+        CHECK (window_strategy IS NULL OR jsonb_typeof(window_strategy) = 'object'),
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    -- v0.87.7 LSEC-3: exact search_path defining_query was resolved under
+    -- (bare $user already expanded). Set at CREATE and on any ALTER that
+    -- changes the query; preserved by configuration-only ALTERs and
+    -- ownership transfer.
+    defining_search_path TEXT NOT NULL,
+    -- v0.93.0: durable ownership of refresh orchestration.
+    orchestration_mode TEXT NOT NULL DEFAULT 'MANAGED'
+        CHECK (orchestration_mode IN ('MANAGED', 'EXTERNAL')),
+    -- v0.93.0: generation of the result-affecting execution contract.
+    contract_generation BIGINT NOT NULL DEFAULT 1 CHECK (contract_generation > 0)
+);
+
+CREATE OR REPLACE FUNCTION pgtrickle._bump_contract_generation()
+RETURNS trigger
+LANGUAGE plpgsql
+SET search_path = pgtrickle, pg_catalog, pg_temp
+AS $$
+BEGIN
+    IF ROW(OLD.pgt_relid, OLD.pgt_name, OLD.pgt_schema, OLD.defining_query,
+           OLD.original_query, OLD.refresh_mode, OLD.requested_refresh_mode,
+           OLD.functions_used, OLD.topk_limit, OLD.topk_order_by,
+           OLD.topk_offset, OLD.diamond_consistency,
+           OLD.diamond_schedule_policy, OLD.has_keyless_source,
+           OLD.requested_cdc_mode, OLD.is_append_only, OLD.scc_id,
+           OLD.st_partition_key, OLD.temporal_mode, OLD.storage_backend,
+           OLD.row_identity_version, OLD.row_probe_version,
+           OLD.defining_search_path, OLD.orchestration_mode)
+       IS DISTINCT FROM
+       ROW(NEW.pgt_relid, NEW.pgt_name, NEW.pgt_schema, NEW.defining_query,
+           NEW.original_query, NEW.refresh_mode, NEW.requested_refresh_mode,
+           NEW.functions_used, NEW.topk_limit, NEW.topk_order_by,
+           NEW.topk_offset, NEW.diamond_consistency,
+           NEW.diamond_schedule_policy, NEW.has_keyless_source,
+           NEW.requested_cdc_mode, NEW.is_append_only, NEW.scc_id,
+           NEW.st_partition_key, NEW.temporal_mode, NEW.storage_backend,
+           NEW.row_identity_version, NEW.row_probe_version,
+           NEW.defining_search_path, NEW.orchestration_mode) THEN
+        NEW.contract_generation := OLD.contract_generation + 1;
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS pgt_stream_tables_contract_generation
+    ON pgtrickle.pgt_stream_tables;
+CREATE TRIGGER pgt_stream_tables_contract_generation
+BEFORE UPDATE OF pgt_relid, pgt_name, pgt_schema, defining_query,
+    original_query, refresh_mode, requested_refresh_mode, functions_used,
+    topk_limit, topk_order_by, topk_offset, diamond_consistency,
+    diamond_schedule_policy, has_keyless_source, requested_cdc_mode,
+    is_append_only, scc_id, st_partition_key, temporal_mode, storage_backend,
+    row_identity_version, row_probe_version, defining_search_path,
+    orchestration_mode
+ON pgtrickle.pgt_stream_tables
+FOR EACH ROW EXECUTE FUNCTION pgtrickle._bump_contract_generation();
+
+CREATE INDEX IF NOT EXISTS idx_pgt_status ON pgtrickle.pgt_stream_tables (status);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_pgt_name ON pgtrickle.pgt_stream_tables (pgt_schema, pgt_name);
+-- PERF-4: Scheduler hot‐path lookup by relation OID.
+CREATE INDEX IF NOT EXISTS idx_pgt_relid ON pgtrickle.pgt_stream_tables (pgt_relid);
+
+-- v0.87.12: Immutable provenance for downstream publications.
+CREATE TABLE IF NOT EXISTS pgtrickle.pgt_publication_bindings (
+    pgt_id                  BIGINT PRIMARY KEY
+                            REFERENCES pgtrickle.pgt_stream_tables(pgt_id)
+                            ON DELETE CASCADE,
+    stream_relid            OID NOT NULL,
+    publication_oid         OID NOT NULL UNIQUE,
+    publication_name        TEXT NOT NULL UNIQUE,
+    publication_owner_oid   OID NOT NULL,
+    expected_relation_oids  OID[] NOT NULL,
+    CONSTRAINT pgt_publication_binding_relations_check
+        CHECK (expected_relation_oids = ARRAY[stream_relid])
+);
+REVOKE ALL ON TABLE pgtrickle.pgt_publication_bindings FROM PUBLIC;
+
+-- v0.83.0: Durable private state registry for set-operation state.
+CREATE TABLE IF NOT EXISTS pgtrickle.pgt_set_operation_states (
+    pgt_id         BIGINT NOT NULL
+                   REFERENCES pgtrickle.pgt_stream_tables(pgt_id)
+                   ON DELETE CASCADE,
+    node_ordinal   INTEGER NOT NULL,
+    operation      TEXT NOT NULL CHECK (operation IN ('INTERSECT', 'EXCEPT')),
+    is_all         BOOLEAN NOT NULL,
+    state_relid    OID NOT NULL,
+    schema_version SMALLINT NOT NULL,
+    PRIMARY KEY (pgt_id, node_ordinal)
+);
+
+SELECT pg_catalog.pg_extension_config_dump('pgtrickle.pgt_set_operation_states', '');
+
+-- v0.89.0: Durable private registry for incremental window state. The
+-- relations referenced here are permanent LOGGED extension members; their
+-- contents are derived and rebuilt after logical restore.
+CREATE TABLE IF NOT EXISTS pgtrickle.pgt_window_states (
+    pgt_id              BIGINT NOT NULL
+                        REFERENCES pgtrickle.pgt_stream_tables(pgt_id)
+                        ON DELETE CASCADE,
+    node_ordinal        INTEGER NOT NULL,
+    spec_ordinal        INTEGER NOT NULL,
+    partition_relid     OID NOT NULL,
+    row_relid           OID NOT NULL,
+    peer_relid          OID,
+    schema_version      SMALLINT NOT NULL,
+    strategy_version    SMALLINT NOT NULL,
+    query_hash          BIGINT NOT NULL,
+    state_generation    BIGINT NOT NULL,
+    status              TEXT NOT NULL
+                        CHECK (status IN
+                               ('BUILDING', 'READY', 'STALE', 'OVER_BUDGET')),
+    estimated_bytes     BIGINT NOT NULL DEFAULT 0
+                        CHECK (estimated_bytes >= 0),
+    last_validated_at   TIMESTAMPTZ,
+    updated_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (pgt_id, node_ordinal, spec_ordinal)
+);
+REVOKE ALL ON TABLE pgtrickle.pgt_window_states FROM PUBLIC;
+
+-- Register the table with an always-false filter so pg_dump restores the
+-- durable strategy JSON but never stale live relation OIDs or derived rows.
+SELECT pg_catalog.pg_extension_config_dump(
+    'pgtrickle.pgt_window_states',
+    'WHERE false'
+);
+
+-- v0.90.0: bounded controller summary. It is a cache of exact samples and
+-- decisions, never a second source of truth for refresh execution.
+CREATE TABLE IF NOT EXISTS pgtrickle.pgt_freshness_controller_state (
+    pgt_id              BIGINT PRIMARY KEY
+                        REFERENCES pgtrickle.pgt_stream_tables(pgt_id)
+                        ON DELETE CASCADE,
+    controller_version   SMALLINT NOT NULL DEFAULT 1,
+    plan_identity        BIGINT,
+    target_ms           BIGINT NOT NULL CHECK (target_ms > 0),
+    sample_count        INTEGER NOT NULL DEFAULT 0 CHECK (sample_count >= 0),
+    last_settled_refresh_id BIGINT,
+    last_sample_ms      DOUBLE PRECISION,
+    p50_freshness_ms    DOUBLE PRECISION,
+    p95_freshness_ms    DOUBLE PRECISION,
+    p99_freshness_ms    DOUBLE PRECISION,
+    sla_status          TEXT NOT NULL DEFAULT 'INSUFFICIENT_DATA'
+                        CHECK (sla_status IN ('MEETING', 'AT_RISK', 'BREACHING',
+                                              'INFEASIBLE', 'INSUFFICIENT_DATA',
+                                              'EVIDENCE_UNAVAILABLE', 'NOT_APPLICABLE')),
+    evidence_state      TEXT NOT NULL DEFAULT 'EXACT',
+    breach_streak       SMALLINT NOT NULL DEFAULT 0 CHECK (breach_streak >= 0),
+    recovery_streak     SMALLINT NOT NULL DEFAULT 0 CHECK (recovery_streak >= 0),
+    breach_started_at   TIMESTAMPTZ,
+    infeasibility_streak SMALLINT NOT NULL DEFAULT 0 CHECK (infeasibility_streak >= 0),
+    feasibility_recovery_streak SMALLINT NOT NULL DEFAULT 0 CHECK (feasibility_recovery_streak >= 0),
+    infeasible_since    TIMESTAMPTZ,
+    infeasibility_reason TEXT,
+    minimum_cost_ms     DOUBLE PRECISION,
+    last_applied_interval_ms BIGINT,
+    last_applied_mode   TEXT,
+    last_applied_batch_size BIGINT,
+    last_input_snapshot JSONB CHECK (last_input_snapshot IS NULL OR jsonb_typeof(last_input_snapshot) = 'object'),
+    next_due_at         TIMESTAMPTZ,
+    last_decision_at    TIMESTAMPTZ,
+    updated_at          TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+REVOKE ALL ON TABLE pgtrickle.pgt_freshness_controller_state FROM PUBLIC;
+SELECT pg_catalog.pg_extension_config_dump(
+    'pgtrickle.pgt_freshness_controller_state',
+    'WHERE false'
+);
+
+-- Snapshot metadata catalog
+CREATE TABLE IF NOT EXISTS pgtrickle.pgt_snapshots (
+    snapshot_id      BIGSERIAL PRIMARY KEY,
+    pgt_id           BIGINT NOT NULL
+                     REFERENCES pgtrickle.pgt_stream_tables(pgt_id) ON DELETE CASCADE,
+    snapshot_schema  TEXT NOT NULL,
+    snapshot_table   TEXT NOT NULL,
+    snapshot_version TEXT NOT NULL,
+    frontier         JSONB,
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+    snapshot_relid   OID,
+    snapshot_provenance_token TEXT,
+    created_by_role_oid OID,
+    CONSTRAINT uq_snapshot_table UNIQUE (snapshot_schema, snapshot_table)
+);
+
+CREATE INDEX IF NOT EXISTS idx_pgt_snapshots_pgt_id
+    ON pgtrickle.pgt_snapshots (pgt_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_pgt_snapshots_snapshot_relid
+    ON pgtrickle.pgt_snapshots (snapshot_relid);
+
+SELECT pg_catalog.pg_extension_config_dump('pgtrickle.pgt_snapshots', '');
+
+-- Durable NOTIFY subscriptions
+CREATE TABLE IF NOT EXISTS pgtrickle.pgt_subscriptions (
+    stream_table TEXT NOT NULL,
+    channel      TEXT NOT NULL,
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (stream_table, channel)
+);
+
+SELECT pg_catalog.pg_extension_config_dump('pgtrickle.pgt_subscriptions', '');
+
+-- DAG edges
+CREATE TABLE IF NOT EXISTS pgtrickle.pgt_dependencies (
+    pgt_id        BIGINT NOT NULL REFERENCES pgtrickle.pgt_stream_tables(pgt_id) ON DELETE CASCADE,
+    source_relid OID NOT NULL,
+    source_type  TEXT NOT NULL CHECK (source_type IN ('TABLE', 'STREAM_TABLE', 'VIEW', 'MATVIEW', 'FOREIGN_TABLE')),
+    columns_used TEXT[],
+    column_snapshot JSONB,
+    schema_fingerprint TEXT,
+    cdc_mode     TEXT NOT NULL DEFAULT 'TRIGGER'
+                  CHECK (cdc_mode IN ('TRIGGER', 'TRANSITIONING', 'WAL')),
+    slot_name    TEXT,
+    decoder_confirmed_lsn PG_LSN,
+    transition_started_at TIMESTAMPTZ,
+    cutover_target TEXT CHECK (cutover_target IN ('TRIGGER', 'WAL')),
+    cutover_lsn PG_LSN,
+    -- CITUS-3: Stable name for the source table (v0.32.0+). NULL = pre-upgrade row.
+    source_stable_name   TEXT,
+    -- CITUS-3: Source placement in a Citus cluster: 'local', 'reference', 'distributed'.
+    source_placement     TEXT NOT NULL DEFAULT 'local',
+    PRIMARY KEY (pgt_id, source_relid)
+);
+
+CREATE INDEX IF NOT EXISTS idx_deps_source ON pgtrickle.pgt_dependencies (source_relid);
+-- PERF-4: Fast lookup by pgt_id (non‐PK prefix for multi‐column PK).
+CREATE INDEX IF NOT EXISTS idx_deps_pgt_id ON pgtrickle.pgt_dependencies (pgt_id);
+
+CREATE OR REPLACE FUNCTION pgtrickle._bump_dependency_contract_generation()
+RETURNS trigger
+LANGUAGE plpgsql
+SET search_path = pgtrickle, pg_catalog, pg_temp
+AS $$
+BEGIN
+    UPDATE pgtrickle.pgt_stream_tables
+       SET contract_generation = contract_generation + 1
+     WHERE pgt_id = CASE WHEN TG_OP = 'DELETE' THEN OLD.pgt_id ELSE NEW.pgt_id END;
+    IF TG_OP = 'DELETE' THEN
+        RETURN OLD;
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS pgt_dependencies_contract_generation
+    ON pgtrickle.pgt_dependencies;
+CREATE TRIGGER pgt_dependencies_contract_generation
+AFTER INSERT OR UPDATE OR DELETE ON pgtrickle.pgt_dependencies
+FOR EACH ROW EXECUTE FUNCTION pgtrickle._bump_dependency_contract_generation();
+
+-- Refresh history / audit log
+CREATE TABLE IF NOT EXISTS pgtrickle.pgt_refresh_history (
+    refresh_id      BIGSERIAL PRIMARY KEY,
+    pgt_id           BIGINT NOT NULL
+                     REFERENCES pgtrickle.pgt_stream_tables(pgt_id) ON DELETE CASCADE,
+    data_timestamp  TIMESTAMPTZ NOT NULL,
+    start_time      TIMESTAMPTZ NOT NULL,
+    end_time        TIMESTAMPTZ,
+    action          TEXT NOT NULL
+                     CHECK (action IN ('NO_DATA', 'FULL', 'DIFFERENTIAL', 'REINITIALIZE', 'SKIP')),
+    rows_inserted   BIGINT DEFAULT 0,
+    rows_updated    BIGINT NOT NULL DEFAULT 0,
+    rows_deleted    BIGINT DEFAULT 0,
+    delta_row_count BIGINT DEFAULT 0,
+    merge_strategy_used TEXT,
+    was_full_fallback BOOLEAN NOT NULL DEFAULT FALSE,
+    refresh_reason TEXT,
+    refresh_reason_detail TEXT,
+    error_message   TEXT,
+    status          TEXT NOT NULL
+                     CHECK (status IN ('RUNNING', 'COMPLETED', 'FAILED', 'SKIPPED')),
+    initiated_by    TEXT
+                     CHECK (initiated_by IN ('SCHEDULER', 'MANUAL', 'INITIAL', 'SELF_MONITOR', 'SCHEDULER_FUSED', 'EXTERNAL_GRAPH')),
+    freshness_deadline TIMESTAMPTZ,
+    tick_watermark_lsn PG_LSN,
+    fixpoint_iteration INT
+    ,
+    error_code      TEXT CHECK (error_code IS NULL OR error_code IN
+                     ('LOCK_TIMEOUT', 'STATEMENT_TIMEOUT', 'DEADLOCK',
+                      'SERIALIZATION', 'OUT_OF_MEMORY', 'CANCELLED',
+                      'PERMANENT', 'UNKNOWN_RETRYABLE')),
+    error_sqlstate  TEXT,
+    retryable       BOOLEAN,
+    -- v0.90.0: exact provenance and visibility settlement. Nullable values
+    -- are deliberately not backfilled: old rows cannot prove freshness.
+    duration_ms     DOUBLE PRECISION,
+    source_commit_at TIMESTAMPTZ,
+    visibility_xid  XID,
+    visible_at      TIMESTAMPTZ,
+    commit_to_visible_ms DOUBLE PRECISION,
+    plan_identity   BIGINT
+);
+
+CREATE INDEX IF NOT EXISTS idx_hist_pgt_ts ON pgtrickle.pgt_refresh_history (pgt_id, data_timestamp);
+-- PERF-1: Fast lookup by (pgt_id, start_time) for self-monitoring and scheduler_overhead queries.
+CREATE INDEX IF NOT EXISTS idx_hist_pgt_start ON pgtrickle.pgt_refresh_history (pgt_id, start_time);
+CREATE INDEX IF NOT EXISTS idx_hist_start_time
+    ON pgtrickle.pgt_refresh_history (start_time, refresh_id);
+CREATE INDEX IF NOT EXISTS idx_hist_pgt_stats_window
+    ON pgtrickle.pgt_refresh_history (pgt_id, start_time, status, action);
+
+-- v0.73.0 PERF-001: Incremental summary table for refresh-history metrics.
+CREATE TABLE IF NOT EXISTS pgtrickle.pgt_refresh_summary (
+    pgt_id BIGINT PRIMARY KEY
+          REFERENCES pgtrickle.pgt_stream_tables(pgt_id) ON DELETE CASCADE,
+    total_refreshes BIGINT NOT NULL DEFAULT 0,
+    successful_refreshes BIGINT NOT NULL DEFAULT 0,
+    failed_refreshes BIGINT NOT NULL DEFAULT 0,
+    total_rows_inserted BIGINT NOT NULL DEFAULT 0,
+    total_rows_updated BIGINT NOT NULL DEFAULT 0,
+    total_rows_deleted BIGINT NOT NULL DEFAULT 0,
+    total_duration_ms BIGINT NOT NULL DEFAULT 0,
+    last_refresh_action TEXT,
+    last_refresh_status TEXT,
+    last_refresh_at TIMESTAMPTZ,
+    stats_reset_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    total_full_refreshes BIGINT NOT NULL DEFAULT 0,
+    total_diff_refreshes BIGINT NOT NULL DEFAULT 0,
+    total_delta_rows_processed BIGINT NOT NULL DEFAULT 0,
+    last_full_reason TEXT,
+    last_full_reason_detail TEXT,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- v0.78.0 P-3: Per-stream-table cost model summary.
+-- Populated by batch_update_cost_model_summary() on each scheduler tick.
+CREATE TABLE IF NOT EXISTS pgtrickle.pgt_cost_model_summary (
+    pgt_id       BIGINT      NOT NULL
+                             REFERENCES pgtrickle.pgt_stream_tables(pgt_id)
+                             ON DELETE CASCADE,
+    avg_full_ms  DOUBLE PRECISION,
+    avg_diff_ms  DOUBLE PRECISION,
+    sample_count INTEGER     NOT NULL DEFAULT 0,
+    p95_ms       DOUBLE PRECISION,
+    p99_ms       DOUBLE PRECISION,
+    updated_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT pgt_cost_model_summary_pk PRIMARY KEY (pgt_id)
+);
+
+-- v0.73.0 ARCH-002 / REL-002: Persistent cleanup retry/backpressure status.
+CREATE TABLE IF NOT EXISTS pgtrickle.pgt_cleanup_status (
+    source_relid OID PRIMARY KEY,
+    buffer_table TEXT NOT NULL,
+    attempt_count INT NOT NULL DEFAULT 0,
+    blocked BOOLEAN NOT NULL DEFAULT false,
+    last_error TEXT,
+    last_operation TEXT,
+    last_attempt_at TIMESTAMPTZ,
+    next_retry_at TIMESTAMPTZ,
+    backlog_rows BIGINT NOT NULL DEFAULT 0,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_cleanup_status_next_retry
+    ON pgtrickle.pgt_cleanup_status (blocked, next_retry_at);
+
+-- Per-source CDC slot tracking
+CREATE TABLE IF NOT EXISTS pgtrickle.pgt_change_tracking (
+    source_relid        OID PRIMARY KEY,
+    slot_name           TEXT NOT NULL,
+    last_consumed_lsn   PG_LSN,
+    receipt_high_water_lsn PG_LSN,
+    acknowledged_high_water_lsn PG_LSN,
+    tracked_by_pgt_ids   BIGINT[],
+    -- CITUS-3: Stable hash name used for all pg_trickle-managed objects (v0.32.0+).
+    -- NULL = pre-upgrade row using OID-based object names (STAB-1 fallback).
+    source_stable_name  TEXT,
+    -- CITUS-3: How the source is placed in a Citus cluster.
+    source_placement    TEXT NOT NULL DEFAULT 'local',
+    -- CITUS-7: Per-node WAL frontier for distributed sources. NULL for local sources.
+    frontier_per_node   JSONB
+);
+
+-- v0.103.0: WAL rows are durably received before the logical slot is
+-- acknowledged. Keeping the raw decoder payload makes replay possible after
+-- a worker crash or a failed buffer write.
+CREATE TABLE IF NOT EXISTS pgtrickle.pgt_wal_receipts (
+    receipt_id       BIGSERIAL PRIMARY KEY,
+    source_relid     OID NOT NULL,
+    slot_name        TEXT NOT NULL,
+    lsn              PG_LSN NOT NULL,
+    source_xid       XID,
+    data             TEXT NOT NULL,
+    source_change    BOOLEAN NOT NULL DEFAULT false,
+    status           TEXT NOT NULL DEFAULT 'RECEIVED'
+                     CHECK (status IN ('RECEIVED', 'APPLIED', 'ACKNOWLEDGED')),
+    received_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    acknowledged_at  TIMESTAMPTZ,
+    UNIQUE (source_relid, lsn, data)
+);
+
+CREATE INDEX IF NOT EXISTS pgt_wal_receipts_pending_idx
+    ON pgtrickle.pgt_wal_receipts (source_relid, status, lsn, receipt_id);
+
+REVOKE ALL ON TABLE pgtrickle.pgt_wal_receipts FROM PUBLIC;
+SELECT pg_catalog.pg_extension_config_dump('pgtrickle.pgt_wal_receipts', '');
+
+-- v0.92.0: durable capture ownership and upgrade quiescence state.
+CREATE TABLE IF NOT EXISTS pgtrickle.pgt_capture_instance (
+    singleton                   BOOLEAN PRIMARY KEY DEFAULT true CHECK (singleton),
+    instance_id                 TEXT NOT NULL,
+    database_oid                OID NOT NULL,
+    system_identifier           TEXT NOT NULL,
+    state                       TEXT NOT NULL DEFAULT 'ACTIVE'
+                                CHECK (state IN ('ACTIVE', 'QUIESCED', 'QUARANTINED')),
+    observed_database_oid       OID,
+    observed_system_identifier  TEXT,
+    quarantine_reason           TEXT,
+    initialized_at              TIMESTAMPTZ NOT NULL DEFAULT now(),
+    last_seen_at                TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+REVOKE ALL ON TABLE pgtrickle.pgt_capture_instance FROM PUBLIC;
+SELECT pg_catalog.pg_extension_config_dump('pgtrickle.pgt_capture_instance', '');
+
+-- v0.82.0: Registry for validated base-table and stream-table change buffers.
+CREATE TABLE IF NOT EXISTS pgtrickle.pgt_change_buffers (
+    buffer_key       TEXT PRIMARY KEY,
+    source_kind      TEXT NOT NULL CHECK (source_kind IN ('BASE', 'STREAM_TABLE')),
+    source_id        BIGINT NOT NULL,
+    durability       TEXT NOT NULL CHECK (durability IN ('logged', 'unlogged', 'sync')),
+    sentinel_token   BIGINT NOT NULL,
+    -- v0.83.0: Composite row-identity encoding used by buffer writers.
+    row_identity_version SMALLINT,
+    -- v0.87.16: bounded identity probe encoding version.
+    row_probe_version    SMALLINT,
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (source_kind, source_id)
+);
+
+-- Scheduler job table for parallel refresh dispatch
+CREATE TABLE IF NOT EXISTS pgtrickle.pgt_scheduler_jobs (
+    job_id          BIGSERIAL PRIMARY KEY,
+    dag_version     BIGINT NOT NULL,
+    unit_key        TEXT NOT NULL,
+    unit_kind       TEXT NOT NULL
+                     CHECK (unit_kind IN ('singleton', 'atomic_group', 'immediate_closure', 'cyclic_scc', 'repeatable_read_group', 'fused_chain')),
+    member_pgt_ids  BIGINT[] NOT NULL,
+    root_pgt_id     BIGINT NOT NULL,
+    status          TEXT NOT NULL DEFAULT 'QUEUED'
+                     CHECK (status IN ('QUEUED', 'RUNNING', 'SUCCEEDED',
+                                       'RETRYABLE_FAILED', 'PERMANENT_FAILED', 'CANCELLED')),
+    scheduler_pid   INT NOT NULL,
+    worker_pid      INT,
+    attempt_no      INT NOT NULL DEFAULT 1,
+    enqueued_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+    started_at      TIMESTAMPTZ,
+    finished_at     TIMESTAMPTZ,
+    outcome_detail  TEXT,
+    retryable       BOOLEAN,
+    dispatch_tick_id BIGINT,
+    tick_watermark_lsn PG_LSN
+    ,
+    outcome_code    TEXT CHECK (outcome_code IS NULL OR outcome_code IN
+                     ('LOCK_TIMEOUT', 'STATEMENT_TIMEOUT', 'DEADLOCK',
+                      'SERIALIZATION', 'OUT_OF_MEMORY', 'CANCELLED',
+                      'PERMANENT', 'UNKNOWN_RETRYABLE')),
+    outcome_sqlstate TEXT,
+    worker_slot_generation BIGINT
+);
+
+CREATE INDEX IF NOT EXISTS idx_sched_jobs_status_enqueued
+    ON pgtrickle.pgt_scheduler_jobs (status, enqueued_at);
+CREATE INDEX IF NOT EXISTS idx_sched_jobs_unit_status
+    ON pgtrickle.pgt_scheduler_jobs (unit_key, status);
+CREATE INDEX IF NOT EXISTS idx_sched_jobs_finished
+    ON pgtrickle.pgt_scheduler_jobs (finished_at)
+    WHERE finished_at IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_sched_jobs_terminal_finished
+    ON pgtrickle.pgt_scheduler_jobs (finished_at, job_id)
+    WHERE status IN ('SUCCEEDED', 'RETRYABLE_FAILED', 'PERMANENT_FAILED', 'CANCELLED');
+
+-- Bootstrap source gates (v0.5.0, Phase 3)
+-- Records which source tables are currently "gated" (bootstrapping in progress).
+-- When a source is gated, all stream tables that depend on it are skipped by
+-- the scheduler until pgtrickle.ungate_source() is called.
+CREATE TABLE IF NOT EXISTS pgtrickle.pgt_source_gates (
+    source_relid    OID PRIMARY KEY,
+    gated           BOOLEAN NOT NULL DEFAULT true,
+    gated_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+    ungated_at      TIMESTAMPTZ,
+    gated_by        TEXT
+);
+
+-- Per-source watermark state: tracks how far each external source has been loaded.
+CREATE TABLE IF NOT EXISTS pgtrickle.pgt_watermarks (
+    source_relid       OID PRIMARY KEY,
+    watermark          TIMESTAMPTZ NOT NULL,
+    updated_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
+    advanced_by        TEXT,
+    wal_lsn_at_advance TEXT
+);
+
+-- Watermark groups: declare that a set of sources must be temporally aligned.
+CREATE TABLE IF NOT EXISTS pgtrickle.pgt_watermark_groups (
+    group_id           SERIAL PRIMARY KEY,
+    group_name         TEXT UNIQUE NOT NULL,
+    source_relids      OID[] NOT NULL,
+    tolerance_secs     DOUBLE PRECISION NOT NULL DEFAULT 0,
+    created_at         TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- DB-3: Schema version tracking table.
+-- Records which schema migration versions have been applied to this database.
+CREATE TABLE IF NOT EXISTS pgtrickle.pgt_schema_version (
+    version     TEXT PRIMARY KEY,
+    applied_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    description TEXT
+);
+
+-- v0.94.0: monotonic identifiers for strict graph-refresh results.
+CREATE SEQUENCE IF NOT EXISTS pgtrickle.pgt_graph_refresh_id_seq;
+INSERT INTO pgtrickle.pgt_schema_version (version, description)
+VALUES ('0.19.0', 'Initial schema version tracking')
+ON CONFLICT (version) DO NOTHING;
+INSERT INTO pgtrickle.pgt_schema_version (version, description)
+VALUES (
+    '0.84.0',
+    'Bootstrap catalog parity repair and manifest tooling baseline'
+)
+ON CONFLICT (version) DO NOTHING;
+INSERT INTO pgtrickle.pgt_schema_version (version, description)
+VALUES (
+    '0.85.0',
+    'Scheduler and resource resilience gate'
+)
+ON CONFLICT (version) DO NOTHING;
+INSERT INTO pgtrickle.pgt_schema_version (version, description)
+VALUES (
+    '0.89.0',
+    'Incremental window strategy and private state registry'
+)
+ON CONFLICT (version) DO NOTHING;
+INSERT INTO pgtrickle.pgt_schema_version (version, description)
+VALUES (
+    '0.90.0',
+    'Freshness provenance, visibility settlement, and advisory controller state'
+)
+ON CONFLICT (version) DO NOTHING;
+INSERT INTO pgtrickle.pgt_schema_version (version, description)
+VALUES (
+    '0.91.0',
+    'Safe defining-query replacement and source schema-evolution recovery'
+)
+ON CONFLICT (version) DO NOTHING;
+INSERT INTO pgtrickle.pgt_schema_version (version, description)
+VALUES (
+    '0.93.0',
+    'Graph V1 contracts and durable external orchestration ownership'
+)
+ON CONFLICT (version) DO NOTHING;
+INSERT INTO pgtrickle.pgt_schema_version (version, description)
+VALUES (
+    '0.97.0',
+    'Operational assurance, monitoring contracts, and release evidence'
+)
+ON CONFLICT (version) DO NOTHING;
+INSERT INTO pgtrickle.pgt_schema_version (version, description)
+VALUES (
+    '0.98.0',
+    'Risk containment, trigger-only capture, and fail-closed integration contracts'
+)
+ON CONFLICT (version) DO NOTHING;
+INSERT INTO pgtrickle.pgt_schema_version (version, description)
+VALUES (
+    '0.103.0',
+    'Durable WAL receipts, replay watermarks, and bounded capture admission'
+)
+ON CONFLICT (version) DO NOTHING;
+
+SELECT pg_catalog.pg_extension_config_dump('pgtrickle.pgt_stream_tables', '');
+SELECT pg_catalog.pg_extension_config_dump('pgtrickle.pgt_dependencies', '');
+SELECT pg_catalog.pg_extension_config_dump('pgtrickle.pgt_change_buffers', '');
+SELECT pg_catalog.pg_extension_config_dump('pgtrickle.pgt_source_gates', '');
+SELECT pg_catalog.pg_extension_config_dump('pgtrickle.pgt_watermarks', '');
+SELECT pg_catalog.pg_extension_config_dump('pgtrickle.pgt_watermark_groups', '');
+
+-- CIT-2: Cross-node advisory lock table for distributed stream table refresh.
+-- Uses INSERT … ON CONFLICT DO NOTHING for atomic acquisition; timestamp-based
+-- lease expiry handles crashed holders without requiring heartbeats.
+CREATE TABLE IF NOT EXISTS pgtrickle.pgt_st_locks (
+    lock_key    TEXT        NOT NULL,
+    holder      TEXT        NOT NULL,
+    acquired_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    expires_at  TIMESTAMPTZ NOT NULL,
+    CONSTRAINT pgt_st_locks_pkey PRIMARY KEY (lock_key)
+);
+SELECT pg_catalog.pg_extension_config_dump('pgtrickle.pgt_st_locks', '');
+
+-- CIT-3: Per-worker logical replication slot tracking for distributed sources.
+-- Each row represents a WAL slot on one Citus worker node that feeds changes
+-- for a given (stream_table, source) pair into the coordinator's change buffer.
+CREATE TABLE IF NOT EXISTS pgtrickle.pgt_worker_slots (
+    pgt_id       BIGINT      NOT NULL
+                 REFERENCES pgtrickle.pgt_stream_tables(pgt_id) ON DELETE CASCADE,
+    source_relid OID         NOT NULL,
+    worker_name  TEXT        NOT NULL,
+    worker_port  INT         NOT NULL DEFAULT 5432,
+    slot_name    TEXT        NOT NULL,
+    last_frontier TEXT,
+    CONSTRAINT pgt_worker_slots_pkey
+        PRIMARY KEY (pgt_id, source_relid, worker_name, worker_port)
+);
+SELECT pg_catalog.pg_extension_config_dump('pgtrickle.pgt_worker_slots', '');
+
+-- G14-SHC: Shared template cache (catalog-backed, UNLOGGED)
+CREATE UNLOGGED TABLE IF NOT EXISTS pgtrickle.pgt_template_cache (
+    pgt_id       BIGINT PRIMARY KEY
+                 REFERENCES pgtrickle.pgt_stream_tables(pgt_id) ON DELETE CASCADE,
+    query_hash   BIGINT NOT NULL,
+    delta_sql    TEXT NOT NULL,
+    columns      TEXT[] NOT NULL,
+    source_oids  INTEGER[] NOT NULL,
+    is_dedup     BOOLEAN NOT NULL DEFAULT FALSE,
+    key_changed  BOOLEAN NOT NULL DEFAULT FALSE,
+    all_algebraic BOOLEAN NOT NULL DEFAULT FALSE,
+    statistics_epoch TEXT NOT NULL DEFAULT 'unknown',
+    planning_version INTEGER NOT NULL DEFAULT 1,
+    cached_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- v0.95.0: durable typed output-delta log and consumer cursors.
+CREATE TABLE IF NOT EXISTS pgtrickle.pgt_output_delta_logs (
+    pgt_id                  BIGINT PRIMARY KEY
+                            REFERENCES pgtrickle.pgt_stream_tables(pgt_id) ON DELETE CASCADE,
+    database_instance_id    TEXT NOT NULL,
+    delta_relid              OID NOT NULL,
+    log_head                 BIGINT NOT NULL DEFAULT 0 CHECK (log_head >= 0),
+    output_contract_digest   BYTEA NOT NULL,
+    row_identity_version     SMALLINT NOT NULL CHECK (row_identity_version > 0),
+    created_at               TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at               TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS pgtrickle.pgt_output_delta_batches (
+    pgt_id                  BIGINT NOT NULL
+                            REFERENCES pgtrickle.pgt_stream_tables(pgt_id) ON DELETE CASCADE,
+    database_instance_id    TEXT NOT NULL,
+    batch_token              BIGINT NOT NULL CHECK (batch_token > 0),
+    producing_refresh_id     BIGINT NOT NULL,
+    graph_refresh_id         BIGINT,
+    mode                     TEXT NOT NULL CHECK (mode IN ('EXACT', 'FULL_INVALIDATION')),
+    row_count                BIGINT NOT NULL CHECK (row_count >= 0),
+    rows_inserted            BIGINT NOT NULL CHECK (rows_inserted >= 0),
+    rows_deleted             BIGINT NOT NULL CHECK (rows_deleted >= 0),
+    output_contract_digest   BYTEA NOT NULL,
+    row_identity_version     SMALLINT NOT NULL CHECK (row_identity_version > 0),
+    source_boundary_digest   BYTEA,
+    created_at               TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (pgt_id, batch_token)
+);
+
+CREATE TABLE IF NOT EXISTS pgtrickle.pgt_output_delta_consumers (
+    consumer_id              UUID PRIMARY KEY,
+    pgt_id                   BIGINT NOT NULL
+                             REFERENCES pgtrickle.pgt_stream_tables(pgt_id) ON DELETE CASCADE,
+    database_instance_id     TEXT NOT NULL,
+    owner_oid                OID NOT NULL,
+    consumer_name            TEXT NOT NULL CHECK (consumer_name <> ''),
+    expected_contract_digest BYTEA NOT NULL,
+    output_contract_digest   BYTEA NOT NULL,
+    row_identity_version     SMALLINT NOT NULL CHECK (row_identity_version > 0),
+    state                    TEXT NOT NULL CHECK (state IN ('ACTIVE', 'PAUSED', 'RESNAPSHOT_REQUIRED', 'INVALIDATED', 'DROPPED')),
+    state_reason             TEXT,
+    acknowledged_batch_token BIGINT NOT NULL DEFAULT 0 CHECK (acknowledged_batch_token >= 0),
+    acknowledged_at         TIMESTAMPTZ,
+    created_at               TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at               TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (pgt_id, owner_oid, consumer_name)
+);
+
+CREATE TABLE IF NOT EXISTS pgtrickle.pgt_output_delta_resnapshots (
+    resnapshot_token UUID PRIMARY KEY,
+    consumer_id      UUID NOT NULL
+                     REFERENCES pgtrickle.pgt_output_delta_consumers(consumer_id) ON DELETE CASCADE,
+    pgt_id           BIGINT NOT NULL
+                     REFERENCES pgtrickle.pgt_stream_tables(pgt_id) ON DELETE CASCADE,
+    log_head         BIGINT NOT NULL,
+    database_instance_id  TEXT NOT NULL,
+    output_contract_digest BYTEA NOT NULL,
+    row_identity_version   SMALLINT NOT NULL CHECK (row_identity_version > 0),
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS pgt_output_delta_batches_pgt_token_idx
+    ON pgtrickle.pgt_output_delta_batches (pgt_id, batch_token);
+CREATE INDEX IF NOT EXISTS pgt_output_delta_consumers_pgt_state_idx
+    ON pgtrickle.pgt_output_delta_consumers (pgt_id, state, acknowledged_batch_token);
+
+CREATE OR REPLACE FUNCTION pgtrickle._reject_output_delta_contract_change()
+RETURNS trigger
+LANGUAGE plpgsql
+SET search_path = pgtrickle, pg_catalog, pg_temp
+AS $$
+BEGIN
+    IF (OLD.pgt_relid, OLD.defining_query, OLD.refresh_mode, OLD.orchestration_mode,
+        OLD.row_identity_version) IS DISTINCT FROM
+       (NEW.pgt_relid, NEW.defining_query, NEW.refresh_mode, NEW.orchestration_mode,
+        NEW.row_identity_version)
+       AND EXISTS (
+           SELECT 1 FROM pgtrickle.pgt_output_delta_consumers
+           WHERE pgt_id = OLD.pgt_id AND state <> 'DROPPED'
+             AND NOT (
+                 state IN ('RESNAPSHOT_REQUIRED', 'INVALIDATED')
+                 AND (OLD.pgt_relid, OLD.defining_query, OLD.refresh_mode, OLD.orchestration_mode)
+                     IS NOT DISTINCT FROM
+                     (NEW.pgt_relid, NEW.defining_query, NEW.refresh_mode, NEW.orchestration_mode)
+             )
+       ) THEN
+        RAISE EXCEPTION 'PGT_EXT_CONSUMER_BLOCKED: active output-delta consumers require an explicit resnapshot'
+            USING ERRCODE = '55006';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS pgt_stream_tables_output_delta_contract_guard
+    ON pgtrickle.pgt_stream_tables;
+CREATE TRIGGER pgt_stream_tables_output_delta_contract_guard
+    BEFORE UPDATE OF pgt_relid, defining_query, refresh_mode, orchestration_mode,
+        row_identity_version ON pgtrickle.pgt_stream_tables
+    FOR EACH ROW EXECUTE FUNCTION pgtrickle._reject_output_delta_contract_change();
+
+SELECT pg_catalog.pg_extension_config_dump('pgtrickle.pgt_output_delta_logs', '');
+SELECT pg_catalog.pg_extension_config_dump('pgtrickle.pgt_output_delta_batches', '');
+SELECT pg_catalog.pg_extension_config_dump('pgtrickle.pgt_output_delta_consumers', '');
+
+
+"#,
+    name = "pg_trickle_catalog",
+    bootstrap,
+);
+
+// ── v0.87.17: V2 recreation preflight and consumer inventory ─────────
+
+extension_sql!(
+    r#"
+-- The V2 upgrade is intentionally a rebuild, not an in-place conversion.
+-- These private catalogs make the destructive window explicit and auditable.
+CREATE TABLE IF NOT EXISTS pgtrickle.pgt_row_identity_v2_inventory (
+    inventory_id BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (inventory_id),
+    recorded_by TEXT NOT NULL,
+    recorded_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    notes TEXT,
+    acknowledged BOOLEAN NOT NULL DEFAULT FALSE,
+    acknowledged_by TEXT,
+    acknowledged_at TIMESTAMPTZ,
+    CHECK (NOT acknowledged OR acknowledged_at IS NOT NULL)
+);
+
+CREATE TABLE IF NOT EXISTS pgtrickle.pgt_row_identity_v2_consumers (
+    consumer_id BIGSERIAL PRIMARY KEY,
+    consumer_name TEXT NOT NULL,
+    consumer_owner TEXT NOT NULL,
+    affected_stream_tables TEXT[] NOT NULL
+        CHECK (cardinality(affected_stream_tables) > 0),
+    consumes_row_id BOOLEAN NOT NULL DEFAULT FALSE,
+    consumes_storage_layout BOOLEAN NOT NULL DEFAULT FALSE,
+    required_schema_change TEXT NOT NULL,
+    resnapshot_status TEXT NOT NULL DEFAULT 'PENDING'
+        CHECK (resnapshot_status IN ('PENDING', 'IN_PROGRESS', 'COMPLETE', 'SKIPPED')),
+    acknowledged BOOLEAN NOT NULL DEFAULT FALSE,
+    acknowledged_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CHECK (NOT acknowledged OR acknowledged_at IS NOT NULL)
+);
+
+SELECT pg_catalog.pg_extension_config_dump(
+    'pgtrickle.pgt_row_identity_v2_inventory', ''
+);
+SELECT pg_catalog.pg_extension_config_dump(
+    'pgtrickle.pgt_row_identity_v2_consumers', ''
+);
+
+CREATE OR REPLACE FUNCTION pgtrickle._row_identity_v2_admin()
+RETURNS BOOLEAN
+LANGUAGE sql
+STABLE
+SET search_path TO pgtrickle, pg_catalog, pg_temp
+AS $row_identity_v2_admin$
+    SELECT EXISTS (
+        SELECT 1
+        FROM pg_roles r
+        JOIN pg_extension e ON e.extname = 'pg_trickle'
+        WHERE r.rolname = current_user
+          AND (r.rolsuper OR r.oid = e.extowner)
+    )
+$row_identity_v2_admin$;
+
+CREATE OR REPLACE FUNCTION pgtrickle.row_identity_v2_record_inventory(
+    p_notes TEXT DEFAULT NULL
+)
+RETURNS VOID
+LANGUAGE plpgsql
+SET search_path TO pgtrickle, pg_catalog, pg_temp
+AS $row_identity_v2_record_inventory$
+BEGIN
+    IF NOT pgtrickle._row_identity_v2_admin() THEN
+        RAISE EXCEPTION 'pg_trickle: row-identity inventory requires the extension owner or superuser'
+            USING ERRCODE = '42501';
+    END IF;
+
+    INSERT INTO pgtrickle.pgt_row_identity_v2_inventory (
+        inventory_id, recorded_by, recorded_at, notes, acknowledged,
+        acknowledged_by, acknowledged_at
+    )
+    VALUES (TRUE, current_user, now(), p_notes, FALSE, NULL, NULL)
+    ON CONFLICT (inventory_id) DO UPDATE
+       SET recorded_by = EXCLUDED.recorded_by,
+           recorded_at = EXCLUDED.recorded_at,
+           notes = EXCLUDED.notes,
+           acknowledged = FALSE,
+           acknowledged_by = NULL,
+           acknowledged_at = NULL;
+END
+$row_identity_v2_record_inventory$;
+
+CREATE OR REPLACE FUNCTION pgtrickle.row_identity_v2_register_consumer(
+    p_consumer_name TEXT,
+    p_consumer_owner TEXT,
+    p_affected_stream_tables TEXT[],
+    p_consumes_row_id BOOLEAN,
+    p_consumes_storage_layout BOOLEAN,
+    p_required_schema_change TEXT
+)
+RETURNS BIGINT
+LANGUAGE plpgsql
+SET search_path TO pgtrickle, pg_catalog, pg_temp
+AS $row_identity_v2_register_consumer$
+DECLARE
+    v_consumer_id BIGINT;
+BEGIN
+    IF NOT pgtrickle._row_identity_v2_admin() THEN
+        RAISE EXCEPTION 'pg_trickle: row-identity inventory requires the extension owner or superuser'
+            USING ERRCODE = '42501';
+    END IF;
+    IF NULLIF(btrim(p_consumer_name), '') IS NULL
+       OR NULLIF(btrim(p_consumer_owner), '') IS NULL
+       OR NULLIF(btrim(p_required_schema_change), '') IS NULL
+       OR p_affected_stream_tables IS NULL
+       OR cardinality(p_affected_stream_tables) = 0
+       OR EXISTS (
+           SELECT 1
+           FROM unnest(p_affected_stream_tables) AS affected(name)
+           WHERE NULLIF(btrim(affected.name), '') IS NULL
+              OR position('.' IN btrim(affected.name)) = 0
+              OR to_regclass(btrim(affected.name)) IS NULL
+       ) THEN
+        RAISE EXCEPTION 'pg_trickle: consumer inventory requires a name, owner, schema-qualified existing stream tables, and a schema-change plan'
+            USING ERRCODE = '22023';
+    END IF;
+
+    IF NOT EXISTS (
+        SELECT 1 FROM pgtrickle.pgt_row_identity_v2_inventory
+        WHERE inventory_id
+    ) THEN
+        RAISE EXCEPTION 'pg_trickle: record the external-consumer inventory before registering consumers'
+            USING ERRCODE = '55000';
+    END IF;
+
+    INSERT INTO pgtrickle.pgt_row_identity_v2_consumers (
+        consumer_name, consumer_owner, affected_stream_tables,
+        consumes_row_id, consumes_storage_layout, required_schema_change
+    )
+    VALUES (
+        btrim(p_consumer_name), btrim(p_consumer_owner), p_affected_stream_tables,
+        p_consumes_row_id, p_consumes_storage_layout, btrim(p_required_schema_change)
+    )
+    RETURNING consumer_id INTO v_consumer_id;
+
+    UPDATE pgtrickle.pgt_row_identity_v2_inventory
+       SET acknowledged = FALSE,
+           acknowledged_by = NULL,
+           acknowledged_at = NULL;
+    RETURN v_consumer_id;
+END
+$row_identity_v2_register_consumer$;
+
+CREATE OR REPLACE FUNCTION pgtrickle.row_identity_v2_acknowledge_inventory()
+RETURNS VOID
+LANGUAGE plpgsql
+SET search_path TO pgtrickle, pg_catalog, pg_temp
+AS $row_identity_v2_acknowledge_inventory$
+BEGIN
+    IF NOT pgtrickle._row_identity_v2_admin() THEN
+        RAISE EXCEPTION 'pg_trickle: row-identity inventory requires the extension owner or superuser'
+            USING ERRCODE = '42501';
+    END IF;
+    UPDATE pgtrickle.pgt_row_identity_v2_inventory
+       SET acknowledged = TRUE,
+           acknowledged_by = current_user,
+           acknowledged_at = now();
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'pg_trickle: record the external-consumer inventory before acknowledging it'
+            USING ERRCODE = '55000';
+    END IF;
+END
+$row_identity_v2_acknowledge_inventory$;
+
+CREATE OR REPLACE FUNCTION pgtrickle.row_identity_v2_acknowledge_consumer(
+    p_consumer_id BIGINT,
+    p_resnapshot_status TEXT DEFAULT 'PENDING'
+)
+RETURNS VOID
+LANGUAGE plpgsql
+SET search_path TO pgtrickle, pg_catalog, pg_temp
+AS $row_identity_v2_acknowledge_consumer$
+DECLARE
+    v_status TEXT := upper(btrim(p_resnapshot_status));
+BEGIN
+    IF NOT pgtrickle._row_identity_v2_admin() THEN
+        RAISE EXCEPTION 'pg_trickle: row-identity inventory requires the extension owner or superuser'
+            USING ERRCODE = '42501';
+    END IF;
+    IF v_status NOT IN ('PENDING', 'IN_PROGRESS', 'COMPLETE', 'SKIPPED') THEN
+        RAISE EXCEPTION 'pg_trickle: invalid resnapshot status %', p_resnapshot_status
+            USING ERRCODE = '22023';
+    END IF;
+    UPDATE pgtrickle.pgt_row_identity_v2_consumers
+       SET resnapshot_status = v_status,
+           acknowledged = TRUE,
+           acknowledged_at = now(),
+           updated_at = now()
+     WHERE consumer_id = p_consumer_id;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'pg_trickle: external consumer % is not in the inventory', p_consumer_id
+            USING ERRCODE = '22023';
+    END IF;
+END
+$row_identity_v2_acknowledge_consumer$;
+
+CREATE OR REPLACE FUNCTION pgtrickle.row_identity_v2_consumer_inventory()
+RETURNS TABLE (
+    consumer_id BIGINT,
+    consumer_name TEXT,
+    consumer_owner TEXT,
+    affected_stream_tables TEXT[],
+    consumes_row_id BOOLEAN,
+    consumes_storage_layout BOOLEAN,
+    required_schema_change TEXT,
+    resnapshot_status TEXT,
+    acknowledged BOOLEAN,
+    acknowledged_at TIMESTAMPTZ
+)
+LANGUAGE plpgsql
+STABLE
+SET search_path TO pgtrickle, pg_catalog, pg_temp
+AS $row_identity_v2_consumer_inventory$
+BEGIN
+    IF NOT pgtrickle._row_identity_v2_admin() THEN
+        RAISE EXCEPTION 'pg_trickle: row-identity inventory requires the extension owner or superuser'
+            USING ERRCODE = '42501';
+    END IF;
+    RETURN QUERY
+    SELECT c.consumer_id, c.consumer_name, c.consumer_owner,
+           c.affected_stream_tables, c.consumes_row_id,
+           c.consumes_storage_layout, c.required_schema_change,
+           c.resnapshot_status, c.acknowledged, c.acknowledged_at
+      FROM pgtrickle.pgt_row_identity_v2_consumers c
+     ORDER BY c.consumer_id;
+END
+$row_identity_v2_consumer_inventory$;
+
+CREATE OR REPLACE FUNCTION pgtrickle.row_identity_v2_recreation_preflight()
+RETURNS JSONB
+LANGUAGE plpgsql
+SET search_path TO pgtrickle, pg_catalog, pg_temp
+AS $row_identity_v2_recreation_preflight$
+DECLARE
+    v_checks JSONB[] := ARRAY[]::JSONB[];
+    v_check JSONB;
+    v_check_list JSONB;
+    v_ok BOOLEAN;
+    v_server_major INTEGER;
+    v_bad_metadata BIGINT;
+    v_bad_storage BIGINT;
+    v_bad_buffers BIGINT;
+    v_bad_sources BIGINT;
+    v_bad_identity_types BIGINT;
+    v_bad_indexes BIGINT;
+    v_bad_index_sizes BIGINT;
+    v_max_index_bytes BIGINT;
+    v_scheduler_paused BOOLEAN;
+    v_inventory_ack BOOLEAN;
+    v_unacknowledged_consumers BIGINT;
+    v_change_schema TEXT := COALESCE(
+        current_setting('pg_trickle.change_buffer_schema', TRUE),
+        'pgtrickle_changes'
+    );
+BEGIN
+    IF NOT pgtrickle._row_identity_v2_admin() THEN
+        RAISE EXCEPTION 'pg_trickle: recreation preflight requires the extension owner or superuser'
+            USING ERRCODE = '42501';
+    END IF;
+
+    v_server_major := COALESCE(
+        current_setting('server_version_num', TRUE), '0'
+    )::INTEGER / 10000;
+    SELECT count(*) INTO v_bad_metadata
+      FROM (
+          SELECT 1
+            FROM pgtrickle.pgt_stream_tables
+           WHERE row_identity_version IS DISTINCT FROM 3
+              OR row_probe_version IS DISTINCT FROM 1
+          UNION ALL
+          SELECT 1
+            FROM pgtrickle.pgt_change_buffers
+           WHERE row_identity_version IS DISTINCT FROM 3
+              OR row_probe_version IS DISTINCT FROM 1
+      ) invalid_metadata;
+
+    SELECT count(*) INTO v_bad_storage
+      FROM pgtrickle.pgt_stream_tables st
+      LEFT JOIN pg_attribute a
+        ON a.attrelid = st.pgt_relid
+       AND a.attname = '__pgt_row_id'
+       AND a.attnum > 0
+       AND NOT a.attisdropped
+     WHERE a.atttypid IS DISTINCT FROM 'bytea'::regtype
+        OR a.attnotnull IS DISTINCT FROM TRUE;
+
+    SELECT count(*) INTO v_bad_buffers
+      FROM pgtrickle.pgt_change_buffers cb
+      LEFT JOIN pg_attribute a
+        ON a.attrelid = to_regclass(format('%I.%I', v_change_schema, cb.buffer_key))
+       AND a.attname = '__pgt_row_id'
+       AND a.attnum > 0
+       AND NOT a.attisdropped
+     WHERE a.atttypid IS DISTINCT FROM 'bytea'::regtype
+        OR a.attnotnull IS DISTINCT FROM TRUE;
+
+    SELECT count(*) INTO v_bad_sources
+      FROM pgtrickle.pgt_dependencies d
+      LEFT JOIN pg_class c ON c.oid = d.source_relid
+     WHERE d.source_type IN ('TABLE', 'STREAM_TABLE', 'VIEW', 'MATVIEW', 'FOREIGN_TABLE')
+       AND c.oid IS NULL;
+
+    SELECT count(*) INTO v_bad_identity_types
+      FROM pgtrickle.pgt_dependencies d
+      CROSS JOIN LATERAL unnest(COALESCE(d.columns_used, ARRAY[]::TEXT[])) AS u(column_name)
+      LEFT JOIN pg_attribute a
+        ON a.attrelid = d.source_relid
+       AND a.attname = u.column_name
+       AND a.attnum > 0
+       AND NOT a.attisdropped
+      LEFT JOIN pg_type t ON t.oid = a.atttypid
+      LEFT JOIN pg_collation co ON co.oid = a.attcollation
+     WHERE d.source_type IN ('TABLE', 'STREAM_TABLE', 'VIEW', 'MATVIEW', 'FOREIGN_TABLE')
+       AND (
+           a.attrelid IS NULL
+           OR (
+               t.typtype <> 'e'
+               AND t.typname <> ALL (ARRAY[
+                   'bool', 'int2', 'int4', 'int8', 'oid', 'float4', 'float8',
+                   'numeric', 'text', 'varchar', 'bpchar', 'bytea', 'uuid',
+                   'date', 'time', 'timestamp', 'timestamptz', 'timetz',
+                   'interval', 'inet', 'cidr', 'macaddr', 'macaddr8',
+                   'bit', 'varbit'
+               ]::NAME[])
+           )
+               OR a.atttypmod IS NULL
+               OR (co.oid IS NOT NULL AND co.collisdeterministic IS DISTINCT FROM TRUE)
+       );
+
+    SELECT count(*) INTO v_bad_indexes
+      FROM pgtrickle.pgt_stream_tables st
+     WHERE NOT EXISTS (
+         SELECT 1
+           FROM pg_index i
+           JOIN pg_class ic ON ic.oid = i.indexrelid
+           JOIN pg_am am ON am.oid = ic.relam
+          WHERE i.indrelid = st.pgt_relid
+            AND i.indisvalid
+            AND i.indisready
+            AND am.amname = 'btree'
+            AND NOT (0 = ANY (i.indclass))
+            AND pg_get_indexdef(i.indexrelid) LIKE '%__pgt_row_id%'
+     );
+    SELECT count(*) INTO v_bad_index_sizes
+      FROM pgtrickle.pgt_stream_tables st
+      JOIN pg_index i ON i.indrelid = st.pgt_relid
+     WHERE i.indisvalid
+       AND pg_get_indexdef(i.indexrelid) LIKE '%__pgt_row_id%'
+       AND pg_relation_size(i.indexrelid) IS NULL;
+    SELECT COALESCE(max(pg_relation_size(i.indexrelid)), 0)
+      INTO v_max_index_bytes
+      FROM pgtrickle.pgt_stream_tables st
+      JOIN pg_index i ON i.indrelid = st.pgt_relid
+     WHERE i.indisvalid
+       AND pg_get_indexdef(i.indexrelid) LIKE '%__pgt_row_id%';
+
+    v_scheduler_paused := COALESCE(
+        current_setting('pg_trickle.enabled', TRUE), 'on'
+    )::BOOLEAN = FALSE;
+    SELECT COALESCE(bool_and(acknowledged), FALSE)
+      INTO v_inventory_ack
+      FROM pgtrickle.pgt_row_identity_v2_inventory
+     WHERE inventory_id;
+    SELECT count(*) INTO v_unacknowledged_consumers
+      FROM pgtrickle.pgt_row_identity_v2_consumers
+     WHERE NOT acknowledged;
+
+    v_check := jsonb_build_object(
+        'check', 'SUPPORTED_POSTGRESQL_MAJOR', 'ok', v_server_major = 18,
+        'detail', format('server major=%s; V2 registry supports major 18', v_server_major)
+    );
+    v_checks := array_append(v_checks, v_check);
+    v_checks := array_append(v_checks, jsonb_build_object(
+        'check', 'IDENTITY_METADATA', 'ok', v_bad_metadata = 0,
+        'detail', format('%s stream-table/buffer rows have stale or unknown version markers', v_bad_metadata)
+    ));
+    v_checks := array_append(v_checks, jsonb_build_object(
+        'check', 'STORAGE_SCHEMA', 'ok', v_bad_storage = 0,
+        'detail', format('%s stream tables lack __pgt_row_id BYTEA NOT NULL', v_bad_storage)
+    ));
+    v_checks := array_append(v_checks, jsonb_build_object(
+        'check', 'BUFFER_SCHEMA', 'ok', v_bad_buffers = 0,
+        'detail', format('%s change buffers lack __pgt_row_id BYTEA NOT NULL', v_bad_buffers)
+    ));
+    v_checks := array_append(v_checks, jsonb_build_object(
+        'check', 'IDENTITY_TYPES_AND_COLLATIONS', 'ok', v_bad_identity_types = 0,
+        'detail', format('%s source identity columns are missing, unsupported, or nondeterministically collated', v_bad_identity_types)
+    ));
+    v_checks := array_append(v_checks, jsonb_build_object(
+        'check', 'SOURCE_KEY_ELIGIBILITY', 'ok', v_bad_sources = 0,
+        'detail', format('%s source relations are missing; keyless sources remain valid and use exact full-ID matching', v_bad_sources)
+    ));
+    v_checks := array_append(v_checks, jsonb_build_object(
+        'check', 'ROW_ID_INDEXES', 'ok', v_bad_indexes = 0 AND v_bad_index_sizes = 0,
+        'detail', format('%s stream tables lack a valid row-id index; %s index sizes could not be read; largest=%s bytes', v_bad_indexes, v_bad_index_sizes, v_max_index_bytes)
+    ));
+    v_checks := array_append(v_checks, jsonb_build_object(
+        'check', 'SCHEDULER_PAUSED', 'ok', v_scheduler_paused,
+        'detail', CASE WHEN v_scheduler_paused
+            THEN 'pg_trickle.enabled is off for this database'
+            ELSE 'set pg_trickle.enabled=off and reload configuration before teardown'
+        END
+    ));
+    v_checks := array_append(v_checks, jsonb_build_object(
+        'check', 'EXTERNAL_CONSUMER_INVENTORY',
+        'ok', v_inventory_ack AND v_unacknowledged_consumers = 0,
+        'detail', format('inventory acknowledged=%s; unacknowledged consumers=%s', v_inventory_ack, v_unacknowledged_consumers)
+    ));
+
+    SELECT jsonb_agg(value) INTO v_check_list FROM unnest(v_checks) AS checks(value);
+    SELECT COALESCE(bool_and((value ->> 'ok')::BOOLEAN), TRUE)
+      INTO v_ok
+      FROM unnest(v_checks) AS checks(value);
+
+    RETURN jsonb_build_object(
+        'ok', v_ok,
+        'release', '0.87.17',
+        'checks', COALESCE(v_check_list, '[]'::JSONB),
+        'instructions', jsonb_build_array(
+            'Pause the scheduler and wait for in-flight refreshes to drain.',
+            'Export stream-table definitions and metadata before dropping anything.',
+            'Drop V1 stream tables in reverse dependency order and clean only unused V1 buffers.',
+            'Install and restart the v0.87.17 binary, then run ALTER EXTENSION pg_trickle UPDATE.',
+            'Recreate stream tables in dependency order and perform fresh initial refreshes.',
+            'Update every external consumer to BYTEA, resnapshot after refresh, and acknowledge completion.',
+            'Writes made during the recreation window are not replayed; resume writes only after resnapshot.'
+        )
+    );
+END
+$row_identity_v2_recreation_preflight$;
+
+REVOKE ALL ON TABLE pgtrickle.pgt_row_identity_v2_inventory FROM PUBLIC;
+REVOKE ALL ON TABLE pgtrickle.pgt_row_identity_v2_consumers FROM PUBLIC;
+REVOKE ALL ON FUNCTION pgtrickle._row_identity_v2_admin() FROM PUBLIC;
+REVOKE ALL ON FUNCTION pgtrickle.row_identity_v2_record_inventory(TEXT) FROM PUBLIC;
+REVOKE ALL ON FUNCTION pgtrickle.row_identity_v2_register_consumer(TEXT, TEXT, TEXT[], BOOLEAN, BOOLEAN, TEXT) FROM PUBLIC;
+REVOKE ALL ON FUNCTION pgtrickle.row_identity_v2_acknowledge_inventory() FROM PUBLIC;
+REVOKE ALL ON FUNCTION pgtrickle.row_identity_v2_acknowledge_consumer(BIGINT, TEXT) FROM PUBLIC;
+REVOKE ALL ON FUNCTION pgtrickle.row_identity_v2_consumer_inventory() FROM PUBLIC;
+REVOKE ALL ON FUNCTION pgtrickle.row_identity_v2_recreation_preflight() FROM PUBLIC;
+"#,
+    name = "pg_trickle_row_identity_v2_recreation",
+);
+
+// ── Status overview view (requires parse_duration_seconds) ────────────
+
+extension_sql!(
+    r#"
+-- Status overview view (ERR-1d: last_error_message and last_error_at are
+-- included via st.* from pgt_stream_tables)
+CREATE OR REPLACE VIEW pgtrickle.stream_tables_info AS
+SELECT st.*,
+       now() - st.last_refresh_at AS staleness,
+       CASE WHEN st.schedule IS NOT NULL
+                 AND st.schedule !~ '[\s@]'
+            THEN EXTRACT(EPOCH FROM (now() - st.last_refresh_at)) >
+                 pgtrickle.parse_duration_seconds(st.schedule)
+            ELSE NULL::boolean
+       END AS stale,
+       CASE WHEN st.topk_limit IS NOT NULL THEN TRUE ELSE FALSE END AS is_topk
+FROM pgtrickle.pgt_stream_tables st;
+"#,
+    name = "pg_trickle_info_view",
+    requires = [parse_duration_seconds],
+);
+
+// ── v0.87.12: publication API security attributes ─────────────────────
+
+extension_sql!(
+    r#"
+ALTER FUNCTION pgtrickle.stream_table_to_publication(text)
+    SECURITY DEFINER; -- nosemgrep: sql.security-definer.present — search_path is pinned immediately below.
+ALTER FUNCTION pgtrickle.stream_table_to_publication(text)
+    SET search_path = pgtrickle, pg_catalog, pg_temp;
+ALTER FUNCTION pgtrickle.drop_stream_table_publication(text)
+    SECURITY DEFINER; -- nosemgrep: sql.security-definer.present — search_path is pinned immediately below.
+ALTER FUNCTION pgtrickle.drop_stream_table_publication(text)
+    SET search_path = pgtrickle, pg_catalog, pg_temp;
+"#,
+    name = "pg_trickle_publication_security",
+    requires = ["pg_trickle_acl_policy"],
+);
+
+// ── Citus observability view ───────────────────────────────────────────
+
+extension_sql!(
+    r#"
+-- CIT-4: Per-worker replication slot tracking view.
+-- Safe to query on non-Citus deployments (pgt_change_tracking and
+-- pgt_worker_slots are local catalog tables; no pg_dist_node reference).
+-- Returns one row per (stream_table, source, worker) combination.
+CREATE OR REPLACE VIEW pgtrickle.citus_status AS
+SELECT
+    st.pgt_id,
+    st.pgt_schema,
+    st.pgt_name,
+    ct.source_relid,
+    ct.source_stable_name,
+    ct.slot_name           AS coordinator_slot,
+    ct.source_placement,
+    ct.frontier_per_node,
+    ws.worker_name,
+    ws.worker_port,
+    ws.slot_name           AS worker_slot,
+    ws.last_frontier       AS worker_frontier
+FROM pgtrickle.pgt_change_tracking ct
+JOIN pgtrickle.pgt_stream_tables   st ON st.pgt_id = ANY(ct.tracked_by_pgt_ids)
+LEFT JOIN pgtrickle.pgt_worker_slots ws
+       ON ws.pgt_id       = st.pgt_id
+      AND ws.source_relid = ct.source_relid
+WHERE ct.source_placement = 'distributed';
+"#,
+    name = "pg_trickle_citus_status_view",
+    requires = ["pg_trickle_catalog"],
+);
+
+// ── DDL event triggers (Phase 7) ──────────────────────────────────────
+
+extension_sql!(
+    r#"
+-- Create event trigger functions with correct RETURNS event_trigger type.
+-- pgrx's #[pg_extern] generates RETURNS void, which PostgreSQL rejects for
+-- event triggers. We create them manually here with the correct return type.
+CREATE FUNCTION pgtrickle."_on_ddl_end"()
+    RETURNS event_trigger
+    SECURITY DEFINER -- nosemgrep: sql.security-definer.present — event trigger runs with pinned pgtrickle catalog search_path below.
+    SET search_path TO pgtrickle, pg_catalog, pg_temp
+    LANGUAGE c
+    AS 'MODULE_PATHNAME', 'pg_trickle_on_ddl_end_wrapper';
+
+CREATE FUNCTION pgtrickle."_on_sql_drop"()
+    RETURNS event_trigger
+    SECURITY DEFINER -- nosemgrep: sql.security-definer.present — event trigger runs with pinned pgtrickle catalog search_path below.
+    SET search_path TO pgtrickle, pg_catalog, pg_temp
+    LANGUAGE c
+    AS 'MODULE_PATHNAME', 'pg_trickle_on_sql_drop_wrapper';
+
+-- Event trigger: track ALTER TABLE on upstream sources
+CREATE EVENT TRIGGER pg_trickle_ddl_tracker
+    ON ddl_command_end
+    EXECUTE FUNCTION pgtrickle._on_ddl_end();
+
+-- Event trigger: track DROP TABLE on upstream sources / ST storage tables
+CREATE EVENT TRIGGER pg_trickle_drop_tracker
+    ON sql_drop
+    EXECUTE FUNCTION pgtrickle._on_sql_drop();
+"#,
+    name = "pg_trickle_event_triggers",
+);
+
+// ── Monitoring views (Phase 9) ────────────────────────────────────────
+
+extension_sql!(
+    r#"
+-- Convenience view: pg_stat_stream_tables
+-- Combines catalog metadata with aggregate refresh statistics.
+CREATE OR REPLACE VIEW pgtrickle.pg_stat_stream_tables AS
+SELECT
+    st.pgt_id,
+    st.pgt_schema,
+    st.pgt_name,
+    st.status,
+    st.refresh_mode,
+    st.is_populated,
+    st.data_timestamp,
+    st.schedule,
+    now() - st.last_refresh_at AS staleness,
+    CASE WHEN st.schedule IS NOT NULL AND st.last_refresh_at IS NOT NULL
+              AND st.schedule !~ '[\s@]'
+         THEN EXTRACT(EPOCH FROM (now() - st.last_refresh_at)) >
+              pgtrickle.parse_duration_seconds(st.schedule)
+         ELSE NULL::boolean
+    END AS stale,
+    st.consecutive_errors,
+    st.needs_reinit,
+    st.last_refresh_at,
+    COALESCE(stats.total_refreshes, 0) AS total_refreshes,
+    COALESCE(stats.successful_refreshes, 0) AS successful_refreshes,
+    COALESCE(stats.failed_refreshes, 0) AS failed_refreshes,
+    COALESCE(stats.total_rows_inserted, 0) AS total_rows_inserted,
+    COALESCE(stats.total_rows_updated, 0) AS total_rows_updated,
+    COALESCE(stats.total_rows_deleted, 0) AS total_rows_deleted,
+    stats.avg_duration_ms,
+    stats.last_action,
+    stats.last_status,
+    (SELECT array_agg(DISTINCT d.cdc_mode ORDER BY d.cdc_mode)
+     FROM pgtrickle.pgt_dependencies d
+     WHERE d.pgt_id = st.pgt_id AND d.source_type = 'TABLE') AS cdc_modes,
+    st.scc_id,
+    st.last_fixpoint_iterations,
+    st.refresh_tier
+FROM pgtrickle.pgt_stream_tables st
+LEFT JOIN LATERAL (
+    SELECT
+        count(*)::bigint AS total_refreshes,
+        count(*) FILTER (WHERE h.status = 'COMPLETED')::bigint AS successful_refreshes,
+        count(*) FILTER (WHERE h.status = 'FAILED')::bigint AS failed_refreshes,
+        COALESCE(sum(h.rows_inserted), 0)::bigint AS total_rows_inserted,
+        COALESCE(sum(h.rows_updated), 0)::bigint AS total_rows_updated,
+        COALESCE(sum(h.rows_deleted), 0)::bigint AS total_rows_deleted,
+        CASE WHEN count(*) FILTER (WHERE h.end_time IS NOT NULL) > 0
+             THEN avg(EXTRACT(EPOCH FROM (h.end_time - h.start_time)) * 1000)
+                  FILTER (WHERE h.end_time IS NOT NULL)
+             ELSE NULL
+        END::float8 AS avg_duration_ms,
+        (SELECT h2.action FROM pgtrickle.pgt_refresh_history h2
+         WHERE h2.pgt_id = st.pgt_id ORDER BY h2.refresh_id DESC LIMIT 1) AS last_action,
+        (SELECT h2.status FROM pgtrickle.pgt_refresh_history h2
+         WHERE h2.pgt_id = st.pgt_id ORDER BY h2.refresh_id DESC LIMIT 1) AS last_status,
+        (SELECT h2.initiated_by FROM pgtrickle.pgt_refresh_history h2
+         WHERE h2.pgt_id = st.pgt_id ORDER BY h2.refresh_id DESC LIMIT 1) AS last_initiated_by,
+        (SELECT h2.freshness_deadline FROM pgtrickle.pgt_refresh_history h2
+         WHERE h2.pgt_id = st.pgt_id ORDER BY h2.refresh_id DESC LIMIT 1) AS freshness_deadline
+    FROM pgtrickle.pgt_refresh_history h
+    WHERE h.pgt_id = st.pgt_id
+) stats ON true;
+
+-- v0.86.0: Bounded per-stream-table diagnostic statistics.
+-- All cumulative values come from summary tables; scraping this view never
+-- scans refresh history.
+CREATE OR REPLACE VIEW pgtrickle.pg_stat_pgtrickle AS
+SELECT
+    st.pgt_id,
+    st.pgt_schema AS schema_name,
+    st.pgt_name AS table_name,
+    COALESCE(s.total_refreshes, 0)::bigint AS total_refreshes,
+    COALESCE(s.total_full_refreshes, 0)::bigint AS total_full_refreshes,
+    COALESCE(s.total_diff_refreshes, 0)::bigint AS total_diff_refreshes,
+    COALESCE(s.total_delta_rows_processed, 0)::bigint AS total_delta_rows_processed,
+    CASE WHEN COALESCE(s.total_refreshes, 0) > 0
+         THEN s.total_duration_ms::double precision / s.total_refreshes
+    END AS avg_refresh_duration_ms,
+    c.p95_ms AS p95_refresh_duration_ms,
+    c.p99_ms AS p99_refresh_duration_ms,
+    s.last_refresh_at,
+    CASE WHEN COALESCE(s.last_refresh_at, st.created_at) IS NOT NULL
+         THEN EXTRACT(EPOCH FROM (now() - COALESCE(s.last_refresh_at, st.created_at))) * 1000
+    END AS current_lag_ms,
+    COALESCE(st.requested_refresh_mode, st.refresh_mode) AS requested_refresh_mode,
+    st.target_freshness_mode,
+    st.freshness_deadline_ms AS target_freshness_ms,
+    s.last_full_reason,
+    s.last_full_reason_detail,
+    st.last_error_message AS last_error,
+    st.last_error_at,
+    s.stats_reset_at,
+    f.p95_freshness_ms,
+    COALESCE(f.sla_status,
+        CASE WHEN st.target_freshness_mode = 'INTERVAL'
+             THEN 'INSUFFICIENT_DATA' ELSE 'NOT_APPLICABLE' END) AS sla_status
+FROM pgtrickle.pgt_stream_tables st
+LEFT JOIN pgtrickle.pgt_refresh_summary s ON s.pgt_id = st.pgt_id
+LEFT JOIN pgtrickle.pgt_cost_model_summary c ON c.pgt_id = st.pgt_id
+LEFT JOIN pgtrickle.pgt_freshness_controller_state f ON f.pgt_id = st.pgt_id;
+
+-- v0.98.0: expose only progress that the refresh history actually records.
+-- No live heartbeat is emitted, so last_progress_at is NULL while RUNNING.
+CREATE OR REPLACE VIEW pgtrickle.pg_stat_progress_pgtrickle AS
+SELECT
+    h.refresh_id AS operation_id,
+    st.pgt_schema,
+    st.pgt_name,
+    CASE
+        WHEN h.initiated_by = 'INITIAL' THEN 'INITIAL_POPULATION'
+        WHEN h.action = 'REINITIALIZE' THEN 'REPAIR'
+        WHEN h.action = 'FULL' THEN 'FULL_REFRESH'
+        ELSE 'DIFFERENTIAL_REFRESH'
+    END AS phase,
+    (COALESCE(h.rows_inserted, 0) + COALESCE(h.rows_updated, 0) +
+     COALESCE(h.rows_deleted, 0))::bigint AS rows_processed,
+    GREATEST(c.reltuples, 0)::bigint AS estimated_rows,
+    EXTRACT(EPOCH FROM (clock_timestamp() - h.start_time))::double precision AS elapsed_seconds,
+    h.start_time AS started_at,
+    NULL::timestamptz AS last_progress_at,
+    h.status
+FROM pgtrickle.pgt_refresh_history h
+JOIN pgtrickle.pgt_stream_tables st ON st.pgt_id = h.pgt_id
+JOIN pg_catalog.pg_class c ON c.oid = st.pgt_relid
+WHERE h.status = 'RUNNING';
+
+-- Per-source CDC status view (G5): exposes cdc_mode, slot names, and
+-- transition timestamps for every TABLE dependency of a stream table.
+CREATE OR REPLACE VIEW pgtrickle.pgt_cdc_status AS
+SELECT
+    st.pgt_schema,
+    st.pgt_name,
+    d.source_relid,
+    c.relname        AS source_name,
+    n.nspname        AS source_schema,
+    d.cdc_mode,
+    d.slot_name,
+    d.decoder_confirmed_lsn,
+    d.transition_started_at
+FROM pgtrickle.pgt_dependencies d
+JOIN pgtrickle.pgt_stream_tables st ON st.pgt_id = d.pgt_id
+JOIN pg_class c ON c.oid = d.source_relid
+JOIN pg_namespace n ON n.oid = c.relnamespace
+WHERE d.source_type = 'TABLE';
+"#,
+    name = "pg_trickle_monitoring_views",
+    requires = [parse_duration_seconds],
+);
+
+// ── Quick health overview (ERG-E) ─────────────────────────────────────
+
+extension_sql!(
+    r#"
+-- ERG-E: One-row health summary for dashboards and alerting.
+CREATE OR REPLACE VIEW pgtrickle.quick_health AS
+WITH broken_immediate AS (
+    SELECT count(DISTINCT st.pgt_id)::bigint AS table_count
+    FROM pgtrickle.pgt_stream_tables st
+    JOIN pgtrickle.pgt_dependencies dep ON dep.pgt_id = st.pgt_id
+    WHERE st.refresh_mode = 'IMMEDIATE'
+      AND dep.source_type IN ('TABLE', 'STREAM_TABLE')
+      AND 8 <> (
+          SELECT count(*)
+          FROM pg_catalog.pg_trigger t
+          WHERE t.tgrelid = dep.source_relid
+            AND t.tgname ~ (
+                '^pgt_ivm_(before_(insert|update|delete|trunc)|after_(ins|upd|del|trunc))_'
+                || st.pgt_id::text || '$'
+            )
+            AND NOT t.tgisinternal
+            AND t.tgenabled IN ('O', 'A')
+      )
+)
+SELECT
+    (SELECT count(*) FROM pgtrickle.pgt_stream_tables)::bigint
+        AS total_stream_tables,
+    (SELECT count(*) FROM pgtrickle.pgt_stream_tables
+     WHERE status = 'ERROR' OR consecutive_errors > 0)::bigint
+        AS error_tables,
+    (SELECT count(*) FROM pgtrickle.pgt_stream_tables
+     WHERE schedule IS NOT NULL
+       AND schedule !~ '[\s@]'
+       AND last_refresh_at IS NOT NULL
+       AND EXTRACT(EPOCH FROM (now() - last_refresh_at)) >
+           pgtrickle.parse_duration_seconds(schedule))::bigint
+        AS stale_tables,
+    (SELECT count(*) > 0 FROM pg_stat_activity
+     WHERE backend_type = 'pg_trickle scheduler')
+        AS scheduler_running,
+    CASE
+        WHEN (SELECT count(*) FROM pgtrickle.pgt_stream_tables) = 0 THEN 'EMPTY'
+        WHEN (SELECT count(*) FROM pgtrickle.pgt_stream_tables WHERE status = 'SUSPENDED') > 0 THEN 'CRITICAL'
+        WHEN broken_immediate.table_count > 0 THEN 'CRITICAL'
+        WHEN (SELECT count(*) FROM pgtrickle.pgt_stream_tables WHERE status = 'ERROR' OR consecutive_errors > 0) > 0 THEN 'WARNING'
+        WHEN (SELECT count(*) FROM pgtrickle.pgt_stream_tables
+              WHERE schedule IS NOT NULL
+                AND schedule !~ '[\s@]'
+                AND last_refresh_at IS NOT NULL
+                AND EXTRACT(EPOCH FROM (now() - last_refresh_at)) >
+                    pgtrickle.parse_duration_seconds(schedule)) > 0 THEN 'WARNING'
+        ELSE 'OK'
+    END AS status,
+    broken_immediate.table_count AS broken_immediate_tables
+FROM broken_immediate;
+"#,
+    name = "pg_trickle_quick_health_view",
+    requires = [parse_duration_seconds],
+);
+
+// ── v0.92.0: Rust-backed pause/resume compatibility entity ─────────────
+
+extension_sql!(
+    r#"
+-- pause_all(), resume_all(), and quiesce() are exported by the Rust API.
+"#,
+    name = "pg_trickle_pause_resume",
+    requires = [],
+);
+
+// ── OP-4: refresh_if_stale ────────────────────────────────────────────
+
+extension_sql!(
+    r#"
+CREATE OR REPLACE FUNCTION pgtrickle."refresh_if_stale"(
+    p_name   text,
+    p_max_age interval DEFAULT '5 minutes'::interval
+)
+RETURNS boolean
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_last_end timestamp with time zone;
+    v_refreshed boolean := false;
+BEGIN
+    SELECT MAX(end_time)
+      INTO v_last_end
+      FROM pgtrickle.pgt_refresh_history h
+      JOIN pgtrickle.pgt_stream_tables   s USING (pgt_id)
+     WHERE s.pgt_name = p_name
+       AND h.status = 'COMPLETED';
+
+    IF v_last_end IS NULL OR (now() - v_last_end) > p_max_age THEN
+        PERFORM pgtrickle.refresh_stream_table(p_name);
+        v_refreshed := true;
+    END IF;
+
+    RETURN v_refreshed;
+END;
+$$;
+
+COMMENT ON FUNCTION pgtrickle."refresh_if_stale"(text, interval) IS
+    'Refresh the named stream table only when the most recent completed '
+    'refresh is older than max_age.  Returns TRUE when a refresh was '
+    'triggered, FALSE when the table was fresh enough.';
+"#,
+    name = "pg_trickle_refresh_if_stale",
+    requires = [refresh_stream_table],
+);
+
+// ── OP-5: stream_table_definition ────────────────────────────────────
+
+extension_sql!(
+    r#"
+CREATE OR REPLACE FUNCTION pgtrickle."stream_table_definition"(
+    p_name text
+)
+RETURNS text
+LANGUAGE sql
+STABLE
+AS $$
+    SELECT pgtrickle.export_definition(p_name);
+$$;
+
+COMMENT ON FUNCTION pgtrickle."stream_table_definition"(text) IS
+    'Return the CREATE STREAM TABLE DDL for the named stream table. '
+    'Equivalent to pgtrickle.export_definition(name) — provided as a '
+    'more discoverable alias.';
+"#,
+    name = "pg_trickle_stream_table_definition",
+    requires = [export_definition],
+);
+
+// ── OPS-1: Canary / shadow-mode helpers ──────────────────────────────
+
+extension_sql!(
+    r#"
+CREATE OR REPLACE FUNCTION pgtrickle."canary_begin"(
+    p_name      text,
+    p_new_query text
+)
+RETURNS text
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_schema  text;
+    v_table   text;
+    v_canary  text;
+    v_dot     int;
+BEGIN
+    v_dot    := strpos(p_name, '.');
+    IF v_dot > 0 THEN
+        v_schema := substr(p_name, 1, v_dot - 1);
+        v_table  := substr(p_name, v_dot + 1);
+    ELSE
+        v_schema := current_schema();
+        v_table  := p_name;
+    END IF;
+
+    v_canary := '__pgt_canary_' || v_table;
+
+    -- Drop any stale canary table from a previous run.
+    BEGIN
+        PERFORM pgtrickle.drop_stream_table(v_schema || '.' || v_canary);
+    EXCEPTION WHEN OTHERS THEN
+        NULL;  -- ignore if it does not exist
+    END;
+
+    -- Create the canary stream table with the new query.
+    PERFORM pgtrickle.create_stream_table(
+        v_schema || '.' || v_canary,
+        p_new_query
+    );
+
+    RETURN format(
+        'Canary stream table %I.%I created. Run pgtrickle.canary_diff(%L) to compare.',
+        v_schema, v_canary, p_name
+    );
+END;
+$$;
+
+COMMENT ON FUNCTION pgtrickle."canary_begin"(text, text) IS
+    'Start a shadow/canary test for the named stream table. '
+    'Creates __pgt_canary_<name> with p_new_query and starts refreshing it. '
+    'Use canary_diff(name) to inspect differences and canary_promote(name) to '
+    'swap canary into production.';
+
+CREATE OR REPLACE FUNCTION pgtrickle."canary_diff"(
+    p_name text
+)
+RETURNS TABLE(
+    row_source text,
+    diff_row   text
+)
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_schema        text;
+    v_table         text;
+    v_canary        text;
+    v_dot           int;
+    v_live_oid      oid;
+    v_canary_oid    oid;
+    v_live_names    text[];
+    v_canary_names  text[];
+    v_live_columns  text;
+    v_canary_columns text;
+    v_sql           text;
+BEGIN
+    v_dot    := strpos(p_name, '.');
+    IF v_dot > 0 THEN
+        v_schema := substr(p_name, 1, v_dot - 1);
+        v_table  := substr(p_name, v_dot + 1);
+    ELSE
+        v_schema := current_schema();
+        v_table  := p_name;
+    END IF;
+
+    v_canary := '__pgt_canary_' || v_table;
+
+    v_live_oid := to_regclass(format('%I.%I', v_schema, v_table));
+    IF v_live_oid IS NULL THEN
+        RAISE EXCEPTION 'Live stream table %.% does not exist', v_schema, v_table
+            USING ERRCODE = '42P01';
+    END IF;
+
+    v_canary_oid := to_regclass(format('%I.%I', v_schema, v_canary));
+    IF v_canary_oid IS NULL THEN
+        RAISE EXCEPTION 'Canary stream table %.% does not exist', v_schema, v_canary
+            USING ERRCODE = '42P01';
+    END IF;
+
+    SELECT
+        array_agg(a.attname::text ORDER BY a.attnum),
+        string_agg(format('%I', a.attname), ', ' ORDER BY a.attnum)
+      INTO v_live_names, v_live_columns
+      FROM pg_attribute a
+     WHERE a.attrelid = v_live_oid
+       AND a.attnum > 0
+       AND NOT a.attisdropped
+       AND left(a.attname::text, 6) <> '__pgt_';
+
+    SELECT
+        array_agg(a.attname::text ORDER BY a.attnum),
+        string_agg(format('%I', a.attname), ', ' ORDER BY a.attnum)
+      INTO v_canary_names, v_canary_columns
+      FROM pg_attribute a
+     WHERE a.attrelid = v_canary_oid
+       AND a.attnum > 0
+       AND NOT a.attisdropped
+       AND left(a.attname::text, 6) <> '__pgt_';
+
+    IF v_live_names IS NULL OR v_live_names IS DISTINCT FROM v_canary_names THEN
+        RAISE EXCEPTION 'Live and canary stream tables have incompatible visible column names or order'
+            USING ERRCODE = '42804';
+    END IF;
+
+    -- Compare typed visible values as multisets. Apply the side label only after
+    -- EXCEPT ALL so it cannot prevent equal rows from cancelling.
+    v_sql := format(
+        'SELECT %L::text AS row_source, ROW(d.*)::text AS diff_row
+           FROM (SELECT %s FROM %I.%I EXCEPT ALL SELECT %s FROM %I.%I) AS d
+         UNION ALL
+         SELECT %L::text, ROW(d.*)::text
+           FROM (SELECT %s FROM %I.%I EXCEPT ALL SELECT %s FROM %I.%I) AS d',
+        'live_only', v_live_columns, v_schema, v_table,
+        v_canary_columns, v_schema, v_canary,
+        'canary_only', v_canary_columns, v_schema, v_canary,
+        v_live_columns, v_schema, v_table
+    );
+
+    BEGIN
+        RETURN QUERY EXECUTE v_sql;
+    EXCEPTION WHEN datatype_mismatch THEN
+        RAISE EXCEPTION 'Live and canary stream tables have incompatible visible column types'
+            USING ERRCODE = '42804';
+    END;
+END;
+$$;
+
+COMMENT ON FUNCTION pgtrickle."canary_diff"(text) IS
+    'Compare the live stream table with its canary counterpart. '
+    'Returns rows that exist in only one of the two tables. '
+    'An empty result set indicates the new query produces the same output.';
+
+CREATE OR REPLACE FUNCTION pgtrickle."canary_promote"(
+    p_name text
+)
+RETURNS text
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_schema    text;
+    v_table     text;
+    v_canary    text;
+    v_dot       int;
+    v_new_query text;
+BEGIN
+    v_dot    := strpos(p_name, '.');
+    IF v_dot > 0 THEN
+        v_schema := substr(p_name, 1, v_dot - 1);
+        v_table  := substr(p_name, v_dot + 1);
+    ELSE
+        v_schema := current_schema();
+        v_table  := p_name;
+    END IF;
+
+    v_canary := '__pgt_canary_' || v_table;
+
+    -- Read the defining query from the canary table.
+    SELECT defining_query
+      INTO v_new_query
+      FROM pgtrickle.pgt_stream_tables
+     WHERE pgt_schema = v_schema
+       AND pgt_name   = v_canary;
+
+    IF v_new_query IS NULL THEN
+        RAISE EXCEPTION 'No canary found for %. Run pgtrickle.canary_begin() first.', p_name;
+    END IF;
+
+    -- Promote: alter the live table to use the new query, then drop the canary.
+    PERFORM pgtrickle.alter_stream_table(v_schema || '.' || v_table, query => v_new_query);
+
+    BEGIN
+        PERFORM pgtrickle.drop_stream_table(v_schema || '.' || v_canary);
+    EXCEPTION WHEN OTHERS THEN
+        NULL;
+    END;
+
+    RETURN format(
+        'Canary promoted: %I.%I now uses the canary query. Canary table dropped.',
+        v_schema, v_table
+    );
+END;
+$$;
+
+COMMENT ON FUNCTION pgtrickle."canary_promote"(text) IS
+    'Promote the canary stream table to production. '
+    'Calls ALTER STREAM TABLE with the canary query, then drops the canary table. '
+    'Run pgtrickle.canary_diff(name) first to confirm the result set matches.';
+"#,
+    name = "pg_trickle_canary",
+    requires = [create_stream_table, drop_stream_table, alter_stream_table],
+);
+
+// ── v0.46.0: Outbox attachment catalog (pg_tide integration) ───────────
+
+extension_sql!(
+    r#"
+-- v0.46.0: Slim outbox attachment catalog.
+-- Maps stream tables to their pg_tide outbox names.
+-- The full outbox/inbox/relay stack lives in pg_tide (trickle-labs/pg-tide).
+CREATE TABLE IF NOT EXISTS pgtrickle.pgt_outbox_config (
+    stream_table_oid         OID         NOT NULL PRIMARY KEY,
+    stream_table_name        TEXT        NOT NULL,
+    tide_outbox_name         TEXT        NOT NULL,
+    -- v0.87.13: immutable pg_tide identity used to reject stale name reuse.
+    pg_tide_extension_oid    OID         NOT NULL,
+    pg_tide_version          TEXT        NOT NULL,
+    tide_outbox_created_at   TIMESTAMPTZ NOT NULL,
+    -- VA-4 (v0.48.0): optional vector column name for embedding outbox events.
+    embedding_vector_column  TEXT,
+    created_at               TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_pgt_outbox_config_name
+    ON pgtrickle.pgt_outbox_config (stream_table_name);
+
+COMMENT ON TABLE pgtrickle.pgt_outbox_config IS
+    'v0.46.0: Catalog of stream tables with a pg_tide outbox attached via attach_outbox(). '
+    'v0.48.0: embedding_vector_column set when attached via attach_embedding_outbox(). '
+    'v0.87.13: pg_tide extension OID, version, and outbox creation time are '
+    'stored to reject stale name reuse.';
+"#,
+    name = "pg_trickle_outbox_catalog",
+    requires = [],
+);
+
+// ── VH-2 (v0.48.0): Distance subscription catalog ─────────────────────────
+extension_sql!(
+    r#"
+-- VH-2 (v0.48.0): Distance-predicate subscription catalog.
+-- Stores per-(stream_table, channel) vector distance subscriptions.
+-- After each non-empty refresh the background worker evaluates the predicate
+-- and emits pg_notify(channel, payload) when matched_rows > 0.
+CREATE TABLE IF NOT EXISTS pgtrickle.pgt_distance_subscriptions (
+    stream_table    TEXT NOT NULL,
+    channel         TEXT NOT NULL,
+    vector_column   TEXT NOT NULL,
+    query_vector    TEXT NOT NULL,
+    op              TEXT NOT NULL
+        CHECK (op IN ('<->', '<=>', '<#>', '<+>', '<<->>', '<<%>>')),
+    threshold       DOUBLE PRECISION NOT NULL CHECK (threshold > 0),
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (stream_table, channel)
+);
+
+COMMENT ON TABLE pgtrickle.pgt_distance_subscriptions IS
+    'VH-2 (v0.48.0): Distance-predicate NOTIFY subscriptions per stream table. '
+    'Populated via pgtrickle.subscribe_distance() / pgtrickle.unsubscribe_distance().';
+"#,
+    name = "pg_trickle_distance_subscriptions_catalog",
+    requires = [],
+);
+
+// ── v0.87.13: pg_tide outbox boundary security attributes ──────────────
+
+extension_sql!(
+    r#"
+ALTER FUNCTION pgtrickle.attach_outbox(text, integer, integer)
+    SECURITY DEFINER; -- nosemgrep: sql.security-definer.present — external pg_tide calls run as the captured caller.
+ALTER FUNCTION pgtrickle.attach_outbox(text, integer, integer)
+    SET search_path = pgtrickle, pg_catalog, pg_temp;
+ALTER FUNCTION pgtrickle.detach_outbox(text, boolean)
+    SECURITY DEFINER; -- nosemgrep: sql.security-definer.present — private mapping cleanup is definer-only.
+ALTER FUNCTION pgtrickle.detach_outbox(text, boolean)
+    SET search_path = pgtrickle, pg_catalog, pg_temp;
+ALTER FUNCTION pgtrickle.attach_embedding_outbox(text, text, integer, integer)
+    SECURITY DEFINER; -- nosemgrep: sql.security-definer.present — external pg_tide calls run as the captured caller.
+ALTER FUNCTION pgtrickle.attach_embedding_outbox(text, text, integer, integer)
+    SET search_path = pgtrickle, pg_catalog, pg_temp;
+"#,
+    name = "pg_trickle_outbox_security",
+    requires = ["pg_trickle_acl_policy"],
+);
+
+// ── v0.84.0: explicit SQL ACL policy ─────────────────────────────────
+
+extension_sql!(
+    r#"
+-- Generated by scripts/check_sql_api_policy.py emit-acl-sql
+REVOKE EXECUTE ON ALL FUNCTIONS IN SCHEMA pgtrickle FROM PUBLIC;
+
+-- Explicit overload policy follows.
+
+-- admin_global
+REVOKE EXECUTE ON FUNCTION pgtrickle.advance_watermark(text, timestamp with time zone) FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION pgtrickle.clear_caches() FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION pgtrickle.convert_buffers_to_unlogged() FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION pgtrickle.create_refresh_group(text, text[], text) FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION pgtrickle.create_watermark_group(text, text[], double precision) FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION pgtrickle.drain(integer) FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION pgtrickle.drop_refresh_group(text) FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION pgtrickle.drop_watermark_group(text) FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION pgtrickle.gate_source(text) FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION pgtrickle.lifecycle_preflight() FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION pgtrickle.migrate() FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION pgtrickle.pause_all() FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION pgtrickle.pause_scheduler(text[]) FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION pgtrickle.quiesce(integer) FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION pgtrickle.recover_capture_instance() FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION pgtrickle.qualify_output_delta_recovery(uuid, text) FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION pgtrickle.rebuild_cdc_triggers() FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION pgtrickle.restore_stream_tables() FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION pgtrickle.resume_all() FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION pgtrickle.resume_scheduler(text[]) FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION pgtrickle.resume_after_drain() FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION pgtrickle.setup_self_monitoring() FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION pgtrickle.teardown_self_monitoring() FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION pgtrickle.ungate_source(text) FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION pgtrickle.stat_reset_all() FROM PUBLIC;
+
+-- arbitrary_sql
+REVOKE EXECUTE ON FUNCTION pgtrickle.write_and_refresh(text, text) FROM PUBLIC;
+
+-- internal
+REVOKE EXECUTE ON FUNCTION pgtrickle._signal_launcher_rescan() FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION pgtrickle.handle_vp_promoted(text) FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION pgtrickle.pgt_ivm_apply_delta(bigint, integer, boolean, boolean) FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION pgtrickle.pgt_ivm_apply_delta_enr(bigint, integer, boolean, boolean) FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION pgtrickle.pgt_ivm_handle_truncate(bigint) FROM PUBLIC;
+
+-- owner_lifecycle
+REVOKE EXECUTE ON FUNCTION pgtrickle.alter_stream_table(text, text, text, text, text, text, text, text, boolean, boolean, text, text, bigint, integer, text, integer, double precision, text, double precision, text) FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION pgtrickle.attach_embedding_outbox(text, text, integer, integer) FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION pgtrickle.attach_outbox(text, integer, integer) FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION pgtrickle.bulk_alter_stream_tables(text[], json) FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION pgtrickle.bulk_create(jsonb) FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION pgtrickle.bulk_drop_stream_tables(text[]) FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION pgtrickle.canary_begin(text, text) FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION pgtrickle.canary_diff(text) FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION pgtrickle.canary_promote(text) FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION pgtrickle.create_or_replace_stream_table(text, text, text, text, boolean, text, text, text, boolean, boolean, text, integer, double precision, text, boolean, text, text) FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION pgtrickle.create_stream_table(text, text, text, text, boolean, text, text, text, boolean, boolean, text, integer, double precision, text, boolean, text, integer, text, text) FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION pgtrickle.create_stream_table_batch(text, text, text, boolean, text, integer, double precision) FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION pgtrickle.create_stream_table_cost_optimized(text, text, text, boolean, text, integer, double precision) FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION pgtrickle.create_stream_table_fast_append_only(text, text, text, text, text, integer, double precision) FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION pgtrickle.create_stream_table_if_not_exists(text, text, text, text, boolean, text, text, text, boolean, boolean, text, integer, double precision, text, boolean, text, integer, text, text) FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION pgtrickle.create_stream_table_realtime(text, text, text, boolean, text, integer, double precision) FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION pgtrickle.detach_outbox(text, boolean) FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION pgtrickle.drop_snapshot(text) FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION pgtrickle.drop_stream_table(text, boolean) FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION pgtrickle.drop_stream_table_publication(text) FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION pgtrickle.embedding_stream_table(text, text, text, text, text, text, boolean) FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION pgtrickle.exec_stream_ddl(text) FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION pgtrickle.pause_stream_table(text) FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION pgtrickle.refresh_efficiency() FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION pgtrickle.refresh_groups() FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION pgtrickle.refresh_if_stale(text, interval) FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION pgtrickle.refresh_stream_table(text) FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION pgtrickle.refresh_timeline(integer) FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION pgtrickle.repair_stream_table(text) FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION pgtrickle.reinitialize_stream_table(text) FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION pgtrickle.reset_fuse(text, text) FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION pgtrickle.restore_from_snapshot(text, text) FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION pgtrickle.resume_stream_table(text) FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION pgtrickle.set_stream_table_refresh_policy(text, text) FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION pgtrickle.set_stream_table_sla(text, interval) FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION pgtrickle.set_stream_table_storage_policy(text, boolean, text) FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION pgtrickle.snapshot_stream_table(text, text) FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION pgtrickle.stream_table_to_publication(text) FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION pgtrickle.subscribe(text, text) FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION pgtrickle.subscribe_distance(text, text, text, text, text, double precision) FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION pgtrickle.unsubscribe(text, text) FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION pgtrickle.unsubscribe_distance(text, text) FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION pgtrickle.stat_reset(bigint) FROM PUBLIC;
+
+-- public_read
+GRANT EXECUTE ON FUNCTION pgtrickle.bootstrap_gate_status() TO PUBLIC;
+GRANT EXECUTE ON FUNCTION pgtrickle.cache_stats() TO PUBLIC;
+GRANT EXECUTE ON FUNCTION pgtrickle.cdc_pause_status() TO PUBLIC;
+GRANT EXECUTE ON FUNCTION pgtrickle.change_buffer_sizes() TO PUBLIC;
+GRANT EXECUTE ON FUNCTION pgtrickle.check_cdc_health() TO PUBLIC;
+GRANT EXECUTE ON FUNCTION pgtrickle.capture_instance_status() TO PUBLIC;
+GRANT EXECUTE ON FUNCTION pgtrickle.request_output_delta_resnapshot(uuid) TO PUBLIC;
+GRANT EXECUTE ON FUNCTION pgtrickle.validate_output_delta_consumer(uuid) TO PUBLIC;
+GRANT EXECUTE ON FUNCTION pgtrickle.cluster_worker_summary() TO PUBLIC;
+GRANT EXECUTE ON FUNCTION pgtrickle.commit_latency_stats() TO PUBLIC;
+GRANT EXECUTE ON FUNCTION pgtrickle.freshness() TO PUBLIC;
+GRANT EXECUTE ON FUNCTION pgtrickle.dedup_stats() TO PUBLIC;
+GRANT EXECUTE ON FUNCTION pgtrickle.dependency_tree() TO PUBLIC;
+GRANT EXECUTE ON FUNCTION pgtrickle.diagnose_errors(text) TO PUBLIC;
+GRANT EXECUTE ON FUNCTION pgtrickle.diamond_groups() TO PUBLIC;
+GRANT EXECUTE ON FUNCTION pgtrickle.explain_dag(text) TO PUBLIC;
+GRANT EXECUTE ON FUNCTION pgtrickle.explain_delta(text, text) TO PUBLIC;
+GRANT EXECUTE ON FUNCTION pgtrickle.explain_delta_plan(bigint) TO PUBLIC;
+GRANT EXECUTE ON FUNCTION pgtrickle.explain_diff_sql(text) TO PUBLIC;
+GRANT EXECUTE ON FUNCTION pgtrickle.explain(text) TO PUBLIC;
+GRANT EXECUTE ON FUNCTION pgtrickle.explain_alter(text, text) TO PUBLIC;
+GRANT EXECUTE ON FUNCTION pgtrickle.explain_json(text) TO PUBLIC;
+GRANT EXECUTE ON FUNCTION pgtrickle.explain_query_rewrite(text) TO PUBLIC;
+GRANT EXECUTE ON FUNCTION pgtrickle.explain_refresh_mode(text) TO PUBLIC;
+GRANT EXECUTE ON FUNCTION pgtrickle.explain_st(text, boolean) TO PUBLIC;
+GRANT EXECUTE ON FUNCTION pgtrickle.explain_stream_table(text) TO PUBLIC;
+GRANT EXECUTE ON FUNCTION pgtrickle.export_definition(text) TO PUBLIC;
+GRANT EXECUTE ON FUNCTION pgtrickle.fuse_status() TO PUBLIC;
+GRANT EXECUTE ON FUNCTION pgtrickle.get_refresh_history(text, integer) TO PUBLIC;
+GRANT EXECUTE ON FUNCTION pgtrickle.get_staleness(text) TO PUBLIC;
+GRANT EXECUTE ON FUNCTION pgtrickle.health_check() TO PUBLIC;
+GRANT EXECUTE ON FUNCTION pgtrickle.health_summary() TO PUBLIC;
+GRANT EXECUTE ON FUNCTION pgtrickle.active_profile() TO PUBLIC;
+GRANT EXECUTE ON FUNCTION pgtrickle.disk_usage() TO PUBLIC;
+GRANT EXECUTE ON FUNCTION pgtrickle.error_catalog() TO PUBLIC;
+GRANT EXECUTE ON FUNCTION pgtrickle.history_prune_status() TO PUBLIC;
+GRANT EXECUTE ON FUNCTION pgtrickle.is_drained() TO PUBLIC;
+GRANT EXECUTE ON FUNCTION pgtrickle.list_auxiliary_columns(text) TO PUBLIC;
+GRANT EXECUTE ON FUNCTION pgtrickle.list_distance_subscriptions(text) TO PUBLIC;
+GRANT EXECUTE ON FUNCTION pgtrickle.list_snapshots(text) TO PUBLIC;
+GRANT EXECUTE ON FUNCTION pgtrickle.list_sources(text) TO PUBLIC;
+GRANT EXECUTE ON FUNCTION pgtrickle.list_subscriptions() TO PUBLIC;
+GRANT EXECUTE ON FUNCTION pgtrickle.metrics_summary() TO PUBLIC;
+GRANT EXECUTE ON FUNCTION pgtrickle.parallel_job_status(integer) TO PUBLIC;
+GRANT EXECUTE ON FUNCTION pgtrickle.parse_duration_seconds(text) TO PUBLIC;
+GRANT EXECUTE ON FUNCTION pgtrickle.encode_row_id_v2(text, anyelement) TO PUBLIC;
+GRANT EXECUTE ON FUNCTION pgtrickle.encode_row_id_v3(text, anyelement) TO PUBLIC;
+GRANT EXECUTE ON FUNCTION pgtrickle.row_probe_v1(bytea) TO PUBLIC;
+GRANT EXECUTE ON FUNCTION pgtrickle.pg_trickle_hash(text) TO PUBLIC;
+GRANT EXECUTE ON FUNCTION pgtrickle.pg_trickle_hash_multi(text[]) TO PUBLIC;
+GRANT EXECUTE ON FUNCTION pgtrickle.pgt_scc_status() TO PUBLIC;
+GRANT EXECUTE ON FUNCTION pgtrickle.pgt_status() TO PUBLIC;
+GRANT EXECUTE ON FUNCTION pgtrickle.pgtrickle_refresh_stats() TO PUBLIC;
+GRANT EXECUTE ON FUNCTION pgtrickle.preflight() TO PUBLIC;
+GRANT EXECUTE ON FUNCTION pgtrickle.preflight_upgrade() TO PUBLIC;
+GRANT EXECUTE ON FUNCTION pgtrickle.preview_stream_table(text, text, text, text) TO PUBLIC;
+GRANT EXECUTE ON FUNCTION pgtrickle.recommend_refresh_mode(text) TO PUBLIC;
+GRANT EXECUTE ON FUNCTION pgtrickle.recommend_schedule(text) TO PUBLIC;
+GRANT EXECUTE ON FUNCTION pgtrickle.reliability_counters() TO PUBLIC;
+GRANT EXECUTE ON FUNCTION pgtrickle.schedule_recommendations() TO PUBLIC;
+GRANT EXECUTE ON FUNCTION pgtrickle.scheduler_overhead() TO PUBLIC;
+GRANT EXECUTE ON FUNCTION pgtrickle.self_monitoring_status() TO PUBLIC;
+GRANT EXECUTE ON FUNCTION pgtrickle.shared_buffer_stats() TO PUBLIC;
+GRANT EXECUTE ON FUNCTION pgtrickle.sla_summary() TO PUBLIC;
+GRANT EXECUTE ON FUNCTION pgtrickle.slot_health() TO PUBLIC;
+GRANT EXECUTE ON FUNCTION pgtrickle.source_gates() TO PUBLIC;
+GRANT EXECUTE ON FUNCTION pgtrickle.source_stable_name(oid) TO PUBLIC;
+GRANT EXECUTE ON FUNCTION pgtrickle.st_auto_threshold(text) TO PUBLIC;
+GRANT EXECUTE ON FUNCTION pgtrickle.st_refresh_stats() TO PUBLIC;
+GRANT EXECUTE ON FUNCTION pgtrickle.stream_table_definition(text) TO PUBLIC;
+GRANT EXECUTE ON FUNCTION pgtrickle.stream_table_lineage(text) TO PUBLIC;
+GRANT EXECUTE ON FUNCTION pgtrickle.stream_table_spec(oid) TO PUBLIC;
+GRANT EXECUTE ON FUNCTION pgtrickle.stream_table_spec(text) TO PUBLIC;
+GRANT EXECUTE ON FUNCTION pgtrickle.trigger_inventory() TO PUBLIC;
+GRANT EXECUTE ON FUNCTION pgtrickle.tune_recommendations() TO PUBLIC;
+GRANT EXECUTE ON FUNCTION pgtrickle.validate_query(text) TO PUBLIC;
+GRANT EXECUTE ON FUNCTION pgtrickle.validate_recovery() TO PUBLIC;
+GRANT EXECUTE ON FUNCTION pgtrickle.vector_status() TO PUBLIC;
+GRANT EXECUTE ON FUNCTION pgtrickle.version() TO PUBLIC;
+GRANT EXECUTE ON FUNCTION pgtrickle.version_check() TO PUBLIC;
+GRANT EXECUTE ON FUNCTION pgtrickle.view_evolution_status() TO PUBLIC;
+GRANT EXECUTE ON FUNCTION pgtrickle.wal_source_status() TO PUBLIC;
+GRANT EXECUTE ON FUNCTION pgtrickle.watermark_groups() TO PUBLIC;
+GRANT EXECUTE ON FUNCTION pgtrickle.watermark_status() TO PUBLIC;
+GRANT EXECUTE ON FUNCTION pgtrickle.watermarks() TO PUBLIC;
+GRANT EXECUTE ON FUNCTION pgtrickle.worker_allocation_status() TO PUBLIC;
+GRANT EXECUTE ON FUNCTION pgtrickle.worker_pool_status() TO PUBLIC;
+
+-- trigger_entry
+REVOKE EXECUTE ON FUNCTION pgtrickle._on_ddl_end() FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION pgtrickle._on_sql_drop() FROM PUBLIC;
+
+SELECT pgtrickle._signal_launcher_rescan();
+
+"#,
+    name = "pg_trickle_acl_policy",
+    requires = [
+        "pg_trickle_event_triggers",
+        "pg_trickle_pause_resume",
+        "pg_trickle_refresh_if_stale",
+        "pg_trickle_stream_table_definition",
+        "pg_trickle_canary",
+        "pg_trickle_distance_subscriptions_catalog",
+        _signal_launcher_rescan,
+        preview_stream_table,
+        create_stream_table_realtime,
+        create_stream_table_batch,
+        create_stream_table_cost_optimized,
+    ],
+    finalize,
+);
+
+// ── v0.96.0: predefined role mapping ─────────────────────────────────────
+
+extension_sql!(
+    r#"
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = 'pgtrickle_reader') THEN
+        CREATE ROLE pgtrickle_reader NOLOGIN NOINHERIT;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = 'pgtrickle_operator') THEN
+        CREATE ROLE pgtrickle_operator NOLOGIN NOINHERIT;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = 'pgtrickle_admin') THEN
+        CREATE ROLE pgtrickle_admin NOLOGIN NOINHERIT;
+    END IF;
+END
+$$;
+
+GRANT USAGE ON SCHEMA pgtrickle TO pgtrickle_reader, pgtrickle_operator, pgtrickle_admin;
+GRANT SELECT ON pgtrickle.pg_stat_progress_pgtrickle
+    TO pgtrickle_reader, pgtrickle_operator, pgtrickle_admin;
+GRANT EXECUTE ON FUNCTION pgtrickle.active_profile() TO pgtrickle_reader;
+GRANT EXECUTE ON FUNCTION pgtrickle.disk_usage() TO pgtrickle_reader;
+GRANT EXECUTE ON FUNCTION pgtrickle.error_catalog() TO pgtrickle_reader;
+GRANT pgtrickle_reader TO pgtrickle_operator;
+GRANT pgtrickle_operator TO pgtrickle_admin;
+
+GRANT EXECUTE ON FUNCTION pgtrickle.refresh_stream_table(text) TO pgtrickle_operator;
+GRANT EXECUTE ON FUNCTION pgtrickle.refresh_if_stale(text, interval) TO pgtrickle_operator;
+GRANT EXECUTE ON FUNCTION pgtrickle.pause_stream_table(text) TO pgtrickle_operator;
+GRANT EXECUTE ON FUNCTION pgtrickle.resume_stream_table(text) TO pgtrickle_operator;
+GRANT EXECUTE ON FUNCTION pgtrickle.repair_stream_table(text) TO pgtrickle_operator;
+GRANT EXECUTE ON FUNCTION pgtrickle.reinitialize_stream_table(text) TO pgtrickle_operator;
+GRANT EXECUTE ON FUNCTION pgtrickle.drain(integer) TO pgtrickle_operator;
+
+GRANT EXECUTE ON FUNCTION pgtrickle.create_stream_table(
+    text, text, text, text, boolean, text, text, text, boolean, boolean,
+    text, integer, double precision, text, boolean, text, integer, text, text
+) TO pgtrickle_admin;
+GRANT EXECUTE ON FUNCTION pgtrickle.alter_stream_table(
+    text, text, text, text, text, text, text, text, boolean, boolean,
+    text, text, bigint, integer, text, integer, double precision, text,
+    double precision, text
+) TO pgtrickle_admin;
+GRANT EXECUTE ON FUNCTION pgtrickle.drop_stream_table(text, boolean) TO pgtrickle_admin;
+"#,
+    name = "pg_trickle_v096_roles",
+    requires = ["pg_trickle_acl_policy"],
+);

@@ -1,0 +1,501 @@
+# postgres_exporter custom queries for pg_trickle
+#
+# Usage: pass this file to postgres_exporter via --extend.query-path
+# (or PG_EXPORTER_EXTEND_QUERY_PATH env var).
+#
+# All metrics are prefixed "pg_trickle_".
+# Requires pg_trickle 0.90.0+ with the v0.90 freshness summary table
+
+# ── Overall cluster health summary ─────────────────────────────────────────────
+
+pg_trickle_health:
+  query: |
+    SELECT
+        total_stream_tables,
+        error_tables,
+        stale_tables,
+        CASE WHEN scheduler_running THEN 1 ELSE 0 END AS scheduler_running,
+        CASE
+            WHEN status = 'OK'       THEN 0
+            WHEN status = 'WARNING'  THEN 1
+            WHEN status = 'CRITICAL' THEN 2
+            ELSE 3
+        END AS health_status_code
+    FROM pgtrickle.quick_health
+  metrics:
+    - total_stream_tables:
+        usage: GAUGE
+        description: "Total number of registered stream tables"
+    - error_tables:
+        usage: GAUGE
+        description: "Number of tables currently in ERROR state or with consecutive errors"
+    - stale_tables:
+        usage: GAUGE
+        description: "Number of tables with data older than their configured schedule"
+    - scheduler_running:
+        usage: GAUGE
+        description: "1 if the pg_trickle scheduler background worker is alive"
+    - health_status_code:
+        usage: GAUGE
+        description: "Overall cluster health: 0=OK, 1=WARNING, 2=CRITICAL"
+
+# ── Per-table refresh statistics ─────────────────────────────────────────────
+
+pg_trickle_table_stats:
+  query: |
+    SELECT
+        pgt_schema                                    AS schema,
+        pgt_name                                      AS name,
+        status,
+        refresh_mode,
+        CASE WHEN is_populated THEN 1 ELSE 0 END      AS is_populated,
+        EXTRACT(EPOCH FROM staleness)::float8          AS staleness_seconds,
+        CASE WHEN stale THEN 1 ELSE 0 END              AS stale,
+        consecutive_errors,
+        COALESCE(total_refreshes, 0)                  AS total_refreshes,
+        COALESCE(successful_refreshes, 0)             AS successful_refreshes,
+        COALESCE(failed_refreshes, 0)                 AS failed_refreshes,
+        COALESCE(total_rows_inserted, 0)              AS rows_inserted_total,
+        COALESCE(total_rows_deleted, 0)               AS rows_deleted_total,
+        COALESCE(avg_duration_ms, 0)                  AS avg_duration_ms
+    FROM pgtrickle.pg_stat_stream_tables
+  metrics:
+    - schema:
+        usage: LABEL
+        description: "Schema of the stream table"
+    - name:
+        usage: LABEL
+        description: "Name of the stream table"
+    - status:
+        usage: LABEL
+        description: "Current lifecycle status (ACTIVE, SUSPENDED, ERROR, INITIALIZING)"
+    - refresh_mode:
+        usage: LABEL
+        description: "Configured refresh mode (FULL, DIFFERENTIAL, AUTO, IMMEDIATE)"
+    - is_populated:
+        usage: GAUGE
+        description: "1 if the stream table has been populated at least once"
+    - staleness_seconds:
+        usage: GAUGE
+        description: "Seconds since last successful refresh (NULL = never refreshed)"
+    - stale:
+        usage: GAUGE
+        description: "1 if the table data is older than its configured schedule"
+    - consecutive_errors:
+        usage: GAUGE
+        description: "Number of consecutive refresh failures (resets on success)"
+    - total_refreshes:
+        usage: COUNTER
+        description: "Total number of refresh cycles completed"
+    - successful_refreshes:
+        usage: COUNTER
+        description: "Number of refresh cycles that completed successfully"
+    - failed_refreshes:
+        usage: COUNTER
+        description: "Number of refresh cycles that failed"
+    - rows_inserted_total:
+        usage: COUNTER
+        description: "Total rows inserted across all refreshes"
+    - rows_deleted_total:
+        usage: COUNTER
+        description: "Total rows deleted across all refreshes"
+    - avg_duration_ms:
+        usage: GAUGE
+        description: "Rolling average refresh duration in milliseconds"
+
+# ── Exact freshness controller evidence (v0.90.0) ────────────────────────────
+# The query key is intentionally `pg_trickle`: postgres_exporter prefixes each
+# metric column with this key, producing the same names as the native endpoint.
+# The summary row uses empty schema/name labels; per-table rows have all four
+# bounded identity labels.
+
+pg_trickle:
+  query: |
+    WITH database_identity AS (
+        SELECT oid::text AS db_oid, datname AS db_name
+        FROM pg_catalog.pg_database
+        WHERE datname = current_database()
+    ),
+    freshness AS (
+        SELECT
+            d.db_oid,
+            d.db_name,
+            s.pgt_schema AS schema,
+            s.pgt_name AS name,
+            s.freshness_deadline_ms / 1000.0 AS target_freshness_seconds,
+            f.p50_freshness_ms / 1000.0 AS freshness_p50_seconds,
+            f.p95_freshness_ms / 1000.0 AS freshness_p95_seconds,
+            f.p99_freshness_ms / 1000.0 AS freshness_p99_seconds,
+            CASE WHEN f.sla_status = 'BREACHING' AND f.breach_started_at IS NOT NULL
+                 THEN GREATEST(EXTRACT(EPOCH FROM
+                                      (clock_timestamp() - f.breach_started_at)), 0)::double precision
+                 ELSE 0::double precision END AS sla_breach_duration_seconds,
+            NULL::bigint AS sla_at_risk_tables,
+            NULL::bigint AS sla_infeasible_tables,
+            NULL::double precision AS adaptive_worker_target
+        FROM database_identity d
+        CROSS JOIN pgtrickle.pgt_stream_tables s
+        LEFT JOIN pgtrickle.pgt_freshness_controller_state f ON f.pgt_id = s.pgt_id
+        WHERE s.target_freshness_mode = 'INTERVAL'
+    ),
+    summary AS (
+        SELECT
+            d.db_oid,
+            d.db_name,
+            ''::text AS schema,
+            ''::text AS name,
+            NULL::double precision AS target_freshness_seconds,
+            NULL::double precision AS freshness_p50_seconds,
+            NULL::double precision AS freshness_p95_seconds,
+            NULL::double precision AS freshness_p99_seconds,
+            NULL::double precision AS sla_breach_duration_seconds,
+            count(*) FILTER (WHERE f.sla_status IN ('AT_RISK', 'BREACHING'))::bigint
+                AS sla_at_risk_tables,
+            count(*) FILTER (WHERE f.sla_status = 'INFEASIBLE')::bigint
+                AS sla_infeasible_tables,
+            CASE
+                WHEN current_setting('pg_trickle.adaptive_workers', true) = 'on'
+                THEN (SELECT adaptive_target::double precision
+                        FROM pgtrickle.worker_pool_status())
+                ELSE current_setting('pg_trickle.worker_pool_size', true)::double precision
+            END AS adaptive_worker_target
+        FROM database_identity d
+        LEFT JOIN pgtrickle.pgt_stream_tables s
+               ON s.target_freshness_mode = 'INTERVAL'
+        LEFT JOIN pgtrickle.pgt_freshness_controller_state f ON f.pgt_id = s.pgt_id
+        GROUP BY d.db_oid, d.db_name
+    )
+    SELECT * FROM freshness
+    UNION ALL
+    SELECT * FROM summary
+  metrics:
+    - db_oid:
+        usage: LABEL
+        description: "OID of the database emitting the metric"
+    - db_name:
+        usage: LABEL
+        description: "Name of the database emitting the metric"
+    - schema:
+        usage: LABEL
+        description: "Schema of the stream table"
+    - name:
+        usage: LABEL
+        description: "Name of the stream table"
+    - target_freshness_seconds:
+        usage: GAUGE
+        description: "Declared freshness target in seconds"
+    - freshness_p50_seconds:
+        usage: GAUGE
+        description: "Exact source-commit-to-visible p50 in seconds"
+    - freshness_p95_seconds:
+        usage: GAUGE
+        description: "Exact source-commit-to-visible p95 in seconds"
+    - freshness_p99_seconds:
+        usage: GAUGE
+        description: "Exact source-commit-to-visible p99 in seconds"
+    - sla_breach_duration_seconds:
+        usage: GAUGE
+        description: "Current BREACHING duration in seconds"
+    - sla_at_risk_tables:
+        usage: GAUGE
+        description: "Number of interval targets at risk or breaching"
+    - sla_infeasible_tables:
+        usage: GAUGE
+        description: "Number of interval targets proven infeasible"
+    - adaptive_worker_target:
+        usage: GAUGE
+        description: "Configured advisory adaptive worker target"
+
+# ── Stream table status counts ────────────────────────────────────────────────
+
+pg_trickle_status_counts:
+  query: |
+    SELECT
+        status,
+        count(*)::bigint AS stream_tables_total
+    FROM pgtrickle.pgt_stream_tables
+    GROUP BY status
+  metrics:
+    - status:
+        usage: LABEL
+        description: "Lifecycle status"
+    - stream_tables_total:
+        usage: GAUGE
+        description: "Number of stream tables in this status"
+
+# ── Refresh history: recent error rate ───────────────────────────────────────
+
+pg_trickle_recent_refresh_stats:
+  query: |
+    SELECT
+        st.pgt_schema                                         AS schema,
+        st.pgt_name                                           AS name,
+        count(*) FILTER (WHERE h.status = 'FAILED')          AS recent_failures,
+        count(*) FILTER (WHERE h.status = 'COMPLETED')       AS recent_successes,
+        COALESCE(
+            avg(EXTRACT(EPOCH FROM (h.end_time - h.start_time)) * 1000)
+            FILTER (WHERE h.status = 'COMPLETED' AND h.end_time IS NOT NULL),
+            0.0
+        )::float8                                            AS recent_avg_duration_ms,
+        COALESCE(
+            max(EXTRACT(EPOCH FROM (h.end_time - h.start_time)) * 1000)
+            FILTER (WHERE h.status = 'COMPLETED' AND h.end_time IS NOT NULL),
+            0.0
+        )::float8                                            AS recent_max_duration_ms
+    FROM pgtrickle.pgt_stream_tables st
+    JOIN pgtrickle.pgt_refresh_history h ON h.pgt_id = st.pgt_id
+    WHERE h.start_time > now() - interval '1 hour'
+    GROUP BY st.pgt_schema, st.pgt_name
+  metrics:
+    - schema:
+        usage: LABEL
+        description: "Schema of the stream table"
+    - name:
+        usage: LABEL
+        description: "Name of the stream table"
+    - recent_failures:
+        usage: GAUGE
+        description: "Number of failed refreshes in the last hour"
+    - recent_successes:
+        usage: GAUGE
+        description: "Number of successful refreshes in the last hour"
+    - recent_avg_duration_ms:
+        usage: GAUGE
+        description: "Average refresh duration (ms) over the last hour"
+    - recent_max_duration_ms:
+        usage: GAUGE
+        description: "Maximum refresh duration (ms) over the last hour"
+
+# ── Template cache statistics (UX-1) ──────────────────────────────────────────
+
+pg_trickle_cache:
+  query: |
+    SELECT
+        l1_hits,
+        l1_evictions,
+        delta_cache_entries
+    FROM pgtrickle.cache_stats()
+  metrics:
+    - l1_hits:
+        usage: COUNTER
+        description: "Total L1 template cache hits (avoids delta query regeneration)"
+    - l1_evictions:
+        usage: COUNTER
+        description: "Total L1 template cache evictions"
+    - delta_cache_entries:
+        usage: GAUGE
+        description: "Current number of entries in the delta template cache"
+
+# ── Deployment health summary (UX-4) ──────────────────────────────────────────
+
+pg_trickle_health_summary:
+  query: |
+    SELECT
+        total_stream_tables,
+        active_count AS active_tables,
+        error_count AS error_tables,
+        stale_count AS stale_tables,
+        CASE WHEN scheduler_status = 'ACTIVE' THEN 1 ELSE 0 END AS scheduler_running,
+        (SELECT count(*) FROM pgtrickle.pgt_refresh_history
+          WHERE start_time > now() - interval '1 hour')::bigint AS total_refreshes_1h,
+        (SELECT count(*) FROM pgtrickle.pgt_refresh_history
+          WHERE status = 'FAILED' AND start_time > now() - interval '1 hour')::bigint
+          AS failed_refreshes_1h,
+        COALESCE((SELECT avg(EXTRACT(EPOCH FROM (end_time - start_time)) * 1000)
+          FROM pgtrickle.pgt_refresh_history
+          WHERE status = 'COMPLETED' AND end_time IS NOT NULL
+            AND start_time > now() - interval '1 hour'), 0)::float8 AS avg_refresh_ms_1h,
+        COALESCE((SELECT percentile_cont(0.99) WITHIN GROUP
+              (ORDER BY EXTRACT(EPOCH FROM (end_time - start_time)) * 1000)
+          FROM pgtrickle.pgt_refresh_history
+          WHERE status = 'COMPLETED' AND end_time IS NOT NULL
+            AND start_time > now() - interval '1 hour'), 0)::float8 AS p99_refresh_ms_1h,
+        cache_hit_rate
+    FROM pgtrickle.health_summary()
+  metrics:
+    - total_stream_tables:
+        usage: GAUGE
+        description: "Total registered stream tables"
+    - active_tables:
+        usage: GAUGE
+        description: "Tables in ACTIVE state"
+    - error_tables:
+        usage: GAUGE
+        description: "Tables in ERROR state"
+    - stale_tables:
+        usage: GAUGE
+        description: "Stale stream tables"
+    - scheduler_running:
+        usage: GAUGE
+        description: "1 if the scheduler is alive"
+    - total_refreshes_1h:
+        usage: GAUGE
+        description: "Total refreshes in the last hour"
+    - failed_refreshes_1h:
+        usage: GAUGE
+        description: "Failed refreshes in the last hour"
+    - avg_refresh_ms_1h:
+        usage: GAUGE
+        description: "Average refresh latency (ms) over the last hour"
+    - p99_refresh_ms_1h:
+        usage: GAUGE
+        description: "P99 refresh latency (ms) over the last hour"
+    - cache_hit_rate:
+        usage: GAUGE
+        description: "Template cache hit rate (0.0–1.0)"
+
+# ── v0.97 assurance signals ─────────────────────────────────────────────────
+
+pg_trickle_cdc_buffers:
+  query: |
+    SELECT stream_table, source_table, cdc_mode, pending_rows, buffer_bytes
+    FROM pgtrickle.change_buffer_sizes()
+  metrics:
+    - stream_table:
+        usage: LABEL
+        description: "Stream table consuming the change buffer"
+    - source_table:
+        usage: LABEL
+        description: "Source table producing the change buffer"
+    - cdc_mode:
+        usage: LABEL
+        description: "CDC capture mode"
+    - pending_rows:
+        usage: GAUGE
+        description: "Rows waiting in the CDC buffer"
+    - buffer_bytes:
+        usage: GAUGE
+        description: "Estimated CDC buffer size in bytes"
+
+pg_trickle_disk:
+  query: |
+    SELECT stream_table, pressure_state, relation_bytes, change_buffer_bytes,
+           projected_bytes, headroom_bytes
+    FROM pgtrickle.disk_usage()
+  metrics:
+    - stream_table:
+        usage: LABEL
+        description: "Stream table footprint"
+    - pressure_state:
+        usage: LABEL
+        description: "Forecast pressure state"
+    - relation_bytes:
+        usage: GAUGE
+        description: "Stream table relation size in bytes"
+    - change_buffer_bytes:
+        usage: GAUGE
+        description: "Change buffer size in bytes"
+    - projected_bytes:
+        usage: GAUGE
+        description: "Projected stream table plus buffer size in bytes"
+    - headroom_bytes:
+        usage: GAUGE
+        description: "Remaining configured disk headroom in bytes"
+
+pg_trickle_full:
+  query: |
+    SELECT st.pgt_schema AS schema, st.pgt_name AS name,
+           count(*) FILTER (WHERE h.was_full_fallback)::bigint AS fallbacks_1h
+    FROM pgtrickle.pgt_stream_tables st
+    JOIN pgtrickle.pgt_refresh_history h ON h.pgt_id = st.pgt_id
+    WHERE h.start_time > now() - interval '1 hour'
+    GROUP BY st.pgt_schema, st.pgt_name
+  metrics:
+    - schema:
+        usage: LABEL
+        description: "Stream table schema"
+    - name:
+        usage: LABEL
+        description: "Stream table name"
+    - fallbacks_1h:
+        usage: GAUGE
+        description: "Differential refreshes that fell back to FULL in the last hour"
+
+pg_trickle_external_graph:
+  query: |
+    SELECT st.pgt_schema AS schema, st.pgt_name AS name,
+           count(*) FILTER (WHERE h.status = 'FAILED')::bigint AS failures_1h
+    FROM pgtrickle.pgt_stream_tables st
+    JOIN pgtrickle.pgt_refresh_history h ON h.pgt_id = st.pgt_id
+    WHERE st.orchestration_mode = 'EXTERNAL'
+      AND h.start_time > now() - interval '1 hour'
+    GROUP BY st.pgt_schema, st.pgt_name
+  metrics:
+    - schema:
+        usage: LABEL
+        description: "External graph stream table schema"
+    - name:
+        usage: LABEL
+        description: "External graph stream table name"
+    - failures_1h:
+        usage: GAUGE
+        description: "Failed externally orchestrated refreshes in the last hour"
+
+pg_trickle_output_delta:
+  query: |
+    SELECT st.pgt_schema AS schema, st.pgt_name AS name,
+           GREATEST(l.log_head - COALESCE(min(c.acknowledged_batch_token), l.log_head), 0)::bigint
+             AS consumer_lag_batches,
+           count(*) FILTER (WHERE c.state = 'INVALIDATED')::bigint AS invalidated_consumers
+    FROM pgtrickle.pgt_stream_tables st
+    JOIN pgtrickle.pgt_output_delta_logs l ON l.pgt_id = st.pgt_id
+    LEFT JOIN pgtrickle.pgt_output_delta_consumers c ON c.pgt_id = st.pgt_id
+    GROUP BY st.pgt_schema, st.pgt_name, l.log_head
+  metrics:
+    - schema:
+        usage: LABEL
+        description: "Output-delta stream table schema"
+    - name:
+        usage: LABEL
+        description: "Output-delta stream table name"
+    - consumer_lag_batches:
+        usage: GAUGE
+        description: "Batches retained beyond the slowest active output consumer"
+    - invalidated_consumers:
+        usage: GAUGE
+        description: "Output consumers requiring resnapshot"
+
+pg_trickle_cleanup:
+  query: |
+    SELECT count(*)::bigint AS backlog_entries,
+           count(*) FILTER (WHERE blocked)::bigint AS blocked_entries,
+           COALESCE(sum(backlog_rows), 0)::bigint AS backlog_rows
+    FROM pgtrickle.pgt_cleanup_status
+  metrics:
+    - backlog_entries:
+        usage: GAUGE
+        description: "Sources with recorded cleanup state"
+    - blocked_entries:
+        usage: GAUGE
+        description: "Sources whose cleanup is blocked"
+    - backlog_rows:
+        usage: GAUGE
+        description: "Rows waiting for cleanup"
+
+# ── Reliability counters (OPS-10-02) ─────────────────────────────────────────
+# Requires pg_trickle 0.50.0+.
+# Alert rules (suggested thresholds):
+#   - pg_trickle_reliability_invalidation_ring_overflows_total > 0
+#     over 5 minutes → deployment has >1024 simultaneously-DDL'd STs
+#   - pg_trickle_reliability_dag_cycles_detected_total > 0
+#     at any point → circular dependency without allow_circular = on
+#   - pg_trickle_reliability_template_cache_stale_evictions_total spike
+#     → rapid schema churn, may predict GROUP_RESCAN fallback storms
+
+pg_trickle_reliability:
+  query: |
+    SELECT
+        invalidation_ring_overflows,
+        dag_cycles_detected,
+        template_cache_stale_evictions
+    FROM pgtrickle.reliability_counters()
+  metrics:
+    - invalidation_ring_overflows:
+        usage: COUNTER
+        description: "Total invalidation ring overflow events (each means >1024 STs invalidated simultaneously)"
+    - dag_cycles_detected:
+        usage: COUNTER
+        description: "Total DAG cycle detections (should always be 0 in steady state)"
+    - template_cache_stale_evictions:
+        usage: COUNTER
+        description: "Delta template cache entries evicted due to defining_query_hash mismatch (schema change indicator)"

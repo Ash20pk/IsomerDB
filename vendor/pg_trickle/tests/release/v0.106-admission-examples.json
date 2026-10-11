@@ -1,0 +1,99 @@
+{
+  "manifest_version": 1,
+  "release_version": "0.106.1",
+  "capabilities": [
+    {
+      "id": "trigger-capture",
+      "capability": "trigger_cdc",
+      "major_version": 1,
+      "minor_version": 0,
+      "status": "stable",
+      "enabled": true,
+      "strategy": "trigger",
+      "reason_code": null,
+      "target": null
+    },
+    {
+      "id": "graph-v1",
+      "capability": "external_graph_refresh",
+      "major_version": 1,
+      "minor_version": 1,
+      "status": "stable",
+      "enabled": true,
+      "strategy": "public_sql",
+      "reason_code": null,
+      "target": null
+    },
+    {
+      "id": "delta-v1",
+      "capability": "output_delta_consumer",
+      "major_version": 1,
+      "minor_version": 0,
+      "status": "stable",
+      "enabled": true,
+      "strategy": "public_sql",
+      "reason_code": null,
+      "target": null
+    },
+    {
+      "id": "wal-capture",
+      "capability": "wal_cdc",
+      "major_version": 1,
+      "minor_version": 0,
+      "status": "stable",
+      "enabled": true,
+      "strategy": "wal",
+      "reason_code": null,
+      "target": null
+    }
+  ],
+  "examples": [
+    {
+      "id": "stable-capability-discovery",
+      "test": "test_v104_capabilities_are_stable_by_default",
+      "command": "just test-v104-conformance",
+      "sql": "SELECT * FROM pgtrickle.integration_capabilities()",
+      "outcome": "accepted",
+      "strategy": "PUBLIC_SQL",
+      "reason_code": null
+    },
+    {
+      "id": "graph-v1-reference-coordinator",
+      "test": "test_v104_graph_reference_coordinator_commits_publication",
+      "command": "just test-v104-conformance",
+      "sql": "SELECT * FROM pgtrickle.refresh_graph_strict(...)",
+      "outcome": "accepted",
+      "strategy": "PUBLIC_SQL",
+      "reason_code": null
+    },
+    {
+      "id": "delta-v1-reference-consumer",
+      "test": "test_v104_delta_reference_consumer_reads_and_acknowledges",
+      "command": "just test-v104-conformance",
+      "sql": "SELECT * FROM pgtrickle.output_delta_batches(...)",
+      "outcome": "accepted",
+      "strategy": "PUBLIC_SQL",
+      "reason_code": null
+    }
+  ],
+  "stable_reason_identifiers": [
+    "PGT_EXT_CAPABILITY_DISABLED",
+    "PGT_EXT_CDC_UNAVAILABLE",
+    "UNSUPPORTED_OPERATOR",
+    "VOLATILE_FUNCTION",
+    "recursive_cte_fallback",
+    "WINDOW_RECOMPUTE_CHEAPER"
+  ],
+  "documentation": {
+    "canonical_manifest": "docs/capability-manifest.json",
+    "reconciled_sources": [
+      "README.md",
+      "docs/DVM_SUPPORT_MATRIX.md",
+      "docs/SQL_REFERENCE.md",
+      "docs/GUC_CATALOG.md",
+      "docs/CONFIGURATION.md",
+      "docs/integrations/citus.md",
+      "docs/integrations/extension-contracts.md"
+    ]
+  }
+}

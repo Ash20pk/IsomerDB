@@ -1,0 +1,89 @@
+[package]
+name = "pg_trickle"
+version = "0.108.3"
+publish = false
+edition = "2024"
+description = "Streaming Stream Tables for PostgreSQL 18 with differential view maintenance"
+license = "Apache-2.0"
+repository = "https://github.com/trickle-labs/pg-trickle"
+homepage = "https://github.com/trickle-labs/pg-trickle"
+readme = "README.md"
+keywords = ["postgresql", "streaming", "materialized-view", "incremental", "pgrx"]
+categories = ["database"]
+
+[workspace]
+members = ["."]
+
+# Allow pgrx internal cfg values used by pg_shmem_init! macro
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("pg13", "pg14", "pg15", "pg16", "pg17"))'] }
+
+[lib]
+crate-type = ["cdylib", "lib"]
+
+[[bin]]
+name = "pg_trickle_dump"
+path = "./src/bin/pg_trickle_dump.rs"
+
+[features]
+default = ["pg18"]
+pg18 = ["pgrx/pg18", "pgrx-tests/pg18"]
+pg_test = []
+light-e2e = []
+# SQL probes used only by the dedicated assertion/ASan E2E image.
+e2e-unsafe-test-hooks = []
+
+[dependencies]
+pgrx = "=0.18.0"
+vstd = { git = "https://github.com/verus-lang/verus", rev = "2e59154" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+xxhash-rust = { version = "0.8", features = ["xxh64", "xxh3"] }
+thiserror = "2"
+sha2 = "0.11"
+croner = "3"
+chrono = "0.4"
+postgres = "0.19"
+# P-1: single-pass placeholder resolution (O(1) in SQL length for k sources)
+aho-corasick = "1"
+# P-8: O(1) LRU eviction for the MERGE template cache (>=0.16.3 fixes RUSTSEC unsound advisory)
+# DEP-002 (v0.74.0): upgraded from 0.16 to 0.18 (minor bump; API-compatible).
+lru = "0.18"
+
+
+[dev-dependencies]
+pgrx-tests = "=0.18.0"
+testcontainers = "0.27"
+testcontainers-modules = { version = "0.15", features = ["postgres"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "process"] }
+# DEP-001 (v0.74.0): upgraded from 0.8 to 0.9.0 (query safety improvements).
+sqlx = { version = "0.9", features = ["runtime-tokio", "postgres", "json"] }
+tokio-postgres = "0.7"
+regex-lite = "0.1"
+proptest = "1"
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "refresh_bench"
+harness = false
+
+[[bench]]
+name = "diff_operators"
+harness = false
+
+[[bench]]
+name = "scheduler_bench"
+harness = false
+
+[[bench]]
+name = "pgvector_bench"
+harness = false
+
+[profile.dev]
+panic = "unwind"
+
+[profile.release]
+panic = "unwind"
+opt-level = 3
+lto = "fat"
+codegen-units = 1

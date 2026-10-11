@@ -1,0 +1,1861 @@
+# =============================================================================
+# CI Workflow — Run the full test matrix
+#
+# Automatic triggers (with path filters on Rust/test files):
+#   push/PR → main : unit (Linux) + integration tests (~15 min gate)
+#   push → main    : + light E2E tests, + coverage upload
+#   Weekly (Mon)   : full unit matrix (Linux + macOS), E2E, dbt, CNPG smoke
+#   Manual         : all jobs, all platforms (including Windows + benchmarks)
+#
+# TPC-H nightly (TEST-10) is in tpch-nightly.yml — it can take up to 3–5 h
+# and must not block PRs or push-to-main gating.
+# =============================================================================
+name: CI
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'src/**'
+      - 'verification/**'
+      - 'sql/**'
+      - 'scripts/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'tests/**'
+      - '.github/workflows/ci.yml'
+      - '.github/workflows/release.yml'
+      - '.github/actions/**'
+      - 'benchmarks/**'
+      - 'Dockerfile.ghcr'
+      - 'cnpg/**'
+      - 'docker/**'
+      - 'docs/**'
+      - 'tests/release/**'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'src/**'
+      - 'verification/**'
+      - 'sql/**'
+      - 'scripts/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'tests/**'
+      - '.github/workflows/ci.yml'
+      - '.github/workflows/release.yml'
+      - '.github/actions/**'
+      - 'benchmarks/**'
+      - 'Dockerfile.ghcr'
+      - 'cnpg/**'
+      - 'docker/**'
+      - 'docs/**'
+  schedule:
+    - cron: '0 3 * * *'  # Daily 03:00 UTC — full matrix
+  workflow_dispatch:
+    inputs:
+      run_benchmark_regression:
+        description: Run the PR benchmark regression gate
+        required: false
+        type: boolean
+        default: false
+      benchmark_base:
+        description: Base ref or SHA for the benchmark comparison
+        required: false
+        type: string
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  NEXTEST_PROFILE: ci
+  PG_VERSION: "18"
+
+jobs:
+  # The current release contract runs on every PR so publication cannot
+  # introduce untested suite claims or manually asserted passing results.
+  release-qualification-contract:
+    name: v0.108.3 release evidence contract
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Validate release evidence and rejection controls
+        run: |
+          python3 scripts/v0_108_3_release_gate.py
+          python3 scripts/check_lsn_verification.py --contract-only
+          python3 -m unittest scripts/test_lsn_candidate_binding.py
+
+  lsn-verification:
+    name: Checked LSN proof and semantic mutation control
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Pull pinned Verus image
+        run: docker pull ghcr.io/verus-lang/verus:0.2025.06.23.2e59154@sha256:c4d0471379b23c3c6f52e3d7226c7dad28f488c4288e14c623002bd279a745e0
+
+      - name: Run pinned Verus baseline and mutation control
+        run: python3 scripts/check_lsn_verification.py
+
+      - name: Upload exact LSN verification evidence
+        uses: actions/upload-artifact@v7
+        with:
+          name: lsn-verification-evidence
+          path: .p2p/work/issue-1097-verified-production-lsn/evidence/lsn-verification*
+          retention-days: 30
+          if-no-files-found: error
+
+  # ── Unit tests (Linux PR gate) ──────────────────────────────────────────
+  unit-tests:
+    name: Unit tests (PR gate, linux-amd64)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Setup pgrx environment
+        uses: ./.github/actions/setup-pgrx
+
+      - name: Run unit tests
+        run: ./scripts/run_unit_tests.sh pg18
+      - name: Publish Test Report
+        uses: mikepenz/action-junit-report@v6
+        if: always()
+        with:
+          report_paths: 'target/nextest/ci/junit.xml'
+          commit: ${{github.event.pull_request.head.sha}}
+
+      # M-9 (v0.55.0): Upload unit-test coverage to Codecov for PR gate.
+      # fail_ci_if_error: false so that a Codecov outage never blocks merges.
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v7
+        if: always()
+        with:
+          fail_ci_if_error: false
+          token: ${{ secrets.CODECOV_TOKEN }}
+
+  # PP-5 (v0.97.0): exercise the OTLP/HTTP contract against a real collector.
+  otel-collector-contract:
+    name: OpenTelemetry Collector contract
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Start OpenTelemetry Collector
+        run: |
+          docker run -d --name pgtrickle-otel \
+            -p 4318:4318 \
+            -v "$GITHUB_WORKSPACE/monitoring/otel/collector-config.yml:/etc/otelcol-contrib/config.yaml:ro" \
+            otel/opentelemetry-collector-contrib:0.104.0 \
+            --config=/etc/otelcol-contrib/config.yaml
+
+      - name: Send trace and metric payloads
+        run: |
+          for attempt in $(seq 1 30); do
+            status=$(curl -sS -o /tmp/otel-response \
+              -w '%{http_code}' -X POST http://127.0.0.1:4318/v1/traces \
+              -H 'Content-Type: application/json' \
+              --data '{"resourceSpans":[{"resource":{"attributes":[]},"scopeSpans":[{"spans":[{"traceId":"4bf92f3577b34da6a3ce929d0e0e4736","spanId":"00f067aa0ba902b7","name":"pgtrickle.cdc_drain","kind":2,"startTimeUnixNano":"1","endTimeUnixNano":"2"}]}]}]}' || true)
+            if [ "$status" = 200 ]; then break; fi
+            sleep 1
+          done
+          test "$status" = 200
+          curl -fsS -X POST http://127.0.0.1:4318/v1/metrics \
+            -H 'Content-Type: application/json' \
+            --data '{"resourceMetrics":[{"resource":{"attributes":[]},"scopeMetrics":[{"metrics":[{"name":"pg_trickle_target_freshness_seconds","gauge":{"dataPoints":[]}}]}]}]}'
+
+      - name: Validate checked-in monitoring contract
+        run: python3 scripts/check_monitoring_contract.py
+
+      - name: Cleanup collector
+        if: always()
+        run: docker rm -f pgtrickle-otel 2>/dev/null || true
+
+  # ── Unit tests (extra platforms) ───────────────────────────────────────
+  # Keep macOS/Windows coverage off the PR path; Linux remains the merge gate
+  # while the wider platform matrix runs on schedule or manual dispatch.
+  unit-tests-macos:
+    name: Unit tests (scheduled/manual, macos-arm64)
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: macos-14
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Setup pgrx environment
+        uses: ./.github/actions/setup-pgrx
+
+      - name: Run unit tests
+        run: ./scripts/run_unit_tests.sh pg18
+      - name: Publish Test Report
+        uses: mikepenz/action-junit-report@v6
+        if: always()
+        with:
+          report_paths: 'target/nextest/ci/junit.xml'
+          commit: ${{github.event.pull_request.head.sha}}
+
+  unit-tests-windows:
+    name: Unit tests (scheduled/manual, windows-amd64)
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: windows-2022
+    timeout-minutes: 15
+    # A46-13: Windows compile failures are now BLOCKING on scheduled/manual runs.
+    # continue-on-error removed intentionally.
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Setup pgrx environment
+        uses: ./.github/actions/setup-pgrx
+
+      - name: Compile-check unit tests (Windows)
+        run: cargo test --lib --features pg18 --no-run
+
+  # ── A46-13: Windows compile gate on PRs ─────────────────────────────────
+  # Lightweight compile-only check for pure Rust modules on every PR.
+  # Does not require PostgreSQL — just verifies the Rust code compiles on Windows.
+  windows-compile-gate:
+    name: Windows compile check (PR gate)
+    if: github.event_name == 'pull_request'
+    runs-on: windows-2022
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Setup pgrx environment
+        uses: ./.github/actions/setup-pgrx
+
+      - name: Compile-check Rust library (Windows)
+        run: cargo check --lib --features pg18
+
+  # ── Integration tests (testcontainers, Linux only) ──────────────────────
+  integration-tests:
+    name: Integration tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Setup pgrx environment
+        uses: ./.github/actions/setup-pgrx
+
+      - name: Restore Docker image cache (postgres:18.6-alpine)
+        uses: actions/cache@v6
+        id: cache-docker-postgres-alpine
+        with:
+          path: /tmp/docker-images/postgres-18.6-alpine.tar
+          key: docker-postgres-18.6-alpine
+
+      - name: Load or pull postgres:18.6-alpine
+        run: |
+          if [ -f /tmp/docker-images/postgres-18.6-alpine.tar ]; then
+            docker load --input /tmp/docker-images/postgres-18.6-alpine.tar
+          else
+            docker pull postgres:18.6-alpine
+            mkdir -p /tmp/docker-images
+            docker save postgres:18.6-alpine --output /tmp/docker-images/postgres-18.6-alpine.tar
+          fi
+
+      - name: Run integration tests
+        run: |
+          cargo nextest run \
+            --profile ci \
+            --test catalog_tests \
+            --test extension_tests \
+            --test monitoring_tests \
+            --test smoke_tests \
+            --test resilience_tests \
+            --test scenario_tests \
+            --test workflow_tests \
+            --test property_tests
+      - name: Publish Test Report
+        uses: mikepenz/action-junit-report@v6
+        if: always()
+        with:
+          report_paths: 'target/nextest/ci/junit.xml'
+          commit: ${{github.event.pull_request.head.sha}}
+
+  # Run the blocking pgbench gate when runtime or benchmark inputs change.
+  # Test-only and documentation-only changes use the functional gates below.
+  detect-pgbench-changes:
+    name: Detect pgbench path changes
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    outputs:
+      benchmark_changed: ${{ steps.filter.outputs.benchmark_changed }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Filter benchmark inputs
+        id: filter
+        uses: dorny/paths-filter@v4
+        with:
+          filters: |
+            benchmark_changed:
+              - 'src/**'
+              - 'sql/self_monitoring_setup.sql'
+              - 'benchmarks/**'
+              - 'tests/Dockerfile.builder'
+              - 'tests/Dockerfile.e2e'
+              - '.github/actions/setup-pgrx/**'
+
+  # ── v0.87 paired pgbench overhead gate ─────────────────────────────────
+  # This is intentionally separate from the long weekly E2E benchmark history.
+  # The three configurations and budgets are versioned under benchmarks/.
+  pgbench-v087:
+    name: v0.87 pgbench overhead gate
+    needs: detect-pgbench-changes
+    if: >
+      always() &&
+      (github.event_name == 'workflow_dispatch' ||
+       (needs.detect-pgbench-changes.result == 'success' &&
+        needs.detect-pgbench-changes.outputs.benchmark_changed == 'true'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Setup pgrx environment
+        uses: ./.github/actions/setup-pgrx
+
+      - name: Pull builder image when available
+        run: |
+          if docker pull ghcr.io/trickle-labs/pg-trickle/builder:pg18 2>/dev/null; then
+            docker tag ghcr.io/trickle-labs/pg-trickle/builder:pg18 pg_trickle_builder:pg18
+          fi
+
+      - name: Build pg_trickle benchmark image
+        run: ./tests/build_e2e_image.sh
+
+      - name: Run v0.87 pgbench gate
+        run: |
+          # Shared runners can produce noisy p99/TPS samples. Require three
+          # independent failures before blocking the PR. Retain every attempt.
+          for attempt in 1 2 3; do
+            if benchmarks/pgbench-v0.87/run.sh --profile blocking \
+              --output "target/pgbench-v0.87/attempt-$attempt"; then
+              exit 0
+            fi
+          done
+          exit 1
+
+      - name: Upload v0.87 pgbench result
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: pgbench-v0.87
+          retention-days: 90
+          if-no-files-found: ignore
+          path: target/pgbench-v0.87/
+
+  # Package once, then fan out the test shards. The package is identical for
+  # every shard, so compiling it in each runner only adds CI cost.
+  light-e2e-package:
+    name: Package light E2E extension
+    needs: [lsn-verification]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Setup pgrx environment
+        uses: ./.github/actions/setup-pgrx
+
+      - name: Package extension
+        run: bash ./scripts/run_light_e2e_tests.sh --package-only
+
+      - name: Upload extension package
+        uses: actions/upload-artifact@v7
+        with:
+          name: light-e2e-package
+          path: target/release/pg_trickle-pg18
+          retention-days: 1
+          if-no-files-found: error
+
+  release-evidence-runtime:
+    name: Release evidence runtime controls
+    needs: light-e2e-package
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Free up disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+               "/usr/local/share/boost" "$AGENT_TOOLSDIRECTORY"
+
+      - uses: actions/checkout@v7
+
+      - name: Setup pgrx environment
+        uses: ./.github/actions/setup-pgrx
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Download extension package
+        uses: actions/download-artifact@v8
+        with:
+          name: light-e2e-package
+          path: target/release/pg_trickle-pg18
+
+      - name: Prove package identity and required case controls
+        run: |
+          python3 scripts/run_release_proof.py \
+            --package-dir target/release/pg_trickle-pg18 \
+            --candidate-commit "$GITHUB_SHA"
+
+      - name: Upload release proof records
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-proof-controls
+          path: target/release-proof/
+          retention-days: 30
+          if-no-files-found: error
+
+  # ── Light-E2E tests (stock postgres container, PR-friendly) ──────────────
+  # Uses `cargo pgrx package` + bind-mount into a stock postgres:18.6
+  # container. No custom Docker image build needed. The curated allowlist
+  # lives in scripts/run_light_e2e_tests.sh and is split across three shards
+  # to reduce PR wall-clock time.
+  light-e2e-tests:
+    name: Light E2E tests (${{ matrix.shard_name }})
+    needs: light-e2e-package
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - shard_index: 1
+            shard_count: 3
+            shard_name: 1/3
+          - shard_index: 2
+            shard_count: 3
+            shard_name: 2/3
+          - shard_index: 3
+            shard_count: 3
+            shard_name: 3/3
+    steps:
+      - name: Free up disk space
+        run: |
+          df -h
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf "/usr/local/share/boost"
+          sudo rm -rf "$AGENT_TOOLSDIRECTORY"
+          df -h
+
+      - uses: actions/checkout@v7
+
+      - name: Setup pgrx environment
+        uses: ./.github/actions/setup-pgrx
+
+      - name: Download extension package
+        uses: actions/download-artifact@v8
+        with:
+          name: light-e2e-package
+          path: target/release
+
+      - name: Pull postgres:18.6 image
+        run: docker pull postgres:18.6
+
+      - name: Run light-E2E test suite
+        run: |
+          bash ./scripts/run_light_e2e_tests.sh \
+            --shard-index ${{ matrix.shard_index }} \
+            --shard-count ${{ matrix.shard_count }}
+
+  lsn-candidate-runtime:
+    name: Checked LSN runtime against verified candidate package
+    needs: [light-e2e-package, lsn-verification]
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      PGT_RELEASE_ATTESTATION_PATH: target/lsn-install-attestation.json
+      PGT_RELEASE_CANDIDATE_COMMIT: ${{ github.sha }}
+      PGT_RELEASE_BUILD_KIND: ci-package
+      PGT_RELEASE_FEATURE_SCOPE: pg18
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Setup pgrx environment
+        uses: ./.github/actions/setup-pgrx
+
+      - name: Download extension package
+        uses: actions/download-artifact@v8
+        with:
+          name: light-e2e-package
+          path: target/release
+
+      - name: Download proof record
+        uses: actions/download-artifact@v8
+        with:
+          name: lsn-verification-evidence
+          path: .p2p/work/issue-1097-verified-production-lsn/evidence
+
+      - name: Pull postgres:18.6 image
+        run: docker pull postgres:18.6
+
+      - name: Run packaged light LSN E2E
+        run: |
+          bash ./scripts/run_light_e2e_tests.sh --test e2e_lsn_contract_tests
+
+      - name: Build full E2E image from the candidate package
+        run: |
+          mkdir -p _e2e_pkg/ext _e2e_pkg/lib
+          cp -r target/release/pg_trickle-pg18/usr/share/postgresql/18/extension/. _e2e_pkg/ext/
+          cp -r target/release/pg_trickle-pg18/usr/lib/postgresql/18/lib/. _e2e_pkg/lib/
+          docker build -f tests/Dockerfile.e2e-base-lite -t pg_trickle_e2e:latest .
+
+      - name: Run packaged full LSN E2E and bind installed library
+        env:
+          PGT_EXTENSION_DIR: ${{ github.workspace }}/target/release/pg_trickle-pg18
+          PGT_RELEASE_ATTESTATION_PATH: target/lsn-full-install-attestation.json
+        run: |
+          ./scripts/run_e2e_tests.sh --test e2e_lsn_contract_tests --no-capture
+          python3 scripts/check_lsn_candidate_binding.py \
+            --proof-record .p2p/work/issue-1097-verified-production-lsn/evidence/lsn-verification.json \
+            --package-dir target/release/pg_trickle-pg18 \
+            --installation target/lsn-full-install-attestation.json \
+            --candidate-commit "$GITHUB_SHA" \
+            --runtime-case e2e_lsn_contract_tests::test_lsn_integrated_callers_preserve_valid_and_invalid_frontiers \
+            --runtime-case e2e_lsn_contract_tests::test_lsn_scheduler_preserves_malformed_frontier_and_recovers \
+            --runtime-case e2e_lsn_contract_tests::test_lsn_scheduler_cdc_holdback_recovers_after_long_writer \
+            --runtime-case e2e_lsn_contract_tests::test_lsn_wal_transition_rejects_malformed_and_preserves_results \
+            --output .p2p/work/issue-1097-verified-production-lsn/evidence/lsn-candidate-binding.json
+
+      - name: Upload candidate binding evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: lsn-candidate-binding-evidence
+          path: |
+            target/lsn-install-attestation.json
+            target/lsn-full-install-attestation.json
+            .p2p/work/issue-1097-verified-production-lsn/evidence/lsn-candidate-binding.json
+          retention-days: 30
+          if-no-files-found: warn
+
+  # ── A46-14: Full-image PR smoke test ────────────────────────────────────
+  # Runs on ordinary PRs and push-to-main. Sensitive PRs use the larger gate
+  # below instead, so they do not build two images for overlapping coverage.
+  e2e-smoke:
+    name: E2E smoke test (PR gate)
+    needs: detect-e2e-gates
+    runs-on: ubuntu-latest
+    if: >
+      always() &&
+      (github.event_name == 'push' ||
+       (github.event_name == 'pull_request' &&
+        needs.detect-e2e-gates.result == 'success' &&
+        needs.detect-e2e-gates.outputs.dvm_changed != 'true' &&
+        needs.detect-e2e-gates.outputs.security_changed != 'true'))
+    timeout-minutes: 30
+    steps:
+      - name: Free up disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+               "/usr/local/share/boost" "$AGENT_TOOLSDIRECTORY"
+          docker system prune -af
+
+      - uses: actions/checkout@v7
+
+      - name: Setup pgrx environment
+        uses: ./.github/actions/setup-pgrx
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Restore Docker image cache (postgres:18.6)
+        uses: actions/cache@v6
+        id: cache-docker-postgres-smoke
+        with:
+          path: /tmp/docker-images/postgres-18.6.tar
+          key: docker-postgres-18.6
+
+      - name: Load or pull postgres:18.6
+        run: |
+          if [ -f /tmp/docker-images/postgres-18.6.tar ]; then
+            docker load --input /tmp/docker-images/postgres-18.6.tar
+          else
+            docker pull postgres:18.6
+            mkdir -p /tmp/docker-images
+            docker save postgres:18.6 --output /tmp/docker-images/postgres-18.6.tar
+          fi
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        continue-on-error: true  # GHCR login is optional (cache pull only); transient timeouts must not fail the job
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Pull builder image from GHCR
+        run: |
+          # Pull the pre-built builder image to avoid a ~30–60 min local build.
+          # Falls back to building locally if the GHCR image is unavailable.
+          if docker pull ghcr.io/trickle-labs/pg-trickle/builder:pg18 2>/dev/null; then
+            docker tag ghcr.io/trickle-labs/pg-trickle/builder:pg18 pg_trickle_builder:pg18
+            echo "BUILDER_IMAGE=ghcr.io/trickle-labs/pg-trickle/builder:pg18" >> "$GITHUB_ENV"
+            echo "Builder image pulled from GHCR — skipping local build"
+          else
+            echo "::warning::Builder image not in GHCR (first run?). Will build locally."
+          fi
+
+      - name: Build E2E Docker image
+        env:
+          BUILDX_CACHE_SCOPE: pgtrickle-e2e
+        run: ./tests/build_e2e_image.sh
+
+      - name: Run E2E smoke tests
+        run: cargo nextest run --profile ci --test e2e_smoke_tests --test-threads 4
+
+  # ── E2E tests (full extension in Docker, Linux only) ────────────────────
+  # Skipped on PRs (takes ~20 min to build the Docker image). Runs on
+  # schedule and manual dispatch only (not push-to-main — too slow).
+  e2e-tests:
+    name: E2E tests
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    timeout-minutes: 180
+    steps:
+      - name: Free up disk space
+        run: |
+          df -h
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf "/usr/local/share/boost"
+          sudo rm -rf "$AGENT_TOOLSDIRECTORY"
+          docker system prune -af
+          df -h
+
+      - uses: actions/checkout@v7
+
+      - name: Setup pgrx environment
+        uses: ./.github/actions/setup-pgrx
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Restore Docker image cache (postgres:18.6)
+        uses: actions/cache@v6
+        id: cache-docker-postgres-e2e
+        with:
+          path: /tmp/docker-images/postgres-18.6.tar
+          key: docker-postgres-18.6
+
+      - name: Load or pull postgres:18.6
+        run: |
+          if [ -f /tmp/docker-images/postgres-18.6.tar ]; then
+            docker load --input /tmp/docker-images/postgres-18.6.tar
+          else
+            docker pull postgres:18.6
+            mkdir -p /tmp/docker-images
+            docker save postgres:18.6 --output /tmp/docker-images/postgres-18.6.tar
+          fi
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        continue-on-error: true  # GHCR login is optional (cache pull only); transient timeouts must not fail the job
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Pull builder image from GHCR
+        run: |
+          # Pull the pre-built builder image to avoid a ~30–60 min local build.
+          # Falls back to building locally if the GHCR image is unavailable.
+          if docker pull ghcr.io/trickle-labs/pg-trickle/builder:pg18 2>/dev/null; then
+            docker tag ghcr.io/trickle-labs/pg-trickle/builder:pg18 pg_trickle_builder:pg18
+            echo "BUILDER_IMAGE=ghcr.io/trickle-labs/pg-trickle/builder:pg18" >> "$GITHUB_ENV"
+            echo "Builder image pulled from GHCR — skipping local build"
+          else
+            echo "::warning::Builder image not in GHCR (first run?). Will build locally."
+          fi
+
+      - name: Build E2E Docker image
+        env:
+          BUILDX_CACHE_SCOPE: pgtrickle-e2e
+        run: ./tests/build_e2e_image.sh
+
+      - name: Run E2E test suite
+        run: cargo nextest run --profile ci --test 'e2e_*'
+
+      - name: Run TPC-H-derived correctness tests
+        run: |
+          cargo nextest run --profile ci --test e2e_tpch_tests --run-ignored all
+
+      - name: Run E2E tests with sequential refresh mode
+        env:
+          PGT_PARALLEL_MODE: "off"
+        run: |
+          # Only run tests sensitive to parallel vs sequential scheduling.
+          # Running all 125 e2e_* files in sequential mode takes ~90 min;
+          # this targeted subset covers the refresh/scheduler/concurrent paths.
+          cargo nextest run --profile ci \
+            --test e2e_refresh_tests \
+            --test e2e_scheduler_tests \
+            --test e2e_tier_scheduler_tests \
+            --test e2e_bgworker_tests \
+            --test e2e_concurrent_tests \
+            --test e2e_dag_autorefresh_tests \
+            --test e2e_dag_concurrent_tests
+
+      - name: Publish Test Report
+        uses: mikepenz/action-junit-report@v6
+        if: always()
+        with:
+          report_paths: 'target/nextest/ci/junit.xml'
+          commit: ${{github.event.pull_request.head.sha}}
+
+  # ── Upgrade completeness check (every PR) ───────────────────────────────
+  # Lightweight: validates that the upgrade SQL script covers all objects
+  # in the pgrx-generated full install script. No Docker needed.
+  upgrade-check:
+    name: Upgrade completeness
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Check version references are in sync
+        run: ./scripts/check_version_sync.sh
+
+      - name: Validate capability manifest
+        run: python3 scripts/generate_capability_manifest.py --check
+
+      - name: Validate v0.105.3 qualification and publication gates
+        run: |
+          if grep -q '^version = "0.105.3"$' Cargo.toml; then
+            python3 scripts/v0_105_3_release_gate.py
+          fi
+
+      - name: Check SQL reference completeness (DX-2)
+        run: python3 scripts/gen_sql_reference.py
+
+      - name: Validate saved vector aggregate benchmark evidence
+        run: python3 scripts/check_vector_aggregate_benchmark.py
+
+      - name: Generate test schema (TEST-005)
+        run: mkdir -p tests/generated && python3 scripts/gen_test_schema.py > tests/generated/schema.rs
+
+      - name: Check test schema is up to date (TEST-005)
+        run: python3 scripts/gen_test_schema.py --check
+
+      - name: Validate upgrade script completeness
+        run: |
+          # Auto-discovers all upgrade steps from sql/pg_trickle--X--Y.sql files.
+          # Fails if the chain doesn't reach the current Cargo.toml version.
+          # Scripts with a from-version older than SUPPORT_CUTOFF are kept in
+          # sql/ for PostgreSQL chain compatibility but are not re-validated in
+          # CI (they are stable, fully-tested historical scripts).
+          SUPPORT_CUTOFF="0.40.0"
+          # Returns 0 if version $1 >= $2 (uses sort -V for correctness).
+          version_ge() { printf '%s\n%s' "$2" "$1" | sort -V -C; }
+          current_version=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
+          pairs=()
+          for f in sql/pg_trickle--*--*.sql; do
+            base=$(basename "$f" .sql)
+            from=${base#pg_trickle--}
+            to=${from#*--}
+            from=${from%%--*}
+            if version_ge "$from" "$SUPPORT_CUTOFF"; then
+              pairs+=("$from $to")
+            fi
+          done
+          last_to=$(printf '%s\n' "${pairs[@]}" | awk '{print $2}' | sort -V | tail -1)
+          if [[ "$last_to" != "$current_version" ]]; then
+            echo "ERROR: Latest upgrade script target ($last_to) != Cargo.toml ($current_version)"
+            exit 1
+          fi
+          echo "Checking ${#pairs[@]} upgrade step(s) from v${SUPPORT_CUTOFF}+ ending at v${current_version}"
+          for pair in "${pairs[@]}"; do
+            from=${pair%% *}
+            to=${pair##* }
+            echo "--- Checking: ${from} -> ${to}"
+            scripts/check_upgrade_completeness.sh "$from" "$to"
+          done
+
+  # ── Upgrade E2E tests (daily + manual) ─────────────────────────────────
+  # True version-to-version upgrade tests: install old version, populate
+  # data, run ALTER EXTENSION UPDATE, verify everything works.
+  # A prepare job discovers all upgrade pairs from sql/pg_trickle--X--Y.sql
+  # files plus the full oldest→current chain, then fans out to a matrix.
+
+  # ── Upgrade E2E slice (nightly + manual only) ──────────────────────────
+  # Moved off PR CI in v0.47.0 (upgrade support policy: v0.40.0+ cutoff).
+  # The completeness check (above) still runs on every PR.
+  # Full upgrade E2E tests run on schedule/manual dispatch only.
+  upgrade-e2e-pr-slice:
+    name: Upgrade E2E slice (nightly/manual)
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Detect changed files
+        id: changes
+        run: |
+          # Determine whether upgrade-sensitive files were modified.
+          BASE="${{ github.event.pull_request.base.sha }}"
+          HEAD="${{ github.event.pull_request.head.sha }}"
+          changed=$(git diff --name-only "$BASE" "$HEAD" 2>/dev/null || git diff --name-only HEAD~1 HEAD)
+          echo "Changed files:"
+          echo "$changed"
+          # Trigger if any of these paths changed:
+          if echo "$changed" | grep -qE '^(sql/|src/config\.rs|src/cdc\.rs|src/api/)'; then
+            echo "run_upgrade_slice=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run_upgrade_slice=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Setup pgrx environment
+        if: steps.changes.outputs.run_upgrade_slice == 'true'
+        uses: ./.github/actions/setup-pgrx
+
+      - name: Pull postgres:18.6 image
+        if: steps.changes.outputs.run_upgrade_slice == 'true'
+        run: docker pull postgres:18.6
+
+      - name: Determine latest upgrade pair
+        if: steps.changes.outputs.run_upgrade_slice == 'true'
+        id: pair
+        run: |
+          # Find the most recent X→Y SQL upgrade script (highest Y).
+          latest=$(ls sql/pg_trickle--*--*.sql | sort -V | tail -1)
+          base=$(basename "$latest" .sql)
+          from=${base#pg_trickle--}
+          to=${from#*--}
+          from=${from%%--*}
+          echo "from=$from" >> "$GITHUB_OUTPUT"
+          echo "to=$to"     >> "$GITHUB_OUTPUT"
+          echo "PR upgrade slice: ${from} → ${to}"
+
+      - name: Build extension package (lite base image)
+        if: steps.changes.outputs.run_upgrade_slice == 'true'
+        run: |
+          # Build the extension artifacts via cargo pgrx package so we can
+          # create a lite base Docker image without the full ~10-min builder.
+          cargo pgrx package --features pg18 \
+            --pg-config /usr/lib/postgresql/18/bin/pg_config
+          # Stage into _e2e_pkg/ — target/ is excluded by .dockerignore so
+          # files cannot be COPY-ed from there directly.
+          rm -rf _e2e_pkg
+          mkdir -p _e2e_pkg/ext _e2e_pkg/lib
+          cp -r target/release/pg_trickle-pg18/usr/share/postgresql/18/extension/. \
+               _e2e_pkg/ext/
+          cp -r target/release/pg_trickle-pg18/usr/lib/postgresql/18/lib/. \
+               _e2e_pkg/lib/
+
+      - name: Build lite E2E base image
+        if: steps.changes.outputs.run_upgrade_slice == 'true'
+        run: |
+          # Create pg_trickle_e2e:latest from the staged _e2e_pkg/ artifacts.
+          # The upgrade image Dockerfile layers on top of this base image.
+          docker build \
+            -f tests/Dockerfile.e2e-base-lite \
+            -t pg_trickle_e2e:latest \
+            .
+
+      - name: Build upgrade E2E Docker image
+        if: steps.changes.outputs.run_upgrade_slice == 'true'
+        run: |
+          ./tests/build_e2e_upgrade_image.sh \
+            ${{ steps.pair.outputs.from }} \
+            ${{ steps.pair.outputs.to }}
+
+      - name: Run upgrade E2E slice
+        if: steps.changes.outputs.run_upgrade_slice == 'true'
+        env:
+          PGS_E2E_IMAGE: pg_trickle_upgrade_e2e:latest
+          PGS_UPGRADE_FROM: ${{ steps.pair.outputs.from }}
+          PGS_UPGRADE_TO: ${{ steps.pair.outputs.to }}
+          # Run a curated subset: basic smoke tests that do not require the
+          # full Docker build or long-running soak scenarios.
+          UPGRADE_SLICE: "smoke"
+        run: |
+          cargo nextest run \
+            --profile ci \
+            --test e2e_upgrade_tests \
+            --run-ignored all \
+            -E "test(smoke) | test(basic) | test(catalog)" \
+          || echo "No matching tests — upgrade slice skipped (no smoke/basic/catalog tests found)"
+
+      - name: Report skipped (no upgrade-sensitive changes)
+        if: steps.changes.outputs.run_upgrade_slice == 'false'
+        run: |
+          echo "::notice::Upgrade E2E slice skipped — no SQL/CDC/API/config changes detected."
+
+  upgrade-e2e-prepare:
+    name: Discover upgrade pairs
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    outputs:
+      matrix: ${{ steps.pairs.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v7
+      - id: pairs
+        run: |
+          # v0.47.0 upgrade support policy: only test upgrades from v0.40.0+.
+          # Scripts for older versions remain in sql/ for PostgreSQL chain
+          # compatibility but are no longer E2E tested. The archive
+          # oldest→current chain is omitted for the same reason.
+          SUPPORT_CUTOFF="0.40.0"
+          # Returns 0 if version $1 >= $2 (sort -V for correctness).
+          version_ge() { printf '%s\n%s' "$2" "$1" | sort -V -C; }
+          current_version=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
+          items='['
+          first=true
+          for f in sql/pg_trickle--*--*.sql; do
+            base=$(basename "$f" .sql)
+            from=${base#pg_trickle--}
+            to=${from#*--}
+            from=${from%%--*}
+            # Skip pairs whose from-version predates the support cutoff.
+            if ! version_ge "$from" "$SUPPORT_CUTOFF"; then
+              continue
+            fi
+            if [ "$first" = true ]; then first=false; else items="$items,"; fi
+            items="$items{\"from\":\"$from\",\"to\":\"$to\"}"
+          done
+          items="$items]"
+          echo "matrix={\"include\":$items}" >> "$GITHUB_OUTPUT"
+          echo "Discovered upgrade pairs: $items"
+
+  upgrade-e2e-tests:
+    name: Upgrade E2E (${{ matrix.from }} → ${{ matrix.to }})
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    needs: [e2e-tests, upgrade-e2e-prepare]
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.upgrade-e2e-prepare.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Setup pgrx environment
+        uses: ./.github/actions/setup-pgrx
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        continue-on-error: true  # GHCR login is optional (cache pull only); transient timeouts must not fail the job
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Pull builder image from GHCR
+        run: |
+          # Pull the pre-built builder image to avoid a ~30–60 min local build.
+          # Falls back to building locally if the GHCR image is unavailable.
+          if docker pull ghcr.io/trickle-labs/pg-trickle/builder:pg18 2>/dev/null; then
+            docker tag ghcr.io/trickle-labs/pg-trickle/builder:pg18 pg_trickle_builder:pg18
+            echo "Builder image pulled from GHCR — skipping local build"
+          else
+            echo "::warning::Builder image not in GHCR (first run?). Will build locally."
+          fi
+
+      - name: Build E2E Docker image
+        run: ./tests/build_e2e_image.sh
+
+      - name: Build upgrade E2E Docker image
+        run: ./tests/build_e2e_upgrade_image.sh ${{ matrix.from }} ${{ matrix.to }}
+
+      - name: Run upgrade E2E tests
+        env:
+          PGS_E2E_IMAGE: pg_trickle_upgrade_e2e:latest
+          PGS_UPGRADE_FROM: ${{ matrix.from }}
+          PGS_UPGRADE_TO: ${{ matrix.to }}
+        run: |
+          cargo nextest run --profile ci --test e2e_upgrade_tests --run-ignored all
+
+  # ── Benchmark regression gate ───────────────────────────────────────────
+  # Measures the candidate before the exact PR base to avoid penalizing the
+  # candidate for hosted-runner drift, then fails on material regressions.
+  bench-regression:
+    name: Benchmark regression check
+    runs-on: ubuntu-latest
+    if: (github.event_name == 'pull_request' && github.base_ref == 'main') || (github.event_name == 'workflow_dispatch' && inputs.run_benchmark_regression)
+    timeout-minutes: 90
+    continue-on-error: false
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Setup pgrx environment
+        uses: ./.github/actions/setup-pgrx
+
+      - name: Clear Criterion data restored with Cargo artifacts
+        run: rm -rf target/criterion
+
+      # Separate release-mode build cache for bench binaries.
+      # Other CI jobs use debug mode, so setup-pgrx's target/ cache never
+      # contains target/release artifacts — without this the bench job does a
+      # full 15-20 min release compile on every run.  A restore-key prefix
+      # allows a partial hit on Cargo.lock changes (recompiles new deps only).
+      - name: Cache bench release build artifacts
+        uses: actions/cache@v6
+        with:
+          path: target/release
+          key: v3-cargo-bench-release-${{ runner.os }}-${{ env.ImageOS || 'unknown' }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            v3-cargo-bench-release-${{ runner.os }}-${{ env.ImageOS || 'unknown' }}-
+
+      - name: Fetch PR base for a same-run benchmark baseline
+        env:
+          BENCH_BASE_REF: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || inputs.benchmark_base || github.event.repository.default_branch }}
+        run: |
+          git fetch --no-tags --depth=1 origin "$BENCH_BASE_REF"
+          git worktree add --detach "$RUNNER_TEMP/benchmark-base" FETCH_HEAD
+
+      - name: Measure PR candidate
+        run: |
+          ./scripts/run_benchmarks.sh -- --save-baseline candidate
+        env:
+          BENCH_QUICK: "1"
+          CARGO_TARGET_DIR: ${{ github.workspace }}/target
+
+      - name: Clear PR candidate's current estimates
+        run: find target/criterion -type d -name new -prune -exec rm -rf {} +
+
+      - name: Measure PR base
+        run: |
+          BENCH_PROJECT_DIR="$RUNNER_TEMP/benchmark-base" ./scripts/run_benchmarks.sh -- --save-baseline base
+        env:
+          BENCH_QUICK: "1"
+          CARGO_TARGET_DIR: ${{ github.workspace }}/target
+
+      - name: Restore PR candidate estimates
+        run: |
+          find target/criterion -type d -name new -prune -exec rm -rf {} +
+          find target/criterion -type d -name candidate -print0 | while IFS= read -r -d '' source; do
+            cp -a "$source" "${source%/candidate}/new"
+          done
+
+      - name: Check for regressions
+        run: |
+          if ! python3 scripts/criterion_regression_check.py --baseline base --minimum-delta-ns 250 --require-pairs; then
+            # Shared runners can produce noisy microbenchmark samples. Re-run
+            # the candidate once on the same runner before blocking the PR.
+            find target/criterion -type d -name new -prune -exec rm -rf {} +
+            ./scripts/run_benchmarks.sh -- --baseline base
+            python3 scripts/criterion_regression_check.py --baseline base --minimum-delta-ns 250 --require-pairs
+          fi
+        env:
+          BENCH_QUICK: "1"
+          PGT_BENCH_REGRESSION_THRESHOLD: "0.10"
+
+  # ── Benchmarks (non-blocking, Linux only) ───────────────────────────────
+  # Expensive; run on weekly schedule and manual dispatch only.
+  # On push to main: saves a Criterion baseline so PRs can compare against it.
+  benchmarks:
+    name: Benchmarks
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    timeout-minutes: 45
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Setup pgrx environment
+        uses: ./.github/actions/setup-pgrx
+
+      - name: Clear Criterion data restored with Cargo artifacts
+        run: rm -rf target/criterion
+
+      - name: Cache bench release build artifacts
+        uses: actions/cache@v6
+        with:
+          path: target/release
+          key: v3-cargo-bench-release-${{ runner.os }}-${{ env.ImageOS || 'unknown' }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            v3-cargo-bench-release-${{ runner.os }}-${{ env.ImageOS || 'unknown' }}-
+
+      - name: Run benchmarks and save baseline
+        run: ./scripts/run_benchmarks.sh -- --save-baseline main
+        env:
+          BENCH_QUICK: "1"
+
+      - name: Save Criterion baseline to cache
+        if: (github.event_name == 'push' && github.ref == 'refs/heads/main') || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main')
+        uses: actions/cache/save@v6
+        with:
+          path: target/criterion
+          key: criterion-baseline-${{ github.sha }}
+
+      - name: Upload benchmark results
+        uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: benchmark-results
+          path: target/criterion/
+          retention-days: 7
+          if-no-files-found: ignore
+
+  # ── DAG benchmark tests — calc/throughput (daily + manual) ───────────────
+  # All DAG topology benchmarks excluding parallel-worker variants.
+  # 15 tests × ~15 s each ≈ well under 30 min. Non-blocking (continue-on-error).
+  dag-bench-calc:
+    name: DAG bench (calc/throughput)
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    timeout-minutes: 30
+    continue-on-error: true
+    steps:
+      - name: Free up disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+               "/usr/local/share/boost" "$AGENT_TOOLSDIRECTORY"
+          docker system prune -af
+
+      - uses: actions/checkout@v7
+
+      - name: Setup pgrx environment
+        uses: ./.github/actions/setup-pgrx
+
+      - name: Restore Docker image cache (postgres:18.6)
+        uses: actions/cache@v6
+        id: cache-docker-postgres-dag-calc
+        with:
+          path: /tmp/docker-images/postgres-18.6.tar
+          key: docker-postgres-18.6
+
+      - name: Load or pull postgres:18.6
+        run: |
+          if [ -f /tmp/docker-images/postgres-18.6.tar ]; then
+            docker load --input /tmp/docker-images/postgres-18.6.tar
+          else
+            docker pull postgres:18.6
+            mkdir -p /tmp/docker-images
+            docker save postgres:18.6 --output /tmp/docker-images/postgres-18.6.tar
+          fi
+
+      - name: Build E2E Docker image
+        run: ./tests/build_e2e_image.sh
+
+      - name: Run DAG benchmark tests (calc/throughput)
+        run: |
+          cargo nextest run --profile ci \
+            --test e2e_dag_bench_tests \
+            --run-ignored ignored-only \
+            -E 'not test(/par[0-9]+/)'
+
+  # ── DAG benchmark tests — parallel workers (daily + manual) ──────────────
+  # DAG topology benchmarks with 4–8 parallel background workers.
+  # 6 tests × ~12 min each ≈ 72 min serially. Non-blocking (continue-on-error).
+  dag-bench-parallel:
+    name: DAG bench (parallel workers)
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    timeout-minutes: 120
+    continue-on-error: true
+    steps:
+      - name: Free up disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+               "/usr/local/share/boost" "$AGENT_TOOLSDIRECTORY"
+          docker system prune -af
+
+      - uses: actions/checkout@v7
+
+      - name: Setup pgrx environment
+        uses: ./.github/actions/setup-pgrx
+
+      - name: Restore Docker image cache (postgres:18.6)
+        uses: actions/cache@v6
+        id: cache-docker-postgres-dag-par
+        with:
+          path: /tmp/docker-images/postgres-18.6.tar
+          key: docker-postgres-18.6
+
+      - name: Load or pull postgres:18.6
+        run: |
+          if [ -f /tmp/docker-images/postgres-18.6.tar ]; then
+            docker load --input /tmp/docker-images/postgres-18.6.tar
+          else
+            docker pull postgres:18.6
+            mkdir -p /tmp/docker-images
+            docker save postgres:18.6 --output /tmp/docker-images/postgres-18.6.tar
+          fi
+
+      - name: Build E2E Docker image
+        run: ./tests/build_e2e_image.sh
+
+      - name: Run DAG benchmark tests (parallel workers)
+        run: |
+          cargo nextest run --profile ci \
+            --test e2e_dag_bench_tests \
+            --run-ignored ignored-only \
+            -E 'test(/par[0-9]+/)'
+
+  # ── dbt-pgtrickle integration tests (Linux only) ──────────────────────────
+  # Cost-optimized: single job builds the Docker image once, then tests
+  # against dbt-core min (1.9) and max (1.10). Intermediate versions are
+  # skipped — if both boundary versions pass, the middle ones will too.
+  # dbt-postgres 1.11 does not exist; 1.10 is the latest paired release.
+  # Runs on weekly schedule and manual dispatch only (slow Docker build).
+  dbt-integration:
+    name: dbt integration
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Build E2E Docker image
+        run: ./tests/build_e2e_image.sh
+
+      - name: Start PostgreSQL with pg_trickle
+        run: |
+          docker run -d \
+            --name pgtrickle-dbt-test \
+            -e POSTGRES_PASSWORD=postgres \
+            -p 5432:5432 \
+            pg_trickle_e2e:latest
+
+          # Wait until the pg_trickle extension is fully installed.
+          # pg_isready returns true before docker-entrypoint-initdb.d scripts
+          # finish, which can cause a race condition if we try to CREATE
+          # EXTENSION concurrently with the initdb.d script.  Polling
+          # pg_extension directly ensures initdb.d has completed.
+          echo "Waiting for pg_trickle extension to be ready..."
+          for i in $(seq 1 60); do
+            if docker exec pgtrickle-dbt-test \
+              psql -U postgres -qtAc \
+                "SELECT 1 FROM pg_extension WHERE extname='pg_trickle'" \
+              2>/dev/null | grep -q 1; then
+              echo "pg_trickle extension is ready (attempt $i)"
+              break
+            fi
+            sleep 1
+          done
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.11'
+
+      - name: Test with dbt 1.9 (minimum supported)
+        env:
+          PGHOST: localhost
+          PGPORT: '5432'
+          PGUSER: postgres
+          PGPASSWORD: postgres
+          PGDATABASE: postgres
+        run: |
+          pip install "dbt-core~=1.9.0" "dbt-postgres~=1.9.0"
+          echo "=== dbt version ==="
+          dbt --version
+          cd dbt-pgtrickle/integration_tests
+          dbt deps
+          dbt seed
+          dbt run
+          ./scripts/wait_for_populated.sh order_totals 30
+          ./scripts/wait_for_populated.sh order_totals_auto 30
+          ./scripts/wait_for_populated.sh order_totals_compat 30
+          # T-5: alter flow — change schedule from '1m' to '3m', verify catalog,
+          # then restore so the subsequent full test run sees the original config.
+          cp models/marts/order_totals_compat.sql models/marts/order_totals_compat.sql.bak
+          sed -i "s/schedule='1m'/schedule='3m'/" models/marts/order_totals_compat.sql
+          dbt run --select order_totals_compat
+          dbt test --select assert_compat_alter_applied
+          mv models/marts/order_totals_compat.sql.bak models/marts/order_totals_compat.sql
+          # Restore catalog to '1m' so assert_compat_model_created passes in the
+          # general test run (catalog was left at '3m' after the alter above).
+          dbt run --select order_totals_compat
+          # assert_compat_alter_applied requires the alter state; exclude it from
+          # the general test run where the schedule is back to '1m'.
+          dbt test --exclude assert_compat_alter_applied
+          dbt run --full-refresh
+          ./scripts/wait_for_populated.sh order_totals 30
+          ./scripts/wait_for_populated.sh order_totals_auto 30
+          ./scripts/wait_for_populated.sh order_totals_compat 30
+          dbt test --exclude assert_compat_alter_applied
+          dbt run-operation pgtrickle_refresh --args '{model_name: order_totals}'
+          dbt run-operation pgtrickle_check_freshness
+          dbt run-operation drop_all_stream_tables
+
+      - name: Test with dbt 1.10 (latest supported)
+        env:
+          PGHOST: localhost
+          PGPORT: '5432'
+          PGUSER: postgres
+          PGPASSWORD: postgres
+          PGDATABASE: postgres
+        run: |
+          pip install "dbt-core~=1.10.0" "dbt-postgres~=1.10.0"
+          echo "=== dbt version ==="
+          dbt --version
+          cd dbt-pgtrickle/integration_tests
+          dbt deps
+          dbt seed
+          dbt run
+          ./scripts/wait_for_populated.sh order_totals 30
+          ./scripts/wait_for_populated.sh order_totals_auto 30
+          ./scripts/wait_for_populated.sh order_totals_compat 30
+          # T-5: alter flow — change schedule from '1m' to '3m', verify catalog,
+          # then restore so the subsequent full test run sees the original config.
+          cp models/marts/order_totals_compat.sql models/marts/order_totals_compat.sql.bak
+          sed -i "s/schedule='1m'/schedule='3m'/" models/marts/order_totals_compat.sql
+          dbt run --select order_totals_compat
+          dbt test --select assert_compat_alter_applied
+          mv models/marts/order_totals_compat.sql.bak models/marts/order_totals_compat.sql
+          # Restore catalog to '1m' so assert_compat_model_created passes in the
+          # general test run (catalog was left at '3m' after the alter above).
+          dbt run --select order_totals_compat
+          # assert_compat_alter_applied requires the alter state; exclude it from
+          # the general test run where the schedule is back to '1m'.
+          dbt test --exclude assert_compat_alter_applied
+          dbt run --full-refresh
+          ./scripts/wait_for_populated.sh order_totals 30
+          ./scripts/wait_for_populated.sh order_totals_auto 30
+          ./scripts/wait_for_populated.sh order_totals_compat 30
+          dbt test --exclude assert_compat_alter_applied
+          dbt run-operation pgtrickle_refresh --args '{model_name: order_totals}'
+          dbt run-operation pgtrickle_check_freshness
+          dbt run-operation drop_all_stream_tables
+
+      - name: Cleanup
+        if: always()
+        run: docker rm -f pgtrickle-dbt-test 2>/dev/null || true
+
+  # ── dbt Getting Started example (Linux only) ─────────────────────────────
+  # Validates the examples/dbt_getting_started/ project against the E2E image.
+  # Runs on push-to-main, weekly schedule, and manual dispatch only.
+  dbt-getting-started:
+    name: dbt getting-started example
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Build E2E Docker image
+        run: ./tests/build_e2e_image.sh
+
+      - name: Start PostgreSQL with pg_trickle
+        run: |
+          docker run -d \
+            --name pgtrickle-getting-started \
+            -e POSTGRES_PASSWORD=postgres \
+            -p 15433:5432 \
+            pg_trickle_e2e:latest
+
+          # pg_isready returns true before docker-entrypoint-initdb.d scripts
+          # finish, which causes a race condition: dbt tries to connect before
+          # postgres has finished initialising and published the host port.
+          # Poll pg_extension directly to ensure initdb.d has completed before
+          # running dbt (mirrors the approach used in the dbt-integration job).
+          echo "Waiting for pg_trickle extension to be ready..."
+          for i in $(seq 1 60); do
+            if docker exec pgtrickle-getting-started \
+              psql -U postgres -qtAc \
+                "SELECT 1 FROM pg_extension WHERE extname='pg_trickle'" \
+              2>/dev/null | grep -q 1; then
+              echo "pg_trickle extension is ready (attempt $i)"
+              break
+            fi
+            sleep 1
+          done
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+
+      - name: Run Getting Started example (dbt 1.10)
+        env:
+          PGHOST: localhost
+          PGPORT: '15433'
+          PGUSER: postgres
+          PGPASSWORD: postgres
+          PGDATABASE: postgres
+        run: |
+          pip install "dbt-core~=1.10.0" "dbt-postgres~=1.10.0"
+          echo "=== dbt version ==="
+          dbt --version
+          cd examples/dbt_getting_started
+          dbt deps
+          dbt seed
+          dbt run
+          ./scripts/wait_for_populated.sh public.department_tree 30
+          ./scripts/wait_for_populated.sh public.department_stats 30
+          ./scripts/wait_for_populated.sh public.department_report 30
+          dbt test
+
+      - name: Cleanup
+        if: always()
+        run: docker rm -f pgtrickle-getting-started 2>/dev/null || true
+
+  # ── CloudNativePG smoke test (scheduled/manual gate, Linux only) ────────
+  # Runs on weekly schedule and manual dispatch only (requires kind cluster).
+  #
+  # Uses a transitional approach: builds the scratch-based extension image
+  # (cnpg/Dockerfile.ext-build), then creates a composite image combining
+  # the extension with postgres:18.6 for the smoke test. This validates
+  # that the extension image layout is correct and the extension works.
+  #
+  # Once kind supports Kubernetes 1.33 with ImageVolume feature gate, this
+  # should be updated to use .spec.postgresql.extensions directly with the
+  # official CNPG operand image.
+  cnpg-smoke-test:
+    name: CNPG smoke test
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Create kind cluster
+        uses: helm/kind-action@v1
+        with:
+          cluster_name: cnpg-test
+
+      - name: Build extension image (scratch-based)
+        run: |
+          docker build -t pg_trickle-ext:ci \
+            -f cnpg/Dockerfile.ext-build .
+
+      - name: Verify extension image layout
+        run: |
+          ID=$(docker create pg_trickle-ext:ci true)
+          mkdir -p /tmp/ext-verify
+          docker cp "$ID:/lib/" /tmp/ext-verify/lib/
+          docker cp "$ID:/share/" /tmp/ext-verify/share/
+          docker rm "$ID"
+
+          echo "=== Extension image contents ==="
+          find /tmp/ext-verify -type f
+          echo "==============================="
+
+          test -f /tmp/ext-verify/lib/pg_trickle.so
+          test -f /tmp/ext-verify/share/extension/pg_trickle.control
+          ls /tmp/ext-verify/share/extension/pg_trickle--*.sql
+
+          echo "Extension image layout OK"
+
+      - name: Build composite image for smoke test
+        run: |
+          # Transitional: combine extension image with postgres:18.6
+          # until kind supports K8s 1.33 ImageVolume feature gate.
+          # This image is NOT shipped — only used for CI validation.
+          #
+          # CNPG runs containers as UID 26 (postgres in RHEL/CNPG operand
+          # images). The Docker Hub postgres:18.6 image uses UID 999.
+          # Remap so initdb (which CNPG runs as UID 26) can resolve its
+          # user identity from /etc/passwd.
+          cat > /tmp/Dockerfile.cnpg-smoke <<'DOCKERFILE'
+          FROM pg_trickle-ext:ci AS ext
+          FROM postgres:18.6
+          RUN sed -i 's/^postgres:x:999:999:/postgres:x:26:26:/' /etc/passwd && \
+              sed -i 's/^postgres:x:999:/postgres:x:26:/' /etc/group && \
+              chown -R 26:26 /var/lib/postgresql /var/run/postgresql
+          COPY --from=ext /lib/ /usr/lib/postgresql/18/lib/
+          COPY --from=ext /share/extension/ /usr/share/postgresql/18/extension/
+          COPY sql/archive/pg_trickle--0.107.0.sql /usr/share/postgresql/18/extension/
+          DOCKERFILE
+
+          docker build -t pg_trickle:18.6 -f /tmp/Dockerfile.cnpg-smoke .
+
+      - name: Load image into kind
+        run: kind load docker-image pg_trickle:18.6 --name cnpg-test
+
+      - name: Install CNPG operator
+        run: |
+          kubectl apply --server-side -f \
+            https://raw.githubusercontent.com/cloudnative-pg/cloudnative-pg/release-1.25/releases/cnpg-1.25.0.yaml
+          kubectl wait --for=condition=Available \
+            deployment/cnpg-controller-manager \
+            -n cnpg-system \
+            --timeout=120s
+
+      - name: Deploy cluster with extension
+        run: |
+          # Use an inline CI-specific manifest.
+          # imagePullPolicy: Never is required for kind-loaded images.
+          #
+          # Do NOT put shared_preload_libraries here: CNPG propagates
+          # postgresql.conf (incl. shared_preload_libraries) into the
+          # initdb container's temporary PostgreSQL start. If _PG_init()
+          # has any issue in that early phase the initdb pod crashes.
+          # Our _PG_init() already handles the missing-SPL case: it
+          # registers GUCs but skips shmem/bgworker — all DDL/DML still
+          # works. Background scheduler is not needed for a smoke test.
+          kubectl apply -f - <<'EOF'
+          apiVersion: postgresql.cnpg.io/v1
+          kind: Cluster
+          metadata:
+            name: pg-trickle-demo
+          spec:
+            instances: 1
+            imageName: pg_trickle:18.6
+            imagePullPolicy: Never
+            bootstrap:
+              initdb:
+                database: app
+                owner: app
+            storage:
+              size: 1Gi
+              storageClass: standard
+          EOF
+
+      - name: Wait for cluster primary pod
+        run: |
+          echo "Waiting for CNPG Cluster to be ready (up to 8 min)..."
+          kubectl wait cluster/pg-trickle-demo \
+            --for=condition=Ready \
+            --timeout=480s || {
+              echo "--- Cluster status ---"
+              kubectl describe cluster/pg-trickle-demo | tail -40
+              echo "--- Pod status ---"
+              kubectl get pods -l cnpg.io/cluster=pg-trickle-demo -o wide
+              echo "--- Initdb pod logs (most recent) ---"
+              FAILED_POD=$(kubectl get pods \
+                -l cnpg.io/cluster=pg-trickle-demo \
+                --field-selector=status.phase=Failed \
+                -o jsonpath='{.items[-1].metadata.name}' 2>/dev/null || true)
+              if [[ -n "$FAILED_POD" ]]; then
+                echo "Logs for ${FAILED_POD}:"
+                kubectl logs "${FAILED_POD}" --all-containers 2>&1 | tail -60
+              fi
+              exit 1
+            }
+
+          echo "Waiting for primary pod to be Ready (up to 3 min)..."
+          kubectl wait pods \
+            -l cnpg.io/cluster=pg-trickle-demo,role=primary \
+            --for=condition=Ready \
+            --timeout=180s
+
+      - name: Run CNPG smoke test
+        run: |
+          PRIMARY=$(kubectl get pods \
+            -l cnpg.io/cluster=pg-trickle-demo \
+            -l role=primary \
+            -o jsonpath='{.items[0].metadata.name}')
+
+          if [[ -z "$PRIMARY" ]]; then
+            echo "ERROR: no primary pod found"
+            kubectl get pods -l cnpg.io/cluster=pg-trickle-demo
+            exit 1
+          fi
+
+          echo "Primary pod: ${PRIMARY}"
+
+          # Run all checks in a SINGLE psql session.
+          #
+          # Why one session? Without shared_preload_libraries the extension
+          # .so is loaded dynamically when CREATE EXTENSION runs. PostgreSQL
+          # only registers GUCs (SHOW pg_trickle.*) for the lifetime of the
+          # connection that triggered the dynamic load. Separate kubectl exec
+          # calls each start a new backend that hasn't loaded the library yet,
+          # so SHOW pg_trickle.enabled returns "unrecognized configuration parameter".
+          # Consolidating into one session avoids this limitation entirely.
+          #
+          # Note: heredoc (<<EOF) is avoided here because GitHub Actions YAML
+          # parses << as a merge key even inside run: | block scalars,
+          # causing a syntax error. Use -c with a multi-line string instead.
+          kubectl exec "${PRIMARY}" -- \
+            psql -U postgres -d app -v ON_ERROR_STOP=1 -c "
+              CREATE EXTENSION pg_trickle VERSION '0.107.0';
+              SELECT extname, extversion FROM pg_extension WHERE extname = 'pg_trickle';
+              ALTER EXTENSION pg_trickle UPDATE TO '0.108.1';
+              SELECT extname, extversion FROM pg_extension WHERE extname = 'pg_trickle';
+              SHOW pg_trickle.enabled;
+              CREATE TABLE cnpg_test_src (id INT PRIMARY KEY, val TEXT);
+              INSERT INTO cnpg_test_src VALUES (1, 'hello');
+              SELECT pgtrickle.create_stream_table(
+                  'cnpg_test_dt',
+                  'SELECT id, val FROM cnpg_test_src',
+                  '1m',
+                  'FULL'
+              );
+              SELECT * FROM cnpg_test_dt;
+              INSERT INTO cnpg_test_src VALUES (2, 'upgraded');
+              SELECT pgtrickle.refresh_stream_table('cnpg_test_dt');
+              SELECT count(*) FROM cnpg_test_dt;
+              SELECT pgtrickle.drop_stream_table('cnpg_test_dt');
+              DROP TABLE cnpg_test_src;
+            "
+
+          echo "CNPG smoke test passed!"
+
+  # ── Shipping image upgrade qualification ───────────────────────────────
+  # Exercises the image actually published to GHCR, including a supported
+  # previous-version database and the current ALTER EXTENSION path.
+  shipping-image-upgrade:
+    name: Shipping image upgrade
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || github.event_name == 'pull_request'
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Build shipping image
+        run: docker build -t pg_trickle_shipping:ci -f Dockerfile.ghcr .
+
+      - name: Run shipping image upgrade smoke test
+        run: |
+          docker run -d --name pgtrickle-shipping-upgrade \
+            -e POSTGRES_PASSWORD=postgres \
+            -p 15432:5432 \
+            pg_trickle_shipping:ci
+          for i in $(seq 1 90); do
+            if docker exec pgtrickle-shipping-upgrade \
+              psql -U postgres -qtAc "SELECT 1" >/dev/null 2>&1; then
+              break
+            fi
+            sleep 2
+          done
+          docker cp sql/archive/pg_trickle--0.107.0.sql \
+            pgtrickle-shipping-upgrade:/usr/share/postgresql/18/extension/
+          docker exec pgtrickle-shipping-upgrade psql -U postgres -v ON_ERROR_STOP=1 -c "
+            DROP EXTENSION pg_trickle CASCADE;
+            CREATE EXTENSION pg_trickle VERSION '0.107.0';
+            CREATE TABLE shipping_upgrade_src (id INT PRIMARY KEY, val TEXT);
+            INSERT INTO shipping_upgrade_src VALUES (1, 'before');
+            ALTER EXTENSION pg_trickle UPDATE TO '0.108.2';
+            SELECT pgtrickle.create_stream_table(
+              'shipping_upgrade_st',
+              'SELECT id, val FROM shipping_upgrade_src',
+              '1m', 'DIFFERENTIAL');
+            INSERT INTO shipping_upgrade_src VALUES (2, 'after');
+            SELECT pgtrickle.refresh_stream_table('shipping_upgrade_st');
+            SELECT extversion FROM pg_extension WHERE extname = 'pg_trickle';
+            SELECT count(*) FROM shipping_upgrade_st;
+          "
+
+      - name: Show container logs on failure
+        if: failure()
+        run: docker logs pgtrickle-shipping-upgrade
+
+      - name: Cleanup
+        if: always()
+        run: docker rm -f pgtrickle-shipping-upgrade 2>/dev/null || true
+
+  # ── CDC crash/WAL qualification ─────────────────────────────────────────
+  # Release qualification for the recovery paths touched by the production
+  # audit. Kept on scheduled/manual runs because these suites restart and
+  # deliberately disrupt PostgreSQL.
+  production-recovery-qualification:
+    name: CDC crash and WAL qualification
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Setup pgrx environment
+        uses: ./.github/actions/setup-pgrx
+
+      - name: Build E2E Docker image
+        run: ./tests/build_e2e_image.sh
+
+      - name: Run crash, WAL, and recovery qualification
+        run: |
+          cargo nextest run --profile ci --run-ignored all \
+            --test e2e_publication_crash_recovery_tests \
+            --test e2e_wal_cdc_tests \
+            --test e2e_failure_recovery_tests \
+            --test resilience_tests
+
+  # TEST-10 (TPC-H nightly SF-1 + SF-10) has been moved to
+  # .github/workflows/tpch-nightly.yml because it can exceed 120 min and
+  # must not block the ci.yml gate.
+
+  # ── CI-1: Sensitive E2E gates on PRs ───────────────────────────────────
+  # One detector feeds both the smoke and sensitive gates. This keeps a PR
+  # from building the same E2E image twice when path sets overlap.
+  detect-e2e-gates:
+    name: Detect sensitive E2E paths
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request' || github.event_name == 'push'
+    outputs:
+      dvm_changed: ${{ steps.filter.outputs.dvm_changed }}
+      security_changed: ${{ steps.filter.outputs.security_changed }}
+      failure_recovery_changed: ${{ steps.filter.outputs.failure_recovery_changed }}
+      unsafe_boundary_changed: ${{ steps.filter.outputs.unsafe_boundary_changed }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Filter changed paths
+        id: filter
+        uses: dorny/paths-filter@v4
+        with:
+          filters: |
+            dvm_changed:
+              - 'src/dvm/**'
+              - 'src/refresh/**'
+              - 'src/cdc/**'
+            security_changed:
+              - 'src/ivm.rs'
+              - 'src/cdc/**'
+              - 'src/refresh/**'
+              - 'sql/*.sql'
+            failure_recovery_changed:
+              - 'src/api/refresh_ops.rs'
+              - 'src/config/scheduler.rs'
+              - 'src/scheduler/**'
+              - 'tests/e2e_failure_recovery_tests.rs'
+              - 'tests/e2e_refresh_atomicity_tests.rs'
+              - 'tests/e2e_dvm_failpoint_tests.rs'
+              - 'tests/e2e_cleanup_chaos_tests.rs'
+              - 'scripts/run_failure_recovery_repetition.sh'
+              - '.github/workflows/ci.yml'
+            unsafe_boundary_changed:
+              - 'Cargo.toml'
+              - 'src/error.rs'
+              - 'src/refresh/pipeline.rs'
+              - 'src/api/security_context.rs'
+              - 'src/api/refresh_ops.rs'
+              - 'src/api/outbox.rs'
+              - 'src/scheduler/dispatch.rs'
+              - 'tests/e2e_unsafe_boundary_tests.rs'
+              - 'tests/e2e/mod.rs'
+              - 'tests/Dockerfile.e2e-asan'
+              - 'tests/fixtures/asan_probe.c'
+              - 'tests/fixtures/asan_pg18_leak.supp'
+              - 'tests/fixtures/initdb-asan-wrapper.sh'
+              - '.github/workflows/ci.yml'
+
+  unsafe-boundary-asan:
+    name: Unsafe boundary ASan qualification
+    needs: detect-e2e-gates
+    if: >
+      github.event_name == 'pull_request' &&
+      needs.detect-e2e-gates.outputs.unsafe_boundary_changed == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Setup pgrx environment
+        uses: ./.github/actions/setup-pgrx
+
+      - name: Build and run the required instrumented slice
+        run: |
+          docker build --platform=linux/amd64 \
+            -f tests/Dockerfile.e2e-asan \
+            -t pg_trickle_e2e_asan:contract .
+          PGS_E2E_IMAGE=pg_trickle_e2e_asan:contract \
+            cargo test --test e2e_unsafe_boundary_tests \
+              --features pg18,e2e-unsafe-test-hooks -- --test-threads=1 --nocapture
+
+  e2e-sensitive-gate:
+    name: Sensitive E2E gate
+    needs: detect-e2e-gates
+    if: >
+      github.event_name == 'pull_request' &&
+      (needs.detect-e2e-gates.outputs.dvm_changed == 'true' ||
+       needs.detect-e2e-gates.outputs.security_changed == 'true' ||
+       needs.detect-e2e-gates.outputs.failure_recovery_changed == 'true')
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Free up disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            "/usr/local/share/boost" "$AGENT_TOOLSDIRECTORY"
+          docker system prune -af
+
+      - uses: actions/checkout@v7
+
+      - name: Setup pgrx environment
+        uses: ./.github/actions/setup-pgrx
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Restore Docker image cache (postgres:18.6)
+        uses: actions/cache@v6
+        id: cache-docker-postgres-dvm
+        with:
+          path: /tmp/docker-images/postgres-18.6.tar
+          key: docker-postgres-18.6
+
+      - name: Load or pull postgres:18.6
+        run: |
+          if [ -f /tmp/docker-images/postgres-18.6.tar ]; then
+            docker load --input /tmp/docker-images/postgres-18.6.tar
+          else
+            docker pull postgres:18.6
+            mkdir -p /tmp/docker-images
+            docker save postgres:18.6 --output /tmp/docker-images/postgres-18.6.tar
+          fi
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        continue-on-error: true  # GHCR login is optional (cache pull only); transient timeouts must not fail the job
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Pull builder image from GHCR
+        run: |
+          if docker pull ghcr.io/trickle-labs/pg-trickle/builder:pg18 2>/dev/null; then
+            docker tag ghcr.io/trickle-labs/pg-trickle/builder:pg18 pg_trickle_builder:pg18
+            echo "BUILDER_IMAGE=ghcr.io/trickle-labs/pg-trickle/builder:pg18" >> "$GITHUB_ENV"
+            echo "Builder image pulled from GHCR — skipping local build"
+          else
+            echo "::warning::Builder image not in GHCR (first run?). Will build locally."
+          fi
+
+      - name: Build E2E Docker image
+        env:
+          BUILDX_CACHE_SCOPE: pgtrickle-e2e
+        run: ./tests/build_e2e_image.sh
+
+      - name: Run full E2E test suite
+        if: needs.detect-e2e-gates.outputs.dvm_changed == 'true'
+        # These scheduler failure schedules run in the dedicated no-retry
+        # repetition step below, isolated from the full-suite container load.
+        run: cargo nextest run --profile ci --test 'e2e_*' -E 'not binary(/^e2e_refresh_atomicity_tests$/)'
+
+      - name: Run security-focused E2E tests
+        if: >
+          needs.detect-e2e-gates.outputs.dvm_changed != 'true' &&
+          needs.detect-e2e-gates.outputs.security_changed == 'true'
+        run: |
+          cargo nextest run --profile ci \
+            --test e2e_safety_tests \
+            --test e2e_ivm_tests \
+            --test e2e_failure_recovery_tests \
+            --test e2e_wal_cdc_tests \
+            --test e2e_rls_wal_tests
+
+      - name: Repeat failure-recovery schedules
+        if: >
+          always() &&
+          needs.detect-e2e-gates.outputs.failure_recovery_changed == 'true'
+        run: bash ./scripts/run_failure_recovery_repetition.sh
+
+      - name: Upload failure-recovery witnesses
+        if: always() && needs.detect-e2e-gates.outputs.failure_recovery_changed == 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: failure-recovery-repetition
+          path: ${{ runner.temp }}/failure-recovery-repetition
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Publish Test Report
+        uses: mikepenz/action-junit-report@v6
+        if: always()
+        with:
+          report_paths: 'target/nextest/ci/junit.xml'
+          commit: ${{ github.event.pull_request.head.sha }}

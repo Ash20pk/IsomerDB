@@ -1,0 +1,86 @@
+# =============================================================================
+# Lightweight Dockerfile for upgrade E2E tests.
+#
+# Extends the standard E2E image (pg_trickle_e2e:latest) by adding:
+#   - The old version's full install SQL (so CREATE EXTENSION VERSION 'X' works)
+#   - All upgrade scripts in the chain (so ALTER EXTENSION UPDATE can chain)
+#
+# Supports multi-hop upgrade chains. For example, upgrading 0.1.3 → 0.7.0:
+#   1. CREATE EXTENSION pg_trickle VERSION '0.1.3'
+#   2. Populate data under the old schema
+#   3. ALTER EXTENSION pg_trickle UPDATE TO '0.7.0'
+#      (PostgreSQL auto-chains through all intermediate upgrade scripts)
+#   4. Verify all objects exist and data is intact
+#
+# The old SQL runs against the new .so binary — this works because:
+#   - We only ADD functions between versions (nothing removed yet)
+#   - MODULE_PATHNAME resolves to the current .so which has all symbols
+#
+# Usage:
+#   docker build -t pg_trickle_upgrade_e2e:latest \
+#     --build-arg FROM_VERSION=0.6.0 \
+#     --build-arg TO_VERSION=0.7.0 \
+#     -f tests/Dockerfile.e2e-upgrade .
+#
+# Prerequisites: pg_trickle_e2e:latest must be built first.
+# =============================================================================
+
+ARG BASE_IMAGE=pg_trickle_e2e:latest
+FROM ${BASE_IMAGE}
+
+# CI-2: The base image runs as 'postgres'; restore root for build steps that
+# write to /usr/share/postgresql/18/extension/.
+USER root
+
+ARG FROM_VERSION=0.6.0
+ARG TO_VERSION=0.7.0
+
+LABEL org.opencontainers.image.title="pg_trickle upgrade E2E test image"
+LABEL org.opencontainers.image.description="PostgreSQL 18.6 with pg_trickle for upgrade path testing (${FROM_VERSION} → ${TO_VERSION})"
+
+# Copy ALL archived install SQL files. This overwrites pgrx-generated
+# install scripts (which contain functions from the *current* source) with
+# the historical snapshots that match each version's actual function set.
+# Without this, CREATE EXTENSION VERSION '0.3.0' would get 0.4.0 functions.
+#
+# The archive COPY also overwrites the *current* release's SQL (e.g.
+# pg_trickle--0.11.0.sql) with a stale snapshot. That snapshot may be missing
+# columns or function signatures added after the archive was cut, causing
+# "unboxing ... argument failed" errors at runtime. We must always preserve
+# the pgrx-generated SQL for the current default_version — regardless of
+# whether TO_VERSION matches the current release or is a historic version.
+#
+# Strategy: read default_version from the control file, save that file before
+# the COPY, restore it after.
+RUN current_ver=$(sed -n "s/^default_version = '\\(.*\\)'$/\\1/p" \
+        /usr/share/postgresql/18/extension/pg_trickle.control) && \
+    cp "/usr/share/postgresql/18/extension/pg_trickle--${current_ver}.sql" \
+       /tmp/pg_trickle--current-release.sql
+COPY sql/archive/pg_trickle--*.sql \
+     /usr/share/postgresql/18/extension/
+# Restore the authoritative pgrx-generated SQL for the current release.
+RUN current_ver=$(sed -n "s/^default_version = '\\(.*\\)'$/\\1/p" \
+        /usr/share/postgresql/18/extension/pg_trickle.control) && \
+    cp /tmp/pg_trickle--current-release.sql \
+       "/usr/share/postgresql/18/extension/pg_trickle--${current_ver}.sql" && \
+    rm /tmp/pg_trickle--current-release.sql
+
+# Copy ALL upgrade scripts so PostgreSQL can automatically chain through
+# intermediate versions (e.g. 0.1.3→0.2.0→0.2.1→0.2.2 via BFS path-finding).
+# Requires at least one script to exist in sql/ — guaranteed by the chain
+# validation in build_e2e_upgrade_image.sh.
+COPY sql/pg_trickle--*--*.sql /usr/share/postgresql/18/extension/
+
+# Remove the auto-create initdb script — upgrade tests control when and
+# which version gets installed.
+RUN rm -f /docker-entrypoint-initdb.d/00-create-pg-trickle.sql
+
+# Verify all required extension files are present
+RUN echo "=== Extension files for upgrade testing ===" && \
+    ls -la /usr/share/postgresql/18/extension/pg_trickle* && \
+    echo "==========================================="
+
+# CI-2: Drop back to unprivileged postgres user for runtime.
+USER postgres
+
+EXPOSE 5432

@@ -1,0 +1,236 @@
+{
+  "manifest_version": 2,
+  "release_version": "0.107.0",
+  "capabilities": [
+    {
+      "id": "trigger-capture",
+      "capability": "trigger_cdc",
+      "major_version": 1,
+      "minor_version": 0,
+      "status": "stable",
+      "enabled": true,
+      "strategy": "trigger",
+      "reason_code": null,
+      "target": null
+    },
+    {
+      "id": "wal-capture",
+      "capability": "wal_cdc",
+      "major_version": 1,
+      "minor_version": 0,
+      "status": "stable",
+      "enabled": true,
+      "strategy": "wal",
+      "reason_code": null,
+      "target": null
+    },
+    {
+      "id": "graph-v1",
+      "capability": "external_graph_refresh",
+      "major_version": 1,
+      "minor_version": 1,
+      "status": "stable",
+      "enabled": true,
+      "strategy": "public_sql",
+      "reason_code": null,
+      "target": null
+    },
+    {
+      "id": "delta-v1",
+      "capability": "output_delta_consumer",
+      "major_version": 1,
+      "minor_version": 0,
+      "status": "stable",
+      "enabled": true,
+      "strategy": "public_sql",
+      "reason_code": null,
+      "target": null
+    },
+    {
+      "id": "vector-aggregates",
+      "capability": "vector_aggregate_dvm",
+      "major_version": 0,
+      "minor_version": 1,
+      "status": "experimental",
+      "enabled": false,
+      "strategy": "differential",
+      "reason_code": "PGT_EXT_CAPABILITY_DISABLED",
+      "target": "pg_trickle.enable_vector_agg=on"
+    },
+    {
+      "id": "set-operation-differential",
+      "capability": "intersect_except_dvm",
+      "major_version": 0,
+      "minor_version": 0,
+      "status": "unavailable",
+      "enabled": false,
+      "strategy": "unavailable",
+      "reason_code": "UNSUPPORTED_OPERATOR",
+      "target": null
+    },
+    {
+      "id": "incremental-window-state",
+      "capability": "incremental_window_state",
+      "major_version": 0,
+      "minor_version": 0,
+      "status": "future",
+      "enabled": false,
+      "strategy": "unavailable",
+      "reason_code": "WINDOW_INCREMENTAL_UNIMPLEMENTED",
+      "target": null
+    }
+  ],
+  "examples": [
+    {
+      "id": "stable-capability-discovery",
+      "test": "test_v104_capabilities_are_stable_by_default",
+      "command": "just test-v104-conformance",
+      "sql": "SELECT * FROM pgtrickle.integration_capabilities()",
+      "outcome": "accepted",
+      "declared_mode": "PUBLIC_SQL",
+      "effective_strategy": "PUBLIC_SQL",
+      "recomputation_scope": "none",
+      "fallback_scope": "none",
+      "reason_code": null
+    },
+    {
+      "id": "graph-v1-reference-coordinator",
+      "test": "test_v104_graph_reference_coordinator_commits_publication",
+      "command": "just test-v104-conformance",
+      "sql": "SELECT * FROM pgtrickle.refresh_graph_strict(...) ",
+      "outcome": "accepted",
+      "declared_mode": "PUBLIC_SQL",
+      "effective_strategy": "PUBLIC_SQL",
+      "recomputation_scope": "none",
+      "fallback_scope": "none",
+      "reason_code": null
+    },
+    {
+      "id": "delta-v1-reference-consumer",
+      "test": "test_v104_delta_reference_consumer_reads_and_acknowledges",
+      "command": "just test-v104-conformance",
+      "sql": "SELECT * FROM pgtrickle.output_delta_batches(...) ",
+      "outcome": "accepted",
+      "declared_mode": "PUBLIC_SQL",
+      "effective_strategy": "PUBLIC_SQL",
+      "recomputation_scope": "none",
+      "fallback_scope": "none",
+      "reason_code": null
+    },
+    {
+      "id": "default-statement-trigger-capture",
+      "test": "test_stmt_cdc_default_trigger_is_statement_level",
+      "command": "bash scripts/run_light_e2e_tests.sh --test e2e_stmt_cdc_tests --filter test_stmt_cdc_default_trigger_is_statement_level",
+      "sql": "SELECT pgtrickle.create_stream_table('s', 'SELECT id FROM source')",
+      "outcome": "accepted",
+      "declared_mode": "AUTO",
+      "effective_strategy": "DIFFERENTIAL",
+      "requested_capture": "trigger",
+      "effective_capture": "TRIGGER",
+      "recomputation_scope": "none",
+      "fallback_scope": "none",
+      "reason_code": null
+    },
+    {
+      "id": "auto-cdc-wal-admission",
+      "test": "test_v107_auto_wal_transition_captures_changes",
+      "command": "cargo test --features pg18 --test e2e_v107_wal_transition_tests test_v107_auto_wal_transition_captures_changes -- --exact --nocapture",
+      "sql": "SELECT pgtrickle.create_stream_table('s', 'SELECT id FROM source', cdc_mode => 'auto')",
+      "outcome": "accepted",
+      "declared_mode": "DIFFERENTIAL",
+      "effective_strategy": "DIFFERENTIAL",
+      "requested_capture": "auto",
+      "effective_capture": "WAL",
+      "recomputation_scope": "none",
+      "fallback_scope": "none",
+      "reason_code": null
+    },
+    {
+      "id": "recursive-cte-recomputation-delta",
+      "test": "test_recursive_cte_non_monotone_agg_subquery_recomputation",
+      "command": "bash scripts/run_light_e2e_tests.sh --test e2e_cte_tests --filter test_recursive_cte_non_monotone_agg_subquery_recomputation",
+      "sql": "WITH RECURSIVE t AS (...) SELECT * FROM t",
+      "outcome": "accepted",
+      "declared_mode": "DIFFERENTIAL",
+      "effective_strategy": "DIFFERENTIAL",
+      "recomputation_scope": "recursive-result",
+      "fallback_scope": "none",
+      "reason_code": "recursive_cte_fallback"
+    },
+    {
+      "id": "window-partition-recomputation",
+      "test": "test_row_number_rejected_candidate_converges_via_partition_recompute",
+      "command": "bash scripts/run_light_e2e_tests.sh --test e2e_window_incremental_tests --filter test_row_number_rejected_candidate_converges_via_partition_recompute",
+      "sql": "SELECT id, ROW_NUMBER() OVER (PARTITION BY grp ORDER BY id) FROM source",
+      "outcome": "accepted",
+      "declared_mode": "DIFFERENTIAL",
+      "effective_strategy": "DIFFERENTIAL",
+      "recomputation_scope": "partition",
+      "fallback_scope": "none",
+      "reason_code": "WINDOW_RECOMPUTE_CHEAPER"
+    },
+    {
+      "id": "nullable-group-key-rescan",
+      "test": "test_v0873_mandatory_composition_matrix",
+      "command": "bash scripts/run_light_e2e_tests.sh --test e2e_dvm_composition_tests --filter test_v0873_mandatory_composition_matrix",
+      "sql": "SELECT nullable_key, STRING_AGG(value, ',') FROM source GROUP BY nullable_key",
+      "outcome": "accepted",
+      "declared_mode": "DIFFERENTIAL",
+      "effective_strategy": "DIFFERENTIAL",
+      "recomputation_scope": "group",
+      "fallback_scope": "none",
+      "reason_code": null
+    },
+    {
+      "id": "intersect-auto-full",
+      "test": "test_diff_full_equivalence_intersect",
+      "command": "bash scripts/run_light_e2e_tests.sh --test e2e_diff_full_equivalence_tests --filter test_diff_full_equivalence_intersect",
+      "sql": "SELECT value FROM left_source INTERSECT SELECT value FROM right_source",
+      "outcome": "accepted",
+      "declared_mode": "AUTO",
+      "effective_strategy": "FULL",
+      "recomputation_scope": "whole-query",
+      "fallback_scope": "whole-query",
+      "reason_code": "UNSUPPORTED_OPERATOR"
+    },
+    {
+      "id": "mutable-case-aggregate-full-fallback",
+      "test": "test_dvm1_case_in_list_mutable_full_fallback",
+      "command": "bash scripts/run_light_e2e_tests.sh --test e2e_v078_tests --filter test_dvm1_case_in_list_mutable_full_fallback",
+      "sql": "SELECT key, SUM(CASE WHEN value IN (...) THEN amount ELSE 0 END) FROM source GROUP BY key",
+      "outcome": "accepted",
+      "declared_mode": "DIFFERENTIAL",
+      "effective_strategy": "DIFFERENTIAL",
+      "recomputation_scope": "whole-query",
+      "fallback_scope": "whole-query",
+      "reason_code": "CASE_IN_LIST_DVM_DRIFT_FULL_FALLBACK"
+    }
+  ],
+  "stable_reason_identifiers": [
+    "CASE_IN_LIST_DVM_DRIFT_FULL_FALLBACK",
+    "PGT_EXT_CAPABILITY_DISABLED",
+    "PGT_EXT_CDC_UNAVAILABLE",
+    "UNSUPPORTED_OPERATOR",
+    "VOLATILE_FUNCTION",
+    "recursive_cte_fallback",
+    "WINDOW_INCREMENTAL_UNIMPLEMENTED",
+    "WINDOW_RECOMPUTE_CHEAPER"
+  ],
+  "documentation": {
+    "canonical_manifest": "docs/capability-manifest.json",
+    "generated_summary": "docs/SUPPORT_SUMMARY.md",
+    "reconciled_sources": [
+      "README.md",
+      "docs/SUPPORT_SUMMARY.md",
+      "docs/DVM_SUPPORT_MATRIX.md",
+      "docs/CDC_MODES.md",
+      "docs/SQL_REFERENCE.md",
+      "docs/GUC_CATALOG.md",
+      "docs/CONFIGURATION.md",
+      "docs/QUICKSTART_5MIN.md",
+      "docs/OPS_CHEATSHEET.md",
+      "docs/integrations/citus.md",
+      "docs/integrations/extension-contracts.md"
+    ]
+  }
+}

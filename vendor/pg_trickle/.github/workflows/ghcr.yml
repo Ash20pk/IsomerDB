@@ -1,0 +1,345 @@
+# =============================================================================
+# GHCR Image Workflow — Build, smoke-test, and publish the pg_trickle image
+# to GitHub Container Registry.
+#
+# Published image: ghcr.io/trickle-labs/pg_trickle
+# Tags produced:
+#   <version>-pg18.6          — immutable, e.g. 0.13.0-pg18.6
+#   latest                    — moves to the most recent release
+#   pg18                      — floating alias for the latest 18.x build
+#
+# Multi-platform: linux/amd64 + linux/arm64 using native runners (no QEMU).
+#   - amd64 builds on ubuntu-latest
+#   - arm64 builds on ubuntu-24.04-arm (native ARM runner)
+#
+# Architecture:
+#   1. build (matrix) — compile & push single-platform images by digest
+#   2. smoke-test     — validate the amd64 image
+#   3. merge          — combine digests into a multi-arch manifest & push tags
+#
+# Triggered only after the Release workflow completes successfully for a tag.
+# =============================================================================
+name: GHCR image (build + publish)
+
+on:
+  workflow_run:
+    workflows: ["Release"]
+    types: [completed]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository_owner }}/pg_trickle
+  PG_MINOR: "18.6"
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  preflight:
+    name: Version sync check
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      startsWith(github.event.workflow_run.head_branch, 'v')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+
+      - name: Check version references are in sync
+        env:
+          RELEASE_TAG: ${{ github.event.workflow_run.head_branch }}
+        run: ./scripts/check_version_sync.sh --expected-tag "$RELEASE_TAG"
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # Job 1: Build each platform natively and push by digest
+  # ════════════════════════════════════════════════════════════════════════════
+  build:
+    name: Build (${{ matrix.platform }})
+    needs: preflight
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-latest
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+
+      - name: Derive version
+        id: version
+        env:
+          RELEASE_TAG: ${{ github.event.workflow_run.head_branch }}
+        run: |
+          VERSION="${RELEASE_TAG#v}"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "Resolved version: ${VERSION}"
+
+      - name: Docker metadata
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: Dockerfile.ghcr
+          platforms: ${{ matrix.platform }}
+          build-args: |
+            VERSION=${{ steps.version.outputs.version }}
+          outputs: type=image,"name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}",push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=${{ matrix.platform }}
+          cache-to: type=gha,scope=${{ matrix.platform }},mode=max
+
+      - name: Export digest
+        run: |
+          mkdir -p ${{ runner.temp }}/digests
+          digest="${{ steps.build.outputs.digest }}"
+          touch "${{ runner.temp }}/digests/${digest#sha256:}"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@v7
+        with:
+          name: digest-${{ matrix.platform == 'linux/amd64' && 'amd64' || 'arm64' }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # Job 2: Smoke-test the amd64 image
+  # ════════════════════════════════════════════════════════════════════════════
+  smoke-test:
+    name: Smoke test (amd64)
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+
+      - name: Download amd64 digest
+        uses: actions/download-artifact@v8
+        with:
+          name: digest-amd64
+          path: ${{ runner.temp }}/digests
+
+      - name: Resolve digest
+        id: digest
+        run: |
+          DIGEST=$(ls "${{ runner.temp }}/digests" | head -1)
+          echo "sha=sha256:${DIGEST}" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Start smoke container
+        run: |
+          docker run -d \
+            --name pgtrickle-ghcr-smoke \
+            -e POSTGRES_PASSWORD=smoke \
+            "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.digest.outputs.sha }}"
+
+          echo "Waiting for PostgreSQL to be ready..."
+          for i in $(seq 1 30); do
+            if docker exec pgtrickle-ghcr-smoke \
+                pg_isready -U postgres -q 2>/dev/null; then
+              echo "PostgreSQL ready after ${i}s"
+              break
+            fi
+            sleep 2
+          done
+
+      - name: Validate OCI version label
+        run: |
+          ./scripts/check_version_sync.sh \
+            --image "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.digest.outputs.sha }}"
+
+      - name: Smoke test — extension loads and version is correct
+        run: |
+          docker exec pgtrickle-ghcr-smoke \
+            psql -U postgres -v ON_ERROR_STOP=1 -q -c \
+            "CREATE EXTENSION IF NOT EXISTS pg_trickle CASCADE;"
+
+          RUNTIME_VERSION=$(docker exec pgtrickle-ghcr-smoke \
+            psql -U postgres -Atqc "SELECT pgtrickle.version()")
+          EXTENSION_VERSION=$(docker exec pgtrickle-ghcr-smoke \
+            psql -U postgres -Atqc \
+            "SELECT extversion FROM pg_extension WHERE extname = 'pg_trickle'")
+
+          test "$RUNTIME_VERSION" = "${{ needs.build.outputs.version }}"
+          test "$EXTENSION_VERSION" = "${{ needs.build.outputs.version }}"
+
+      - name: Smoke test — stream table lifecycle
+        run: |
+          docker exec pgtrickle-ghcr-smoke \
+            psql -U postgres -v ON_ERROR_STOP=1 -c "
+              CREATE TABLE smoke_src (id INT PRIMARY KEY, v INT);
+              INSERT INTO smoke_src VALUES (1, 10), (2, 20);
+
+              SELECT pgtrickle.create_stream_table(
+                'smoke_mv',
+                'SELECT id, v * 2 AS doubled FROM smoke_src'
+              );
+
+              SELECT pgtrickle.refresh_stream_table('smoke_mv');
+
+              SELECT count(*) AS row_count FROM smoke_mv;
+              SELECT * FROM smoke_mv ORDER BY id;
+            "
+
+      - name: Smoke test — catalog tables present
+        run: |
+          docker exec pgtrickle-ghcr-smoke \
+            psql -U postgres -v ON_ERROR_STOP=1 -c "
+              SELECT count(*) FROM pgtrickle.pgt_stream_tables;
+              SELECT count(*) FROM pgtrickle.pgt_watermarks;
+              SELECT count(*) FROM pgtrickle.pgt_watermark_groups;
+            "
+
+      - name: Smoke test — GUC defaults are applied
+        run: |
+          docker exec pgtrickle-ghcr-smoke \
+            psql -U postgres -v ON_ERROR_STOP=1 -c "
+              SELECT name, setting, unit
+              FROM pg_settings
+              WHERE name IN (
+                'shared_preload_libraries',
+                'wal_level',
+                'max_replication_slots',
+                'max_worker_processes',
+                'shared_buffers',
+                'pg_trickle.enabled',
+                'pg_trickle.cdc_mode',
+                'pg_trickle.parallel_refresh_mode'
+              )
+              ORDER BY name;
+            "
+
+      - name: Tear down smoke container
+        if: always()
+        run: docker rm -f pgtrickle-ghcr-smoke 2>/dev/null || true
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # Job 3: Merge per-platform digests into a multi-arch manifest
+  # ════════════════════════════════════════════════════════════════════════════
+  merge:
+    name: Merge + publish manifest
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      startsWith(github.event.workflow_run.head_branch, 'v')
+    needs: [build, smoke-test]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+
+      - name: Derive version
+        id: version
+        env:
+          RELEASE_TAG: ${{ github.event.workflow_run.head_branch }}
+        run: |
+          VERSION="${RELEASE_TAG#v}"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Docker metadata
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=${{ steps.version.outputs.version }}-pg${{ env.PG_MINOR }}
+            type=raw,value=pg18
+            type=raw,value=latest
+          labels: |
+            org.opencontainers.image.title=pg_trickle
+            org.opencontainers.image.description=PostgreSQL ${{ env.PG_MINOR }} with pg_trickle streaming tables and incremental view maintenance
+            org.opencontainers.image.vendor=trickle-labs
+            org.opencontainers.image.licenses=Apache-2.0
+            org.opencontainers.image.documentation=https://github.com/trickle-labs/pg-trickle/blob/main/docs/GETTING_STARTED.md
+
+      - name: Download all digests
+        uses: actions/download-artifact@v8
+        with:
+          path: ${{ runner.temp }}/digests
+          pattern: digest-*
+          merge-multiple: true
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create and push multi-arch manifest
+        working-directory: ${{ runner.temp }}/digests
+        run: |
+          TAGS=$(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON")
+          SOURCES=$(printf '${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@sha256:%s ' *)
+          # shellcheck disable=SC2086
+          docker buildx imagetools create $TAGS $SOURCES
+
+      - name: Inspect manifest
+        run: |
+          docker buildx imagetools inspect \
+            "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.version }}"
+
+      # ── Summary ──────────────────────────────────────────────────────────
+      - name: Print summary
+        if: always()
+        run: |
+          echo "## GHCR publish summary" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Item | Value |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|------|-------|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Version | \`${{ steps.version.outputs.version }}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| PostgreSQL | ${{ env.PG_MINOR }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Platforms | linux/amd64 · linux/arm64 |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Registry | \`${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "**Tags pushed:**" >> "$GITHUB_STEP_SUMMARY"
+          echo "\`\`\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "${{ steps.meta.outputs.tags }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "\`\`\`" >> "$GITHUB_STEP_SUMMARY"
