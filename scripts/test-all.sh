@@ -28,7 +28,7 @@ docker compose --profile attach --profile test up -d
 healthy
 sleep 5
 for t in scripts/smoke.sh tests/phase0.sh tests/phase1.sh tests/phase2.sh tests/phase3.sh tests/native.sh \
-         tests/routing.sh tests/history.sh; do
+         tests/routing.sh tests/history.sh tests/freshness.sh; do
   run "$t"
 done
 
@@ -40,6 +40,7 @@ if [ "${1:-all}" = "all" ]; then
   run tests/multinode.sh
   run tests/routing.sh
   run tests/history.sh
+  run tests/freshness.sh
 fi
 
 if [ ${#failed[@]} -eq 0 ]; then echo "### all checks passed"; else echo "### failed: ${failed[*]}"; exit 1; fi

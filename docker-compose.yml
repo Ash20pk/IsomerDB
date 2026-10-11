@@ -30,6 +30,9 @@ services:
       db:
         condition: service_healthy
     command: ["documentdb_gateway", "/etc/isomerdb/gateway.json"]
+    environment:
+      # 1: a read of a projection waits for the client's gossiped $clusterTime (implicit causal reads).
+      ISOMER_IMPLICIT_CAUSAL: ${ISOMER_IMPLICIT_CAUSAL:-0}
     volumes:
       - pgsocket:/var/run/postgresql
     ports:

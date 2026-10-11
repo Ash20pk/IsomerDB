@@ -9,6 +9,17 @@
  *     its causally-consistent session to the token returned by isomer.last_write_token()
  *     (session.advanceOperationTime(Timestamp(t, i))), and the driver sends it on every read.
  *
+ * Responses carry cluster time the way MongoDB's do, so causal sessions work unchanged:
+ *   * writes return operationTime and $clusterTime: the cluster clock after the write;
+ *   * reads of a projection return operationTime: the newest token the projection reflects
+ *     (isomer.freshness), which is the read's freshness (PRD FR-R5).
+ * $clusterTime is only returned on writes, so a client's gossiped $clusterTime is advanced by its
+ * own writes alone. With ISOMER_IMPLICIT_CAUSAL=1, a projection read that carries $clusterTime but
+ * no afterClusterTime waits for it, giving read-your-writes on implicit sessions (FR-R4a).
+ * Drivers only send a session's cluster time on a connection that has received one itself, so in
+ * that mode the hello handshake returns a zero $clusterTime: it starts every connection's cluster
+ * time without making any read wait.
+ *
  * Token <-> Timestamp: a token is the Citus cluster clock packed as (ms << 22) | counter, and a
  * Mongo Timestamp(t, i) carries it as t = ms / 1000, i = ((ms % 1000) << 22) | counter, which is
  * lossless (i < 1000 * 2^22 < 2^32) and order-preserving.
@@ -18,6 +29,7 @@
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
+use bson::{rawdoc, spec::BinarySubtype, Binary, RawDocumentBuf, Timestamp};
 use dashmap::DashMap;
 use tokio_postgres::types::Type;
 
@@ -26,6 +38,7 @@ use crate::{
     error::{DocumentDBError, ErrorCode, Result},
     postgres::{conn_mgmt::StatementError, PgDataClient},
     requests::RequestType,
+    responses::{RawResponse, Response},
 };
 
 /// How long a "is this collection a projection?" answer is reused.
@@ -82,6 +95,27 @@ fn after_cluster_time(request_context: &RequestContext<'_>) -> Option<(u32, u32)
     let read_concern = request_context.request().document().get_document("readConcern").ok()?;
     let ts = read_concern.get_timestamp("afterClusterTime").ok()?;
     (ts.time != 0 || ts.increment != 0).then_some((ts.time, ts.increment))
+}
+
+/// Whether a gossiped $clusterTime counts as a token on reads that carry no afterClusterTime.
+fn implicit_causal() -> bool {
+    static FLAG: OnceLock<bool> = OnceLock::new();
+    *FLAG.get_or_init(|| {
+        std::env::var("ISOMER_IMPLICIT_CAUSAL").is_ok_and(|v| matches!(v.as_str(), "1" | "true" | "on"))
+    })
+}
+
+fn gossiped_cluster_time(request_context: &RequestContext<'_>) -> Option<(u32, u32)> {
+    let cluster_time = request_context.request().document().get_document("$clusterTime").ok()?;
+    let ts = cluster_time.get_timestamp("clusterTime").ok()?;
+    (ts.time != 0 || ts.increment != 0).then_some((ts.time, ts.increment))
+}
+
+/// The time a read waits for: afterClusterTime, or with implicit causal mode the client's
+/// gossiped $clusterTime.
+fn read_wait_time(request_context: &RequestContext<'_>) -> Option<(u32, u32)> {
+    after_cluster_time(request_context)
+        .or_else(|| implicit_causal().then(|| gossiped_cluster_time(request_context)).flatten())
 }
 
 fn statement_error(error: StatementError) -> DocumentDBError {
@@ -144,7 +178,7 @@ pub async fn before_request(
     if collection.is_empty() {
         return Ok(());
     }
-    let wait = if read { after_cluster_time(request_context) } else { None };
+    let wait = if read { read_wait_time(request_context) } else { None };
     if read && wait.is_none() {
         return Ok(());
     }
@@ -178,6 +212,100 @@ pub async fn before_request(
     Ok(())
 }
 
+async fn query_token(
+    pg_data_client: &impl PgDataClient,
+    sql: &str,
+    projection: Option<&str>,
+) -> Result<Option<i64>> {
+    let connection = pg_data_client.pull_connection_with_transaction(false).await?;
+    let rows = match projection {
+        Some(p) => connection.query(sql, &[Type::TEXT], &[&p]).await,
+        None => connection.query(sql, &[], &[]).await,
+    }
+    .map_err(statement_error)?;
+    Ok(rows.first().and_then(|r| r.get(0)))
+}
+
+fn append_cluster_time(document: &mut RawDocumentBuf, ts: Timestamp) {
+    // MongoDB without keyfile auth signs cluster time with a zero hash and key id 0.
+    document.append(
+        "$clusterTime",
+        rawdoc! {
+            "clusterTime": ts,
+            "signature": {
+                "hash": Binary { subtype: BinarySubtype::Generic, bytes: vec![0_u8; 20] },
+                "keyId": 0_i64,
+            },
+        },
+    );
+}
+
+/// In implicit causal mode, give the hello handshake a zero $clusterTime (see the module notes).
+pub fn stamp_handshake(document: &mut RawDocumentBuf) {
+    if implicit_causal() && document.get("$clusterTime").ok().flatten().is_none() {
+        append_cluster_time(document, Timestamp { time: 0, increment: 0 });
+    }
+}
+
+fn with_cluster_time(response: &Response, operation_time: i64, gossip: bool) -> Result<Response> {
+    let (time, increment) = timestamp_from_token(operation_time);
+    let ts = Timestamp { time, increment };
+    let mut document = response.as_raw_document()?.to_raw_document_buf();
+    if document.get("operationTime")?.is_none() {
+        document.append("operationTime", ts);
+    }
+    if gossip && document.get("$clusterTime")?.is_none() {
+        append_cluster_time(&mut document, ts);
+    }
+    let raw = RawResponse::new(document);
+    Ok(Response::Raw(if response.has_write_errors() { raw.with_write_errors() } else { raw }))
+}
+
+/// Runs after every successful request. Stamps writes with the cluster time after them, and
+/// reads of projections with the newest token the projection reflects.
+///
+/// # Errors
+///
+/// Returns an error if the cluster time or a projection's freshness can't be read.
+pub async fn after_request(
+    request_context: &RequestContext<'_>,
+    pg_data_client: &impl PgDataClient,
+    response: Response,
+) -> Result<Response> {
+    let request_type = request_context.execution_request_type();
+    let read = is_read(request_type);
+    if !read && !is_write(request_type) {
+        return Ok(response);
+    }
+    if !read {
+        let token = query_token(
+            pg_data_client,
+            "SELECT isomer.current_token() WHERE EXISTS \
+             (SELECT 1 FROM pg_extension WHERE extname = 'isomer')",
+            None,
+        )
+        .await?;
+        return match token {
+            Some(token) => with_cluster_time(&response, token, true),
+            None => Ok(response),
+        };
+    }
+    let request = request_context.request();
+    let Ok(collection) = request.collection() else {
+        return Ok(response);
+    };
+    if collection.is_empty() {
+        return Ok(response);
+    }
+    let Some(projection) = projection_for(pg_data_client, request.db(), collection).await? else {
+        return Ok(response);
+    };
+    match query_token(pg_data_client, "SELECT isomer.freshness($1)", Some(&projection)).await? {
+        Some(token) => with_cluster_time(&response, token, false),
+        None => Ok(response),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -188,6 +316,31 @@ mod tests {
             let (t, i) = timestamp_from_token(token);
             assert_eq!(token_from_timestamp(t, i), token);
         }
+    }
+
+    #[test]
+    fn writes_gossip_cluster_time_and_reads_only_report_freshness() {
+        let token = (1_791_705_332_694_i64 << 22) | 7;
+        let (time, increment) = timestamp_from_token(token);
+        let ok = || Response::Raw(RawResponse::new(rawdoc! { "ok": 1.0 }));
+
+        let write = with_cluster_time(&ok(), token, true).unwrap();
+        let doc = write.as_raw_document().unwrap();
+        assert_eq!(doc.get_timestamp("operationTime").unwrap(), Timestamp { time, increment });
+        let cluster_time = doc.get_document("$clusterTime").unwrap();
+        assert_eq!(cluster_time.get_timestamp("clusterTime").unwrap(), Timestamp { time, increment });
+        assert_eq!(cluster_time.get_document("signature").unwrap().get_i64("keyId").unwrap(), 0);
+
+        let read = with_cluster_time(&ok(), token, false).unwrap();
+        let doc = read.as_raw_document().unwrap();
+        assert!(doc.get("operationTime").unwrap().is_some());
+        assert!(doc.get("$clusterTime").unwrap().is_none());
+    }
+
+    #[test]
+    fn write_errors_survive_stamping() {
+        let response = Response::Raw(RawResponse::new(rawdoc! { "ok": 1.0 }).with_write_errors());
+        assert!(with_cluster_time(&response, 1 << 22, true).unwrap().has_write_errors());
     }
 
     #[test]

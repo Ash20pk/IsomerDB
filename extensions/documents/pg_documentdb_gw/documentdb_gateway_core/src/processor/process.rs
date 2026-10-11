@@ -403,5 +403,9 @@ pub async fn process_request(
         }
     }
 
-    result
+    // IsomerDB: cluster time on writes, freshness on projection reads.
+    match result {
+        Ok(response) => crate::isomer::after_request(request_context, pg_data_client, response).await,
+        Err(error) => Err(error),
+    }
 }

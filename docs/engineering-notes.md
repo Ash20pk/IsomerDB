@@ -24,6 +24,8 @@ ahead, 0 behind).
 | pg_trickle | The DDL tracker treats `ENABLE [ALWAYS\|REPLICA] TRIGGER` as harmless (`hooks.rs`) | Otherwise enabling a trigger suspends every stream table on that source |
 | pg_trickle | The "logical replication target" warning only fires in statement-level CDC mode (`api/helpers.rs`) | With row-level CDC and `ALWAYS` triggers, replicated changes are captured |
 | DocumentDB gateway | New `isomer` module (`documentdb_gateway_core/src/isomer.rs`), called from `processor/process.rs` before each request | Reads with `readConcern.afterClusterTime` on an IsomerDB projection wait for it (`isomer.wait_for`); writes to projection collections are refused with code 166, as for a MongoDB view |
+| DocumentDB gateway | `isomer::after_request`, called from `processor/process.rs` after each successful request | Writes return `operationTime` and `$clusterTime`; projection reads return their freshness as `operationTime` (FR-R4a, FR-R5) |
+| DocumentDB gateway | `isomer::stamp_handshake`, called from `processor/ismaster.rs` | With `ISOMER_IMPLICIT_CAUSAL=1`, hello returns a zero `$clusterTime` so drivers gossip session cluster time on every connection |
 
 All are marked `IsomerDB:` in the source. The pg_trickle changes are worth proposing upstream as an
 opt-in setting.
@@ -42,6 +44,53 @@ opt-in setting.
 5. **Updating to a new upstream version:** copy the new tag into a scratch checkout, commit it
    unmodified as its own import commit on a branch, then re-apply our changes. Update the tables
    above in the same change.
+
+## 2026-10-12 — Read-your-writes without calling wait_for (FR-R4, FR-R4a, FR-R5)
+
+`tests/freshness.sh` passes, five runs in a row. It closes the read-your-writes gaps the Phase 2
+notes left open:
+
+- **`SET isomer.read_after = <token>` works on plain SQL reads.** `isomer_router` now also hooks
+  the executor. A top-level SELECT that reads a projection waits, through `isomer.wait_for`, until
+  that projection reflects the token, or fails with IS001 ("not yet") after
+  `isomer.read_after_timeout` (5s). Reads that touch no projection never wait. `SET LOCAL` works,
+  so transaction-mode PgBouncer is fine. `isomer.get` and `isomer.cache_get` honour it as well.
+- **MongoDB responses carry cluster time.** Writes return `operationTime` and `$clusterTime`
+  (the cluster clock after the write). Reads of a projection return `operationTime` set to
+  `isomer.freshness`: the newest token the projection reflects, which is the read's freshness.
+- **Implicit causal reads** (`ISOMER_IMPLICIT_CAUSAL=1` on the gateway). A projection read that
+  carries `$clusterTime` but no `afterClusterTime` waits for it. `$clusterTime` is only returned on
+  writes, so a client's gossiped time is advanced by its own writes and nothing else.
+
+Things that bit us:
+
+- **Under READ COMMITTED the statement snapshot is taken before the executor starts.** Waiting in
+  ExecutorStart and then reading with that snapshot returns the stale row: the test that resumes
+  draining two seconds into a read caught exactly that when the fix was disabled. After a wait the
+  hook unregisters the query's snapshot and registers a fresh one; `PortalRunSelect` pushes
+  `queryDesc->snapshot`, so the run uses it. Only top-level statements wait (executor nesting is
+  tracked), and never in REPEATABLE READ, which `wait_for` refuses with a reason.
+- **Which relations are a projection.** Plan permission entries cover views and the tables under
+  them, so the map (`isomer._projection_relations()`, loaded as the bootstrap superuser and cached
+  for two seconds) lists each projection's view, its storage table and any native view.
+  `documentdb_api.collection(db, name)` has no relation; the hook matches its constant arguments,
+  and waits for every projection when they aren't constants.
+- **`isomer.get` and `cache_get` were STABLE,** so their reads ran on the caller's snapshot.
+  They are VOLATILE now and wait inside, before reading.
+- **The Node driver only gossips a session's cluster time on a connection that holds one
+  itself** (`prepareCommand`: `let a = this.clusterTime`, then the session's time if larger). A
+  pooled connection that never saw a write sent nothing, so implicit reads passed or failed
+  depending on the connection. In implicit mode the hello handshake now returns a zero
+  `$clusterTime`, which starts every connection's clock without making anything wait.
+- **The gateway's error-code proc macro bakes in `CARGO_MANIFEST_DIR`.** After the move out of
+  `vendor/`, a cached build looked for the CSV at the old path; `cargo clean -p documentdb_macros`.
+
+Limits:
+
+- Implicit causal mode guarantees read-your-writes within a driver session. A read on an implicit
+  session that lands on a connection which never carried the write's cluster time does not wait.
+- The token is a single scalar, so a read waits for every change up to it on that projection, not
+  only the caller's own.
 
 ## 2026-10-11 — Kubernetes operator on kind
 

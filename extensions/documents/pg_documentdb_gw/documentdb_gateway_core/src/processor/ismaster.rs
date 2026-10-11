@@ -82,5 +82,8 @@ pub fn process(
         );
     }
 
+    // IsomerDB: start each connection's cluster time at zero in implicit causal mode.
+    crate::isomer::stamp_handshake(&mut response_doc);
+
     Ok(Response::Raw(RawResponse::new(response_doc)))
 }

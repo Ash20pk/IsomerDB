@@ -23,7 +23,7 @@ runs, with no migration.
 | [`services/embedder/`](services/embedder/) | Rust service that computes embeddings for vector projections |
 | [`operator/`](operator/) | Kubernetes operator (Go): `IsomerCluster` resources, online scale up/down with rebalance and drain. See [`operator/README.md`](operator/README.md) |
 | [`services/api/`](services/api/) | Rust HTTP API: projections by key, time travel, change feeds and live streams (SSE) |
-| [`tests/phase0.sh`](tests/phase0.sh) … [`phase3.sh`](tests/phase3.sh), [`native.sh`](tests/native.sh), [`multinode.sh`](tests/multinode.sh), [`routing.sh`](tests/routing.sh), [`history.sh`](tests/history.sh), [`operator.sh`](tests/operator.sh) | Acceptance tests: Phase 0 (attach, document and search projections), 1 (vector projections), 2 (primary mode: cutover, sharding, sync, read-your-writes, auditor), 3 (proposer, shard advisor, certificates, randomized concurrency) |
+| [`tests/phase0.sh`](tests/phase0.sh) … [`phase3.sh`](tests/phase3.sh), [`native.sh`](tests/native.sh), [`multinode.sh`](tests/multinode.sh), [`routing.sh`](tests/routing.sh), [`history.sh`](tests/history.sh), [`freshness.sh`](tests/freshness.sh), [`operator.sh`](tests/operator.sh) | Acceptance tests: Phase 0 (attach, document and search projections), 1 (vector projections), 2 (primary mode: cutover, sharding, sync, read-your-writes, auditor), 3 (proposer, shard advisor, certificates, randomized concurrency) |
 | [`scripts/smoke.sh`](scripts/smoke.sh) | Checks every base component works in a running stack |
 | [`scripts/test-all.sh`](scripts/test-all.sh) | Every suite on fresh stacks, single-node then the three-node cluster |
 | [`docs/engineering-notes.md`](docs/engineering-notes.md) | What we learned building the stack (gateway auth, change capture and sharding quirks) |
@@ -35,7 +35,7 @@ docker compose up --build -d     # Postgres on :5432, MongoDB wire gateway on :1
 ./scripts/smoke.sh
 
 docker compose --profile attach up -d   # adds a stand-in customer Postgres (:5433) and a mock embeddings API
-./tests/phase0.sh && ./tests/phase1.sh && ./tests/phase2.sh && ./tests/phase3.sh && ./tests/native.sh && ./tests/routing.sh && ./tests/history.sh
+./tests/phase0.sh && ./tests/phase1.sh && ./tests/phase2.sh && ./tests/phase3.sh && ./tests/native.sh && ./tests/routing.sh && ./tests/history.sh && ./tests/freshness.sh
 
 docker compose --profile cluster up -d  # adds two worker nodes
 ./tests/multinode.sh                    # joins them, rebalances online, tests across nodes
@@ -85,11 +85,17 @@ SELECT isomer.alter_projection('customer_profile', freshness => 'sync');
 -- Shard by entity and keep sync projections on one shard
 SELECT isomer.distribute(ARRAY['customers', 'orders']::regclass[], 'customer_id');
 
--- Read your writes: wait for a committed write, from SQL...
-SELECT isomer.wait_for(isomer.last_write_token(), 'customer_profile');
+-- Read your writes: pass a committed write's token, and reads of projections wait for it
+SELECT isomer.last_write_token();                 -- after the write commits
+SET isomer.read_after = '<token>';                -- or SET LOCAL, under transaction-mode PgBouncer
+SELECT * FROM shop.customer_card WHERE id = 42;   -- waits until the projection has the write
+SELECT isomer.wait_for(isomer.last_write_token(), 'customer_profile');   -- or wait explicitly
 -- ...or from any MongoDB driver: advance a causally consistent session to the write's time
 SELECT * FROM isomer.token_to_mongo_timestamp(isomer.last_write_token());   -- then
 --   session.advanceOperationTime(Timestamp({t, i}))
+-- MongoDB writes return operationTime and $clusterTime; projection reads return their freshness
+-- as operationTime. With ISOMER_IMPLICIT_CAUSAL=1 on the gateway, a client's own gossiped
+-- $clusterTime makes its reads of projections wait too, with no session changes.
 
 SELECT * FROM isomer.projection_status;
 SELECT * FROM isomer.drift_report;      -- "drift 0 rows · N checks · since ..."
