@@ -1,5 +1,8 @@
 # Local single-node IsomerDB: Postgres on 5432, MongoDB wire gateway on 10260.
 #   docker compose up --build
+#
+# The gateway reaches Postgres over its Unix socket (shared volume), because the DocumentDB
+# gateway only supports password-less local connections to Postgres.
 services:
   db:
     build:
@@ -14,10 +17,11 @@ services:
       - "5432:5432"
     volumes:
       - pgdata:/var/lib/postgresql
+      - pgsocket:/var/run/postgresql
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      test: ["CMD-SHELL", "pg_isready -U postgres -h localhost && psql -U postgres -tAc \"SELECT 1 FROM pg_extension WHERE extname = 'documentdb'\" | grep -q 1"]
       interval: 5s
-      retries: 30
+      retries: 60
 
   gateway:
     image: isomerdb:dev
@@ -25,8 +29,11 @@ services:
       db:
         condition: service_healthy
     command: ["documentdb_gateway", "/etc/isomerdb/gateway.json"]
+    volumes:
+      - pgsocket:/var/run/postgresql
     ports:
       - "10260:10260"
 
 volumes:
   pgdata:
+  pgsocket:

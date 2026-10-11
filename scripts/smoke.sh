@@ -4,7 +4,7 @@
 # stream table, and the MongoDB gateway accepts a write and a read.
 set -euo pipefail
 
-PG="docker compose exec -T db psql -U postgres -d postgres -v ON_ERROR_STOP=1 -X -q -t -A"
+PG="docker compose exec -T -e PGOPTIONS=-cclient_min_messages=warning db psql -U postgres -d postgres -v ON_ERROR_STOP=1 -X -q -t -A"
 
 echo "== extensions"
 $PG -c "SELECT string_agg(extname || ' ' || extversion, ', ' ORDER BY extname) FROM pg_extension
@@ -27,12 +27,16 @@ $PG -c "SELECT id FROM smoke_orders ORDER BY embedding <=> '[1,0,0]' LIMIT 1;"
 
 echo "== pg_search: BM25 on a distributed table"
 $PG <<'SQL'
-CREATE INDEX smoke_orders_bm25 ON smoke_orders USING bm25 (id, note) WITH (key_field = 'id');
+CREATE INDEX smoke_orders_bm25 ON smoke_orders USING bm25 (id, note);
 SELECT string_agg(id::text, ',' ORDER BY id) FROM smoke_orders WHERE note @@@ 'mechanical';
 SQL
 
 echo "== pg_trickle: stream table"
 $PG <<'SQL'
+-- Drop the stream table before its source: pg_trickle 0.108.3 cannot drop a stream table
+-- whose source was dropped first ("SpiTupleTable positioned before the start").
+SELECT pgtrickle.drop_stream_table('smoke_status_counts', false)
+  FROM pg_class WHERE relname = 'smoke_status_counts';
 DROP TABLE IF EXISTS smoke_local CASCADE;
 CREATE TABLE smoke_local (id bigint PRIMARY KEY, status text);
 INSERT INTO smoke_local VALUES (1,'shipped'), (2,'pending'), (3,'shipped');

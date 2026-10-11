@@ -509,7 +509,7 @@ ship its own access methods. So projections are declared in grammar Postgres alr
 ```sql
 CREATE MATERIALIZED VIEW order_search USING isomer_bounded AS
   SELECT o.id, c.name, o.status, o.placed_at FROM orders o JOIN customers c ON c.id = o.customer_id;
-CREATE INDEX ON order_search USING bm25 (id, name, status) WITH (key_field = 'id');  -- kind: search
+CREATE INDEX ON order_search USING bm25 (id, name, status);                             -- kind: search
 SECURITY LABEL FOR isomer ON MATERIALIZED VIEW order_search IS 'lag=2s';             -- lag budget
 ```
 
