@@ -338,6 +338,9 @@ pub fn rebuild_cdc_trigger(
             })?;
         }
     }
+    // IsomerDB: rebuilt triggers must keep firing for replicated changes (attach mode).
+    super::fire_cdc_triggers_always(&source_table, &cdc_name, mode, insert_only)?;
+
     // 4. Sync the change buffer column schema.
     sync_change_buffer_columns(source_oid, change_schema, &columns)?;
 

@@ -175,6 +175,11 @@ fn classify_alter_table(fcinfo: pg_sys::FunctionCallInfo) -> AlterTableHint {
         }
         match cmd.subtype {
             pg_sys::AlterTableType::AT_ChangeOwner => AlterTableHint::OwnerOnly,
+            pg_sys::AlterTableType::AT_EnableTrig
+            | pg_sys::AlterTableType::AT_EnableAlwaysTrig
+            | pg_sys::AlterTableType::AT_EnableReplicaTrig
+            | pg_sys::AlterTableType::AT_EnableTrigAll
+            | pg_sys::AlterTableType::AT_EnableTrigUser => AlterTableHint::TriggerEnableOnly,
             pg_sys::AlterTableType::AT_ReplicaIdentity => {
                 let Some(def) = cmd.def.as_ref() else {
                     return AlterTableHint::Other;
@@ -231,6 +236,9 @@ enum AlterTableHint {
     Other,
     OwnerOnly,
     ReplicaIdentityFull,
+    /// IsomerDB: ENABLE [ALWAYS | REPLICA] TRIGGER. Enabling a trigger never drops captured
+    /// changes, and IsomerDB marks CDC triggers ENABLE ALWAYS while creating a stream table.
+    TriggerEnableOnly,
     AttachPartition {
         schema: Option<String>,
         relation: String,
@@ -1036,7 +1044,10 @@ fn handle_alter_table(objid: pg_sys::Oid, identity: &str, alter_table_hint: &Alt
         }
         // REPLICA IDENTITY only changes WAL's old-row representation. It does
         // not affect trigger CDC; other CDC modes retain conservative handling.
-        if replica_identity_full || empty_partition_attach {
+        if replica_identity_full
+            || empty_partition_attach
+            || matches!(alter_table_hint, AlterTableHint::TriggerEnableOnly)
+        {
             continue;
         }
         // ALTER TABLE also covers owner and row-security changes. Those values

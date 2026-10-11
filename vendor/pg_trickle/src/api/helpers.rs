@@ -280,6 +280,10 @@ pub(super) fn setup_cdc_for_source(
             ],
         )
         .map_err(|e| PgTrickleError::SpiError(e.to_string()))?;
+
+        // IsomerDB: now that the source is tracked, let its CDC triggers fire for replicated
+        // changes too (attach mode).
+        cdc::fire_cdc_triggers_always_for_oid(source_oid)?;
     } else {
         // Already tracked — add this pgt_id to the tracking array
         Spi::run_with_args(
@@ -2093,12 +2097,15 @@ pub(super) fn warn_source_table_properties(source_relids: &[(pg_sys::Oid, String
         .unwrap_or(Some(false))
         .unwrap_or(false);
 
-        if is_sub_target {
+        // IsomerDB: CDC triggers are created ENABLE ALWAYS, so replicated changes are captured
+        // as long as they are row-level (apply workers never fire statement-level triggers).
+        if is_sub_target
+            && config::pg_trickle_cdc_trigger_mode() != config::CdcTriggerMode::Row
+        {
             pgrx::warning!(
                 "pg_trickle: source table {} is a logical replication target. \
-                 Changes arriving via replication will NOT fire CDC triggers — \
-                 the stream table may become stale. Consider using \
-                 cdc_mode = 'wal' or a FULL refresh schedule.",
+                 Replicated changes only fire row-level triggers, so the stream table \
+                 may become stale. Set pg_trickle.cdc_trigger_mode = 'row'.",
                 table_name,
             );
         }

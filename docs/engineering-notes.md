@@ -1,7 +1,67 @@
 # Engineering notes
 
-Things we learned building the base stack that are not obvious from the upstream docs. Newest
-first.
+Things we learned building the stack that are not obvious from the upstream docs. Newest first.
+
+## 2026-10-11 — Phase 0: attach mode, document and search projections
+
+`tests/phase0.sh` passes against a stand-in customer database (the compose `source` service). It
+covers preflight, attach, bounded document and search projections kept fresh from the source,
+schema changes, new tables, slot health, the drop guard, and `dump_projections`.
+
+Design decisions this phase forced:
+
+- **Document projections are maintained by key, not by pg_trickle.** pg_trickle refuses
+  `IMMEDIATE` (and true incremental) maintenance for any query using `jsonb_build_object` /
+  `jsonb_agg`, because Postgres marks them STABLE. Instead, each source table declares which column
+  holds the projection key. A row trigger collects the affected keys, and IsomerDB re-runs the
+  projection's own query for just those keys and upserts the results through DocumentDB's SQL API.
+  This is correct by construction (each document is recomputed from the tables), and the PRD's
+  "recompute only the affected document" behaviour. `create_projection` refuses a query that reads
+  a table without a key mapping, so no write can go untracked.
+- **pg_trickle stays the engine for flat projections** (search today, aggregates later), where its
+  differential maintenance works.
+- **The extension is SQL/PL-pgSQL for now**, not Rust/pgrx as the PRD planned. Phase 0 is
+  orchestration of Postgres features, so SQL was the shortest correct path. Rust comes in where it
+  is needed: the embedding worker (Phase 1), the gateway (Phase 2), and the cross-shard engine
+  (Phase 3).
+- **The native `CREATE MATERIALIZED VIEW … USING isomer_*` path (FR-S1a) is not built.** It needs
+  key-mapping inference from the query. The function API is the interface for now.
+- **Projections over Citus distributed tables are refused** with a clear message. Attached tables
+  are local, and sharding-aware projections are Phase 2 work.
+
+Things that bit us:
+
+- **Replication apply workers run with an empty `search_path`** (Postgres 17+). Every IsomerDB
+  function pins `search_path = pg_catalog` and qualifies every name. User queries are
+  canonicalised at create time by deparsing a probe view under an empty search path, which
+  schema-qualifies every table and function.
+- **Apply workers fire only row-level triggers, and only `ENABLE ALWAYS`/`REPLICA` ones.**
+  pg_trickle defaults to statement-level, origin-only CDC triggers, so its stream tables silently
+  went stale over attached tables (2m48s stale in our first test). Fixed with
+  `pg_trickle.cdc_trigger_mode = 'row'` plus a patch that creates its triggers `ENABLE ALWAYS`
+  (see `vendor/README.md`).
+- **Patching pg_trickle's trigger creation in the wrong place broke it.** Running `ALTER TABLE`
+  before pg_trickle records the source in `pgt_change_tracking` sends its own DDL hook looking for
+  a buffer under the wrong name. Its DDL tracker also suspends every stream table on a source for
+  any `ALTER TABLE` it can't prove harmless, which now includes enabling triggers.
+- **`pg_trickle.block_source_ddl` must be off for attach mode.** Otherwise the `ADD COLUMN` we
+  replay from the source is refused. pg_trickle then extends its change buffers in place.
+- **Citus intercepts DDL on temp objects.** Probe views fail with `schema "pg_temp" does not
+  exist` on DROP. IsomerDB's probe functions run with `citus.enable_ddl_propagation = off`.
+- **`CREATE SUBSCRIPTION` can run inside a function only with `create_slot = false`.** We create
+  the slot ourselves over dblink, as a failover slot on PG 17+ sources. `ALTER SUBSCRIPTION …
+  REFRESH PUBLICATION` can't run inside a function at all, so it goes over a loopback dblink
+  connection, one health check after the new local table commits.
+- **`dblink_exec` refuses row-returning statements**, so slot functions go through
+  `isomer._remote_call`.
+- **Document keys must keep their type.** `_id: 42` and `_id: "42"` are different documents. Keys
+  travel through the queue as text and are cast back to the key column's type before they reach
+  DocumentDB. An early version deleted every document it had just written because of this.
+- **JSON fidelity.** Documents are built as `jsonb`, so keys come out sorted (jsonb order),
+  `numeric` becomes a BSON double (`89.00` → `89`), and timestamps become ISO strings rather than
+  BSON dates. Fine for Phase 0; a BSON-native builder is the fix.
+- **Projection collections are writable through the gateway.** Nothing stops an app writing to
+  them yet. The gateway work in Phase 2 should reject writes to projection collections.
 
 ## 2026-10-11 — Base image (Postgres 18.6 + Citus 14.2 + DocumentDB 0.117 + pg_search 0.26.1 + pgvector 0.8.7 + pg_trickle 0.108.3)
 

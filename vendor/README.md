@@ -15,6 +15,16 @@ repo and our changes show up as ordinary diffs. Projects we use unmodified are p
 DocumentDB v0.117-0 builds against Citus commit `fe25f68`, which v14.2.0 includes (41 commits
 ahead, 0 behind).
 
+## Our changes
+
+| Project | Change | Why |
+|---|---|---|
+| pg_trickle | CDC triggers are created `ENABLE ALWAYS` (`cdc/mod.rs`, `cdc/rebuild.rs`, `api/helpers.rs`) | Logical-replication apply workers only fire `ALWAYS`/`REPLICA` triggers, so stream tables over attached tables never updated |
+| pg_trickle | The DDL tracker treats `ENABLE [ALWAYS\|REPLICA] TRIGGER` as harmless (`hooks.rs`) | Otherwise enabling a trigger suspends every stream table on that source |
+| pg_trickle | The "logical replication target" warning only fires in statement-level CDC mode (`api/helpers.rs`) | With row-level CDC and `ALWAYS` triggers, replicated changes are captured |
+
+All are marked `IsomerDB:` in the source. Worth proposing upstream as an opt-in setting.
+
 ## Pinned, not copied
 
 | Component | Version | Source | License |

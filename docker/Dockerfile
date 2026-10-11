@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1
-# IsomerDB base image: PostgreSQL 18 + Citus + DocumentDB (+ gateway) + pg_search + pgvector +
-# pg_trickle. Citus, DocumentDB and pg_trickle are built from vendor/; the rest are pinned
-# packages. Build from the repo root:
+# IsomerDB image: PostgreSQL 18 + Citus + DocumentDB (+ gateway) + pg_search + pgvector +
+# pg_trickle + the isomer extension. Citus, DocumentDB and pg_trickle are built from vendor/;
+# the rest are pinned packages. Build from the repo root:
 #
 #   docker build -f docker/Dockerfile -t isomerdb:dev .
 
@@ -81,6 +81,8 @@ COPY --from=citus /out/ /
 COPY --from=documentdb /out/ /
 COPY --from=pg_trickle /out/ /
 COPY --from=gateway /out/ /
+
+COPY extensions/isomer/isomer.control extensions/isomer/isomer--*.sql /usr/share/postgresql/${PG_MAJOR}/extension/
 
 COPY docker/postgresql.isomer.conf /usr/share/postgresql/isomer.conf
 RUN printf "\ninclude = '/usr/share/postgresql/isomer.conf'\n" >> /usr/share/postgresql/postgresql.conf.sample

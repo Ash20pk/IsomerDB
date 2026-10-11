@@ -13,6 +13,12 @@ CREATE EXTENSION IF NOT EXISTS pg_trickle CASCADE;
 SELECT citus_set_coordinator_host('localhost', 5432);
 SELECT citus_set_node_property('localhost', 5432, 'shouldhaveshards', true);
 SELECT documentdb_api_distributed.initialize_cluster();
+
+CREATE EXTENSION IF NOT EXISTS dblink;
+CREATE EXTENSION IF NOT EXISTS isomer;
+-- Bounded projections are drained every second; attachments are health-checked every 10s.
+SELECT cron.schedule('isomer-drain', '1 seconds', 'SELECT isomer.drain()');
+SELECT cron.schedule('isomer-check-attachments', '10 seconds', 'SELECT isomer.check_attachments()');
 SQL
 
 if [ -n "${ISOMER_MONGO_USER:-}" ] && [ -n "${ISOMER_MONGO_PASSWORD:-}" ]; then

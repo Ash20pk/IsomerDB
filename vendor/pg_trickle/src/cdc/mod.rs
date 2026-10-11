@@ -970,12 +970,76 @@ pub fn create_change_trigger(
         ))
     })?;
 
+    // IsomerDB: also capture changes applied by logical replication (attach mode). A first-time
+    // setup is not tracked yet at this point (the ALTER TABLE would send pg_trickle's own DDL hook
+    // looking for an untracked buffer), so setup_cdc_for_source does it after recording tracking.
+    if get_cdc_name_for_source(source_oid) == stable_name {
+        fire_cdc_triggers_always(&source_table, stable_name, mode, insert_only)?;
+    }
+
     // Return the representative trigger name (used for logging only).
     let primary_trig = match mode {
         config::CdcTriggerMode::Statement => format!("pg_trickle_cdc_ins_{}", stable_name),
         config::CdcTriggerMode::Row => trigger_name,
     };
     Ok(primary_trig)
+}
+
+/// IsomerDB: `fire_cdc_triggers_always` for a tracked source, resolving its names and mode.
+pub(crate) fn fire_cdc_triggers_always_for_oid(source_oid: pg_sys::Oid) -> Result<(), PgTrickleError> {
+    let Some(source_table) = resolve_relation_name(source_oid)? else {
+        return Ok(());
+    };
+    let stable_name = get_cdc_name_for_source(source_oid);
+    fire_cdc_triggers_always(
+        &source_table,
+        &stable_name,
+        config::pg_trickle_cdc_trigger_mode(),
+        is_insert_only_table(source_oid),
+    )
+}
+
+/// IsomerDB: mark the CDC triggers on a source table `ENABLE ALWAYS`.
+///
+/// Logical replication apply workers run with `session_replication_role = replica`, so
+/// ordinary (`ENABLE ORIGIN`) triggers never fire for replicated changes and a stream table
+/// over a subscribed table silently stops updating. Apply workers also never fire
+/// statement-level DML triggers, so replicated sources additionally need
+/// `pg_trickle.cdc_trigger_mode = 'row'`. TRUNCATE triggers are statement-level but do fire.
+pub(crate) fn fire_cdc_triggers_always(
+    source_table: &str,
+    stable_name: &str,
+    mode: config::CdcTriggerMode,
+    insert_only: bool,
+) -> Result<(), PgTrickleError> {
+    let mut triggers = vec![format!("pg_trickle_cdc_truncate_{stable_name}")];
+    match mode {
+        config::CdcTriggerMode::Statement => {
+            triggers.push(format!("pg_trickle_cdc_ins_{stable_name}"));
+            if !insert_only {
+                triggers.push(format!("pg_trickle_cdc_upd_{stable_name}"));
+                triggers.push(format!("pg_trickle_cdc_del_{stable_name}"));
+            }
+        }
+        config::CdcTriggerMode::Row => triggers.push(format!("pg_trickle_cdc_{stable_name}")),
+    }
+    for trig in triggers {
+        // nosemgrep: rust.spi.run.dynamic-format — DDL cannot be parameterized; trig is built
+        // from stable_name and source_table is a regclass-quoted identifier.
+        Spi::run(&format!(
+            "DO $isomer$ BEGIN \
+               IF EXISTS (SELECT 1 FROM pg_trigger WHERE tgrelid = '{source_table}'::regclass AND tgname = '{trig}') THEN \
+                 ALTER TABLE {source_table} ENABLE ALWAYS TRIGGER {trig}; \
+               END IF; \
+             END $isomer$"
+        ))
+        .map_err(|e| {
+            PgTrickleError::SpiError(format!(
+                "Failed to enable CDC trigger {trig} on {source_table} for replicated changes: {e}"
+            ))
+        })?;
+    }
+    Ok(())
 }
 
 /// Drop a CDC trigger and its function for a source table.
