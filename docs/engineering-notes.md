@@ -2,6 +2,100 @@
 
 Things we learned building the stack that are not obvious from the upstream docs. Newest first.
 
+## 2026-10-11 — Phase 2: primary mode
+
+`tests/phase2.sh` passes. It covers:
+
+- attach, then cutover to primary, with sequences, identity columns, defaults and rollback
+  replication back to the source;
+- sync projections inside the writing transaction, including over Citus-sharded, co-located
+  tables, with a reference table joined in;
+- the co-location refusal;
+- cache projections;
+- read-your-writes from SQL (`wait_for`), and from an unmodified MongoDB driver through the
+  gateway;
+- writes to projection collections refused;
+- a non-superuser application role;
+- the auditor detecting injected drift, pinning it, alerting, and repairing it.
+
+How it works:
+
+- **Write tokens.** Every source change is stamped with the Citus node clock, packed as
+  `ms << 22 | counter` (`isomer.current_token()`). `isomer.last_write_token()` returns the session's
+  newest one. `isomer.wait_for(token, projection)` waits until no queued change stamped at or
+  before it remains (it refreshes search projections on demand), or raises SQLSTATE `IS001`
+  ("not yet"). Backfills carry token 0, so they never block a read-your-writes wait.
+- **MongoDB read-your-writes needs no driver changes.** The application converts its token with
+  `isomer.token_to_mongo_timestamp()` and calls `session.advanceOperationTime(Timestamp(t, i))`
+  on a causally consistent session. The driver then sends `afterClusterTime` on every read, and
+  the gateway waits on `isomer.wait_for` for reads of projection collections. The test proves the
+  wait is real: with draining paused, the causal read fails "not yet" while a plain read returns
+  the stale document.
+- **Sync over shards.** Citus runs row triggers on shards when they are created with
+  `citus.enable_unsafe_triggers = on` and DDL propagation on. A trigger on a shard can query the
+  co-located shards and write DocumentDB documents in the same transaction. `_check_sources`
+  allows sync only when every distributed source is co-located and sharded by the column that
+  maps to the projection key, so every document a write touches lives on the writing shard.
+- **Cutover** freezes the source (new sessions read-only), waits for open write transactions,
+  waits until the subscription has applied past the source's current LSN, and refuses if
+  `pg_stat_subscription_stats` recorded any conflict. It then copies sequences, defaults and
+  identity columns, and stops replication. With `rollback_conninfo` it publishes IsomerDB's
+  tables, and the next health check subscribes the source to them.
+- **The auditor** samples keys from both the tables and the projection's storage, so orphans are
+  found too, and compares what the tables produce with what is stored. A mismatch only counts as
+  drift if it persists for at least twice the lag budget (minimum 2 seconds), which filters out
+  lag. Drift is pinned in `isomer.drift_samples`, logged as an error, raised in `isomer.alerts`,
+  and counted in `isomer.drift_report` ("drift 0 rows · N checks · since …").
+  `isomer.repair()` re-derives the affected keys.
+
+Things that bit us:
+
+- **Source triggers inherited "no DDL propagation"** from `_install`, so they were created on the
+  distributed table's coordinator definition but on no shard, and never fired. Trigger
+  creation and dropping now force propagation on.
+- **Cutover deadlocked creating rollback replication.** The source's `CREATE SUBSCRIPTION`
+  creates a slot on IsomerDB, which waits for every open transaction, including the cutover
+  waiting on it. The subscription is now created by the next health check, after cutover commits.
+- **A frozen source refuses IsomerDB's own clean-up.** New sessions are read-only, and `SET
+  default_transaction_read_only = off` doesn't help inside a multi-statement string (the implicit
+  transaction already started read-only). `BEGIN READ WRITE; …; COMMIT` does.
+- **Cutover is not atomic across the two databases.** A failure after the remote slot was dropped
+  used to roll back only our side. Source clean-up failures are now logged warnings that don't
+  undo a finished cutover.
+- **Identity columns own their sequences.** Pre-creating them broke `ADD GENERATED AS IDENTITY`,
+  so they are excluded from the sequence copy.
+- **Trigger functions run as the writing role.** Every earlier test ran as a superuser, so
+  ordinary application roles would have failed inside IsomerDB's trigger. `_on_source_change`,
+  `wait_for`, `embed` and the gateway lookups are now `SECURITY DEFINER` with pinned search paths.
+- **MongoDB drivers misread error code 20** on a write as "retryable writes not supported".
+  Refused writes use 166 (`CommandNotSupportedOnView`), as MongoDB does for views.
+- **DocumentDB's `collection()` only works at the top level of a query.** The auditor reads
+  `documentdb_data.documents_<id>` directly and converts canonical extended JSON to plain values.
+- **DocumentDB's distributed planner hook needs schema access for every role** on every Citus
+  query, sharded or reference, with or without IsomerDB. Ordinary roles failed with
+  `permission denied for schema documentdb_core`. The image grants `USAGE` on `documentdb_core`
+  and `documentdb_api_catalog` to `PUBLIC` at first boot.
+- **`wait_for` inside the writing transaction can never succeed** (the drain can't see the
+  uncommitted change), and used to just time out. It now refuses immediately with a hint to
+  commit first.
+- **The auditor's first version flagged every document** carrying a fraction: `0.1` stored as a
+  BSON double prints back as `0.10000000000000000555`. Both sides are now compared at double
+  precision, and the test audits repeatedly before asserting "no drift", which would have caught
+  this.
+- **The local secret-redaction hook rewrites lines like `token = …`.** It silently replaced code
+  in two files (a SQL `SET token = …` and a Rust `let token = …`). Grep for `REDACTED` after
+  writing files, and avoid that shape.
+
+Gaps:
+
+- **Per-read freshness is a function** (`isomer.freshness`). The gateway does not attach it to
+  responses, and it does not return `operationTime` on writes, since writes go through SQL.
+- **`SET isomer.read_after` is not honoured by plain SQL reads**; call `isomer.wait_for` before
+  reading. Honouring a GUC needs a planner or executor hook in C.
+- **Projections over multi-node clusters are refused** (Phase 3). Everything above was tested on a
+  single node whose coordinator holds the shards.
+- **The `CREATE MATERIALIZED VIEW … USING isomer_*` syntax (FR-S1a) is still not built.**
+
 ## 2026-10-11 — Phase 1: vector projections and the embedder
 
 `tests/phase1.sh` passes. It runs against `tests/mockai`, an OpenAI-compatible stand-in that

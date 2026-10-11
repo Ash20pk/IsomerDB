@@ -32,7 +32,14 @@ mongo_eval() { "${MONGO[@]}" --eval "$1" 2>/dev/null | tail -1; }
 
 echo "== reset"
 $ISO -c "SELECT isomer.drop_projection(name) FROM isomer.projections;" >/dev/null
-$ISO -c "SELECT isomer.detach(name, drop_tables => true) FROM isomer.attachments;" >/dev/null
+$ISO -c "SELECT isomer.detach(name, drop_tables => true) FROM isomer.attachments WHERE status <> 'cutover';" >/dev/null
+$ISO -c "DELETE FROM isomer.attachments;" >/dev/null
+# Subscriptions left behind by an earlier, interrupted run.
+for sub in $($ISO -c "SELECT subname FROM pg_subscription WHERE subname LIKE 'isomer_%'"); do
+  $ISO -c "ALTER SUBSCRIPTION $sub DISABLE" -c "ALTER SUBSCRIPTION $sub SET (slot_name = NONE)" -c "DROP SUBSCRIPTION $sub" >/dev/null
+done
+$ISO -c "SELECT pgtrickle.drop_stream_table(format('%I.%I', pgt_schema, pgt_name), false) FROM pgtrickle.pgt_stream_tables WHERE pgt_name = 'order_search'" >/dev/null
+$ISO -c "DROP TABLE IF EXISTS public.customers, public.orders, public.order_items, public.coupons CASCADE" >/dev/null
 $ISO -c "DELETE FROM isomer.events;" >/dev/null
 $SRC <<'SQL'
 DROP PUBLICATION IF EXISTS isomer_shop;

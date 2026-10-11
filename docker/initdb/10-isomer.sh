@@ -14,6 +14,10 @@ SELECT citus_set_coordinator_host('localhost', 5432);
 SELECT citus_set_node_property('localhost', 5432, 'shouldhaveshards', true);
 SELECT documentdb_api_distributed.initialize_cluster();
 
+-- DocumentDB's distributed planner hook resolves its own schemas on every Citus query, so any
+-- role querying a sharded table needs USAGE on them (objects inside keep their own privileges).
+GRANT USAGE ON SCHEMA documentdb_core, documentdb_api_catalog TO PUBLIC;
+
 CREATE EXTENSION IF NOT EXISTS dblink;
 CREATE EXTENSION IF NOT EXISTS isomer;
 -- Bounded projections are drained every second; attachments are health-checked every 10s.

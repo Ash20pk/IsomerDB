@@ -12,6 +12,8 @@ pub mod configuration;
 pub mod context;
 pub mod error;
 pub mod explain;
+/// IsomerDB: projection-aware request handling (read-your-writes, read-only projections).
+pub mod isomer;
 pub mod postgres;
 pub mod processor;
 pub mod protocol;

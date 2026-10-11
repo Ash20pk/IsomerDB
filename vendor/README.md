@@ -23,7 +23,10 @@ ahead, 0 behind).
 | pg_trickle | The DDL tracker treats `ENABLE [ALWAYS\|REPLICA] TRIGGER` as harmless (`hooks.rs`) | Otherwise enabling a trigger suspends every stream table on that source |
 | pg_trickle | The "logical replication target" warning only fires in statement-level CDC mode (`api/helpers.rs`) | With row-level CDC and `ALWAYS` triggers, replicated changes are captured |
 
-All are marked `IsomerDB:` in the source. Worth proposing upstream as an opt-in setting.
+| DocumentDB gateway | New `isomer` module (`documentdb_gateway_core/src/isomer.rs`), called from `processor/process.rs` before each request | Reads with `readConcern.afterClusterTime` on an IsomerDB projection wait for it (`isomer.wait_for`); writes to projection collections are refused with code 166, as for a MongoDB view |
+
+All are marked `IsomerDB:` in the source. The pg_trickle changes are worth proposing upstream as an
+opt-in setting.
 
 ## Pinned, not copied
 

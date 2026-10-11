@@ -45,6 +45,9 @@ pub async fn process_request(
 
     transaction::handle(request_context, connection_context, pg_data_client).await?;
 
+    // IsomerDB: refuse writes to projections; make afterClusterTime reads wait for them.
+    crate::isomer::before_request(request_context, pg_data_client).await?;
+
     let result = match request_context.execution_request_type() {
         RequestType::Aggregate => {
             data_management::process_aggregate(request_context, connection_context, pg_data_client)
