@@ -1,0 +1,389 @@
+# Release pipeline: tag push (v*) or manual dispatch.
+#
+# Package production goes through the consolidated build_all_packages.yml
+# reusable workflow, which fans out to the DEB/RPM builds over the Tier-1
+# matrix and emits ONE verified bundle: every .deb/.rpm, SHA256SUMS,
+# manifest.txt, gated by a per-category presence check. The release job
+# attaches that bundle verbatim, so a release can never ship a silently
+# partial package set (the v0.114-0 release shipped no RPMs at all —
+# exactly the failure mode the presence check exists to stop).
+#
+# Downstream: the documentdb.github.io deploy workflow downloads the
+# published release assets, GPG-signs them, and publishes the apt/yum
+# repositories on documentdb.io. Keep asset filenames stable — that
+# pipeline selects packages by filename pattern.
+name: DocumentDB Release Pipeline
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      create_release:
+        description: 'Create GitHub release'
+        required: true
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  packages: write
+  id-token: write
+
+jobs:
+  extract-version:
+    name: Extract Version
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.extract.outputs.version }}
+      version_dash: ${{ steps.extract.outputs.version_dash }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Extract Version from Control File
+        id: extract
+        uses: ./.github/actions/resolve-documentdb-version
+
+      # A tag that disagrees with the control file would produce a release
+      # whose name, package versions, and changelog all describe a different
+      # version than the one the operator thought they tagged. Fail fast
+      # instead of publishing the mismatch.
+      - name: Verify tag matches control-file version
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          VERSION_DASH: ${{ steps.extract.outputs.version_dash }}
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          if [ "$TAG" != "v${VERSION_DASH}" ]; then
+            echo "::error::Pushed tag '${TAG}' does not match the control-file version 'v${VERSION_DASH}' (pg_documentdb_core/documentdb_core.control). Bump the control file (and CHANGELOG.md) first, or fix the tag."
+            exit 1
+          fi
+          echo "Tag ${TAG} matches control-file version."
+
+      # Require the changelog section BEFORE spending ~an hour of build time,
+      # not after. The release body is assembled in create-release below.
+      - name: Verify CHANGELOG has a section for this version
+        env:
+          VERSION_DASH: ${{ steps.extract.outputs.version_dash }}
+        run: |
+          if ! grep -q "^### documentdb v${VERSION_DASH}" CHANGELOG.md; then
+            echo "::error::CHANGELOG.md has no '### documentdb v${VERSION_DASH}' section. Add the release notes before tagging."
+            exit 1
+          fi
+          echo "CHANGELOG.md section found for v${VERSION_DASH}."
+
+  build-all-packages:
+    name: Build All Packages
+    needs: extract-version
+    uses: ./.github/workflows/build_all_packages.yml
+    with:
+      version: ${{ needs.extract-version.outputs.version }}
+      use_full_matrix: true
+    secrets: inherit
+
+  build-gateway-images:
+    name: Build Gateway Images
+    # Wait for the packages: images and packages ship as one release, so a
+    # failed package build must not leave published images behind with no
+    # release to accompany them. Costs serialization on an infrequent
+    # (tag-triggered) pipeline, which is the right trade for an atomic release.
+    needs: [extract-version, build-all-packages]
+    uses: ./.github/workflows/build_gateway.yml
+    with:
+      # Publish only for a real release. A dry run (workflow_dispatch with
+      # create_release=false) builds the images and pushes nothing — the
+      # gateway workflow honours this value on workflow_call.
+      push_images: ${{ (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')) || (github.event_name == 'workflow_dispatch' && inputs.create_release) }}
+
+  create-release:
+    name: Create GitHub Release
+    needs: [extract-version, build-all-packages, build-gateway-images]
+    runs-on: ubuntu-24.04
+    if: (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')) || (github.event_name == 'workflow_dispatch' && inputs.create_release)
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Prepare Release Variables
+        run: |
+          VERSION_DASH="${{ needs.extract-version.outputs.version_dash }}"
+          RELEASE_DATE=$(date '+%B %d, %Y' | sed 's/ 0/ /')
+          echo "VERSION_DASH=$VERSION_DASH" >> $GITHUB_ENV
+          echo "RELEASE_NAME=v${VERSION_DASH} (${RELEASE_DATE})" >> $GITHUB_ENV
+
+      # Only the consolidated, presence-checked bundle is attached — not the
+      # raw per-cell artifacts. It already contains every .deb/.rpm (deduped,
+      # dbgsym excluded) plus SHA256SUMS and manifest.txt.
+      - name: Download consolidated package bundle
+        uses: actions/download-artifact@v4
+        with:
+          name: documentdb-packages-${{ needs.extract-version.outputs.version }}
+          path: ./bundle
+
+      - name: Verify bundle checksums
+        run: |
+          cd ./bundle
+          sha256sum -c SHA256SUMS
+          echo "Bundle contents:"
+          ls -lh
+
+      # Debug symbols are optional and, until debug-symbol production is
+      # enabled in the builders (see the TODO in build_all_packages.yml), the
+      # artifact is never produced at all — so a missing artifact must not
+      # fail the release.
+      - name: Download debug-symbol bundle (optional)
+        id: dbgsym
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: documentdb-debug-symbols-${{ needs.extract-version.outputs.version }}
+          path: ./debug-symbols
+
+      - name: Zip debug symbols for release attachment
+        if: ${{ steps.dbgsym.outcome == 'success' }}
+        run: |
+          cd ./debug-symbols
+          zip -r "../documentdb-debug-symbols-${{ needs.extract-version.outputs.version }}.zip" .
+          ls -lh ..
+
+      - name: Extract Changelog for Version
+        id: changelog
+        run: |
+          VERSION_DASH="${{ env.VERSION_DASH }}"
+
+          # The section's presence was already enforced in extract-version;
+          # re-check here so a manual re-run of just this job still fails
+          # loudly rather than shipping a placeholder body.
+          if ! grep -q "^### documentdb v${VERSION_DASH}" CHANGELOG.md; then
+            echo "::error::CHANGELOG.md lost its '### documentdb v${VERSION_DASH}' section between build and release."
+            exit 1
+          fi
+
+          # Print from this version's header up to (not including) the next
+          # version header. awk handles the last-section-in-file case that a
+          # sed range + '$d' mishandles (it would eat the final content line).
+          awk -v hdr="### documentdb v${VERSION_DASH}" '
+            index($0, hdr) == 1 { found = 1; print; next }
+            found && /^### documentdb v[0-9]/ { exit }
+            found { print }
+          ' CHANGELOG.md > changelog_excerpt.md
+
+          # The header often still carries the pre-release "(Unreleased)"
+          # marker; a published release must not. Strip it here and warn so
+          # the flip lands in CHANGELOG.md next time.
+          if grep -q "(Unreleased)" changelog_excerpt.md; then
+            echo "::warning::CHANGELOG.md section for v${VERSION_DASH} is still marked '(Unreleased)' — stripping it from the release body. Flip it to the release date in CHANGELOG.md."
+            sed -i 's/ (Unreleased)//' changelog_excerpt.md
+          fi
+
+          echo "=== Changelog excerpt ==="
+          cat changelog_excerpt.md
+          echo "========================"
+
+      # The prerequisite commands are generated from the BEGIN/END:el-prereqs
+      # block in packaging/README.md rather than restated here, so the release
+      # body cannot drift from the commands nightly CI proves actually work
+      # (GitHub issue #75).
+      - name: Append release footer (install, verify, support tier)
+        run: |
+          VERSION_DASH="${{ env.VERSION_DASH }}"
+
+          # Resolve BEFORE the heredoc and fail loudly. A failing command
+          # substitution INSIDE a heredoc does not trip `set -e` -- it silently
+          # expands to nothing, which would publish a release body with an empty
+          # prerequisite code block and no signal that anything went wrong.
+          EL_PREREQS="$(./packaging/extract-el-prereqs.sh)" || {
+            echo "::error::could not generate the RHEL prerequisite block from packaging/README.md"
+            exit 1
+          }
+
+          cat >> changelog_excerpt.md <<EOF
+
+          ---
+
+          ## 📦 Packages
+
+          All \`.deb\` / \`.rpm\` files are attached below, together with \`SHA256SUMS\` and \`manifest.txt\`. Verify after downloading:
+
+          \`\`\`sh
+          gh release download v${VERSION_DASH} -R ${{ github.repository }} -D pkgs && cd pkgs && sha256sum -c SHA256SUMS
+          \`\`\`
+
+          **Repository-backed install (recommended):** see <https://documentdb.io> → Package Installation. Repository publication follows shortly after this release.
+
+          ### RHEL / Rocky / AlmaLinux: enable PGDG + EPEL + CRB first
+
+          The RPMs depend on PGDG's \`pgvector_N\`, \`pg_cron_N\` and \`postgis36_N\`. **CRB (CodeReady Builder) is disabled by default and is required** — \`postgis36_N\` pulls in \`gdal*-libs\`, which needs \`libqhull_r.so.7\`, and that library ships only in CRB. Without it \`dnf install\` fails dependency resolution with a wall of GDAL candidate lines that never mention the missing repository:
+
+          \`\`\`sh
+          ${EL_PREREQS}
+          \`\`\`
+
+          On EL8 replace \`EL-9\` with \`EL-8\` in the PGDG URL and use \`--set-enabled powertools\`; on arm64 replace \`x86_64\` with \`aarch64\`. See \`packaging/README.md\` for the full prerequisite and troubleshooting notes.
+
+          ### First-party (Tier 1) targets
+
+          | Format | Distro | PostgreSQL | Architectures |
+          |---|---|---|---|
+          | DEB | Ubuntu 24.04 | 17, 18 | amd64, arm64 |
+          | RPM | RHEL/Rocky/Alma 9 | 17, 18 | x86_64, aarch64 |
+
+          Other supported combinations (PostgreSQL 15/16; Debian 11/12/13, Ubuntu 22.04, RHEL 8) can be built on demand from this tag — see \`packaging/README.md\`:
+
+          \`\`\`sh
+          ./packaging/build_packages.sh --os <os> --pg <N>
+          ./packaging/gateway/build_gateway_packages.sh --os <os> --pg <N> --version ${VERSION_DASH//-/.}
+          \`\`\`
+
+          > **Pre-GA note:** in-place package upgrades from earlier releases are not supported yet. Install on a clean host, or remove the previous DocumentDB packages first.
+          EOF
+
+      - name: Create or update draft GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_REPOSITORY: ${{ github.repository }}
+          RELEASE_TARGET: ${{ github.sha }}
+          ALLOW_MISSING_RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.create_release && github.ref_type == 'branch' }}
+        run: |
+          set -euo pipefail
+
+          : "${VERSION_DASH:?VERSION_DASH is required}"
+          : "${RELEASE_NAME:?RELEASE_NAME is required}"
+          : "${RELEASE_REPOSITORY:?RELEASE_REPOSITORY is required}"
+          : "${RELEASE_TARGET:?RELEASE_TARGET is required}"
+          : "${ALLOW_MISSING_RELEASE_TAG:?ALLOW_MISSING_RELEASE_TAG is required}"
+          if [ "$ALLOW_MISSING_RELEASE_TAG" != "true" ] && [ "$ALLOW_MISSING_RELEASE_TAG" != "false" ]; then
+            echo "::error::ALLOW_MISSING_RELEASE_TAG must be 'true' or 'false', got '${ALLOW_MISSING_RELEASE_TAG}'."
+            exit 1
+          fi
+
+          TAG="v${VERSION_DASH}"
+          shopt -s nullglob
+          package_assets=(./bundle/*)
+          if [ "${#package_assets[@]}" -eq 0 ]; then
+            echo "::error::The verified package bundle is empty; refusing to create ${TAG}."
+            exit 1
+          fi
+          assets=("${package_assets[@]}")
+          debug_assets=(./documentdb-debug-symbols-*.zip)
+          assets+=("${debug_assets[@]}")
+
+          release_error="$(mktemp)"
+          trap 'rm -f "$release_error"' EXIT
+
+          if release_record="$(
+            gh api "repos/${RELEASE_REPOSITORY}/releases/tags/${TAG}" \
+              --jq '[.draft, .tag_name] | @tsv' 2>"$release_error"
+          )"; then
+            release_exists=true
+            IFS=$'\t' read -r is_draft existing_tag <<< "$release_record"
+            if [ "$existing_tag" != "$TAG" ]; then
+              echo "::error::Release lookup returned tag '${existing_tag}', expected '${TAG}'."
+              exit 1
+            fi
+            if [ "$is_draft" != "true" ]; then
+              echo "::error::Release ${TAG} is already published; refusing to modify or replace it with a draft."
+              exit 1
+            fi
+          else
+            lookup_status=$?
+            if grep -Eq '\(HTTP 404\)([^0-9]|$)' "$release_error"; then
+              release_exists=false
+            else
+              echo "::error::Failed to inspect release ${TAG} in ${RELEASE_REPOSITORY}; refusing to treat an API or authentication error as a missing release."
+              cat "$release_error" >&2
+              exit "$lookup_status"
+            fi
+          fi
+
+          # Resolve the exact remote tag ref before either release mutation.
+          # `gh release create --target` does not move an existing tag and can
+          # recreate a deleted one, so neither option is proof of identity.
+          # The sole exception is an explicitly requested manual branch release:
+          # it may prepare a draft before the release tag is pushed.
+          : > "$release_error"
+          if existing_ref="$(
+            gh api "repos/${RELEASE_REPOSITORY}/git/ref/tags/${TAG}" \
+              --jq '.ref' 2>"$release_error"
+          )"; then
+            tag_exists=true
+            if [ "$existing_ref" != "refs/tags/${TAG}" ]; then
+              echo "::error::Tag lookup returned '${existing_ref}', expected 'refs/tags/${TAG}'."
+              exit 1
+            fi
+            # The commits endpoint peels annotated tags, but returns HTTP 422
+            # for a missing ref. Only the exact Git-ref endpoint above can
+            # distinguish an absent tag through its HTTP 404 response.
+            if ! existing_target="$(
+              gh api "repos/${RELEASE_REPOSITORY}/commits/refs/tags/${TAG}" \
+                --jq '.sha' 2>"$release_error"
+            )"; then
+              echo "::error::Failed to resolve the commit for remote tag ${TAG}."
+              cat "$release_error" >&2
+              exit 1
+            fi
+            if [ "$existing_target" != "$RELEASE_TARGET" ]; then
+              echo "::error::Remote tag ${TAG} targets '${existing_target}', expected release commit '${RELEASE_TARGET}'. Refusing to create, update, or retarget the release."
+              exit 1
+            fi
+          else
+            tag_status=$?
+            if grep -Eq '\(HTTP 404\)([^0-9]|$)' "$release_error"; then
+              if [ "$ALLOW_MISSING_RELEASE_TAG" != "true" ]; then
+                echo "::error::Required remote tag ${TAG} does not exist in ${RELEASE_REPOSITORY}; refusing to create or update a release."
+                exit 1
+              fi
+              tag_exists=false
+            else
+              echo "::error::Failed to resolve remote tag ${TAG} in ${RELEASE_REPOSITORY}; refusing to treat an API or authentication error as a missing tag."
+              cat "$release_error" >&2
+              exit "$tag_status"
+            fi
+          fi
+
+          verify_tag_args=()
+          if [ "$tag_exists" = "true" ]; then
+            verify_tag_args=(--verify-tag)
+          fi
+          if [ "$release_exists" = "true" ]; then
+            if ! gh release edit "$TAG" \
+              -R "$RELEASE_REPOSITORY" \
+              "${verify_tag_args[@]}" \
+              --target "$RELEASE_TARGET" \
+              --title "$RELEASE_NAME" \
+              --notes-file changelog_excerpt.md \
+              --draft \
+              --prerelease; then
+              echo "::error::Failed to update draft release ${TAG}."
+              exit 1
+            fi
+          else
+            if ! gh release create "$TAG" \
+              -R "$RELEASE_REPOSITORY" \
+              "${verify_tag_args[@]}" \
+              --target "$RELEASE_TARGET" \
+              --title "$RELEASE_NAME" \
+              --notes-file changelog_excerpt.md \
+              --draft \
+              --prerelease; then
+              echo "::error::Failed to create draft release ${TAG}."
+              exit 1
+            fi
+          fi
+
+          if ! gh release upload "$TAG" "${assets[@]}" \
+            -R "$RELEASE_REPOSITORY" \
+            --clobber; then
+            echo "::error::Failed to upload the verified release assets for ${TAG}."
+            exit 1
+          fi

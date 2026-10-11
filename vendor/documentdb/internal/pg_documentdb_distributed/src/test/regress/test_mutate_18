@@ -1,0 +1,23 @@
+/^test: bson_aggregation_pipeline_tests_maxmin_group/d
+/^test: bson_aggregation_cursor_tests_pk_cursors$/d
+/^test: create_indexes_cosmos_vector /d
+/^test: bson_query_operator_geospatial_tests_explain_index$/d
+/^test: bson_query_operator_geospatial_tests_explain_runtime$/d
+s/ bson_aggregation_pipeline_stage_densify//
+s/ bson_aggregation_pipeline_stage_fill//
+/^test: bson_aggregation_pipeline_tests_bucket_auto/d
+s/ bson_aggregation_date_operators_tests//
+s/ bson_aggregation_stage_inversematch_tests//
+s/ query_sharding_tests//
+s/commands_delete //
+s/ bson_aggregation_stage_lookup_tests_pg17\\b//
+s/ bson_unique_index_composite//
+s/ commands_shard_collection//
+s/ commands_update\\b//
+s/ commands_create_indexes_pfe_a//
+/^test: bson_aggregation_count_query_tests/d
+s/ bson_aggregation_stage_lookup_tests_pg17_composite//
+s/ bson_aggregation_pipeline_stage_setWindowFields//
+s/cursors_basic_support //
+s/ commands_update_txn_proc//
+/^test: command_compact$/d

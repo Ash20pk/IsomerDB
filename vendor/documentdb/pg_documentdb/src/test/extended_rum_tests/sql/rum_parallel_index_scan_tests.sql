@@ -1,0 +1,118 @@
+SET search_path TO documentdb_api_catalog, documentdb_core, public;
+SET documentdb.next_collection_id TO 900;
+SET documentdb.next_collection_index_id TO 900;
+
+SELECT documentdb_api.drop_collection('p_ixscan', 'parallel_scan');
+SELECT documentdb_api.create_collection('p_ixscan', 'parallel_scan');
+
+SELECT collection_id AS p_col FROM documentdb_api_catalog.collections WHERE database_name = 'p_ixscan' AND collection_name = 'parallel_scan' \gset
+
+-- disable autovacuum to have predicatability
+SELECT FORMAT('ALTER TABLE documentdb_data.documents_%s set (autovacuum_enabled = off, parallel_workers = 2)', :p_col) \gexec
+
+
+SELECT COUNT(documentdb_api.insert_one('p_ixscan', 'parallel_scan',  FORMAT('{ "_id": %s, "a": %s, "b": %s }', i, i, i)::bson)) FROM generate_series(1, 1000) AS i;
+
+SELECT documentdb_api_internal.create_indexes_non_concurrently(
+    'p_ixscan',
+    '{ "createIndexes": "parallel_scan", "indexes": [ { "key": { "a": 1 }, "name": "a_1", "enableCompositeTerm": true } ] }', TRUE);
+SELECT documentdb_api_internal.create_indexes_non_concurrently(
+    'p_ixscan',
+    '{ "createIndexes": "parallel_scan", "indexes": [ { "key": { "b": 1 }, "name": "b_1", "enableCompositeTerm": false } ] }', TRUE);
+
+set documentdb.enableExtendedExplainPlans to on;
+set enable_bitmapscan to off;
+SELECT documentdb_test_helpers.run_explain_and_trim(
+    $cmd$ EXPLAIN (COSTS OFF, ANALYZE ON, VERBOSE OFF, BUFFERS OFF, SUMMARY OFF, TIMING OFF) SELECT document FROM bson_aggregation_find('p_ixscan',
+        '{ "find": "parallel_scan", "filter": { "a": { "$gt": 10 } } }') $cmd$);
+
+set parallel_tuple_cost to 0;
+set parallel_setup_cost to 0;
+set documentdb.enableCompositeParallelIndexScan to on;
+set parallel_leader_participation to off;
+set enable_seqscan to off;
+set documentdb.forceParallelScanIfAvailable to on;
+set documentdb.enableAddShardKeyOnlyOnPrimaryKeyFilters to on;
+
+-- Ensure deterministic planner statistics
+SELECT FORMAT('VACUUM FREEZE ANALYZE documentdb_data.documents_%s', :p_col) \gexec
+
+-- Enable leader participation for EXPLAIN ANALYZE so the leader's scan opaque
+-- gets the scan type from DSM during rumgettuple.
+set parallel_leader_participation to on;
+
+SELECT documentdb_test_helpers.run_explain_and_trim(
+    $cmd$ EXPLAIN (COSTS OFF, ANALYZE ON, VERBOSE OFF, BUFFERS OFF, SUMMARY OFF, TIMING OFF) SELECT document FROM bson_aggregation_find('p_ixscan',
+        '{ "find": "parallel_scan", "filter": { "a": { "$gt": 10, "$lt": 50 } } }') $cmd$);
+
+-- Backward sort on composite index with parallel ordered scan
+SELECT documentdb_test_helpers.run_explain_and_trim(
+    $cmd$ EXPLAIN (COSTS OFF, ANALYZE ON, VERBOSE OFF, BUFFERS OFF, SUMMARY OFF, TIMING OFF) SELECT document FROM bson_aggregation_find('p_ixscan',
+        '{ "find": "parallel_scan", "filter": { "a": { "$gt": 10, "$lt": 50 } }, "sort": { "a": -1 } }') $cmd$);
+
+SELECT CASE
+    WHEN explain_line ~ 'parallelScanLoops: [0-9]+ loops'
+         AND SUBSTRING(explain_line FROM 'parallelScanLoops: ([0-9]+) loops')::int
+             BETWEEN 1 AND 1000
+    THEN REGEXP_REPLACE(
+        explain_line,
+        'parallelScanLoops: [0-9]+ loops',
+        'parallelScanLoops: 1-1000 loops')
+    ELSE explain_line
+END AS run_explain_and_trim
+FROM documentdb_test_helpers.run_explain_and_trim(
+    $cmd$ EXPLAIN (COSTS OFF, ANALYZE ON, VERBOSE OFF, BUFFERS OFF, SUMMARY OFF, TIMING OFF) SELECT document FROM bson_aggregation_find('p_ixscan',
+        '{ "find": "parallel_scan", "filter": { "a": { "$gt": 10, "$lt": 50 } }, "sort": { "a": 1 } }') $cmd$) AS explain_line;
+
+SELECT CASE
+    WHEN explain_line ~ 'parallelScanLoops: [0-9]+ loops'
+         AND SUBSTRING(explain_line FROM 'parallelScanLoops: ([0-9]+) loops')::int
+             BETWEEN 1 AND 1000
+    THEN REGEXP_REPLACE(
+        explain_line,
+        'parallelScanLoops: [0-9]+ loops',
+        'parallelScanLoops: 1-1000 loops')
+    ELSE explain_line
+END
+FROM documentdb_test_helpers.run_explain_and_trim(
+    $cmd$ EXPLAIN (COSTS OFF, ANALYZE ON, VERBOSE OFF, BUFFERS OFF, SUMMARY OFF, TIMING OFF) SELECT document FROM bson_aggregation_find('p_ixscan',
+        '{ "find": "parallel_scan", "sort": { "a": 1 } }') $cmd$) AS explain_line;
+
+SELECT documentdb_test_helpers.run_explain_and_trim(
+    $cmd$ EXPLAIN (COSTS OFF, ANALYZE ON, VERBOSE OFF, BUFFERS OFF, SUMMARY OFF, TIMING OFF) SELECT document FROM bson_aggregation_find('p_ixscan',
+        '{ "find": "parallel_scan", "filter": { "b": { "$gt": 10, "$lt": 50 } } }') $cmd$);
+
+SELECT documentdb_test_helpers.run_explain_and_trim(
+    $cmd$ EXPLAIN (COSTS OFF, ANALYZE ON, VERBOSE OFF, BUFFERS OFF, SUMMARY OFF, TIMING OFF) SELECT document FROM bson_aggregation_find('p_ixscan',
+        '{ "find": "parallel_scan", "filter": { "b": { "$gt": 10, "$lt": 50 } }, "sort": { "b": -1 } }') $cmd$);
+
+SELECT documentdb_test_helpers.run_explain_and_trim(
+    $cmd$ EXPLAIN (COSTS OFF, ANALYZE ON, VERBOSE OFF, BUFFERS OFF, SUMMARY OFF, TIMING OFF) SELECT document FROM bson_aggregation_find('p_ixscan',
+        '{ "find": "parallel_scan", "filter": { "b": { "$gt": 10, "$lt": 50 } }, "sort": { "b": 1 } }') $cmd$);
+
+-- Restore leader participation off for non-EXPLAIN queries
+set parallel_leader_participation to off;
+
+-- Test with parallel_leader_participation OFF: the leader does not call rumgettuple,
+-- so scan type is inferred from numberOfOrderBys. Must not crash.
+SELECT CASE
+    WHEN explain_line ~ 'parallelScanLoops: [0-9]+ loops'
+         AND SUBSTRING(explain_line FROM 'parallelScanLoops: ([0-9]+) loops')::int
+             BETWEEN 1 AND 1000
+    THEN REGEXP_REPLACE(
+        explain_line,
+        'parallelScanLoops: [0-9]+ loops',
+        'parallelScanLoops: 1-1000 loops')
+    ELSE explain_line
+END AS explain_line
+FROM documentdb_test_helpers.run_explain_and_trim(
+    $cmd$ EXPLAIN (COSTS OFF, ANALYZE ON, VERBOSE OFF, BUFFERS OFF, SUMMARY OFF, TIMING OFF) SELECT document FROM bson_aggregation_find('p_ixscan',
+        '{ "find": "parallel_scan", "filter": { "a": { "$gt": 10, "$lt": 50 } }, "sort": { "a": 1 } }') $cmd$) AS explain_line;
+
+SELECT documentdb_test_helpers.run_explain_and_trim(
+    $cmd$ EXPLAIN (COSTS OFF, ANALYZE ON, VERBOSE OFF, BUFFERS OFF, SUMMARY OFF, TIMING OFF) SELECT document FROM bson_aggregation_find('p_ixscan',
+        '{ "find": "parallel_scan", "filter": { "a": { "$gt": 10, "$lt": 50 } }, "sort": { "a": -1 } }') $cmd$);
+
+SELECT documentdb_test_helpers.run_explain_and_trim(
+    $cmd$ EXPLAIN (COSTS OFF, ANALYZE ON, VERBOSE OFF, BUFFERS OFF, SUMMARY OFF, TIMING OFF) SELECT document FROM bson_aggregation_find('p_ixscan',
+        '{ "find": "parallel_scan", "filter": { "a": { "$gt": 10, "$lt": 50 } } }') $cmd$);

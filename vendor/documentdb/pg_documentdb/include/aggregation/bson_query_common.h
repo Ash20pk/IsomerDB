@@ -1,0 +1,75 @@
+/*-------------------------------------------------------------------------
+ * Copyright (c) Microsoft Corporation.  All rights reserved.
+ *
+ * include/bson/bson_query_common.h
+ *
+ * Private and common declarations of functions for handling bson query
+ * Shared across runtime and index implementations.
+ *
+ *-------------------------------------------------------------------------
+ */
+
+#ifndef BSON_QUERY_COMMON_H
+#define BSON_QUERY_COMMON_H
+
+#include "io/bson_core.h"
+#include "utils/documentdb_errors.h"
+
+/*
+ * This struct defines the parameters for a range query.
+ */
+typedef struct DollarRangeParams
+{
+	bson_value_t minValue;
+	bson_value_t maxValue;
+	bool isMinInclusive;
+	bool isMaxInclusive;
+
+	bool isFullScan;
+	int32_t orderScanDirection;
+
+	bool isElemMatch;
+	bson_value_t elemMatchValue;
+
+	bool isMinIndexKey;
+	bool isMaxIndexKey;
+	bson_value_t minOrMaxIndexKey;
+
+	/* Serialized deduplication state (row-pointer bitmap) carried across
+	 * dynamic cursor pages so an ordered scan can suppress documents already
+	 * returned on an earlier page. Present when value_type is BSON_TYPE_BINARY. */
+	bson_value_t dedupState;
+
+	/* Reservoir sampling: when true, the range signals the planner to wrap
+	 * scan paths with a reservoir sampling CustomScan. */
+	bool isSample;
+	int64_t sampleSize;
+
+	/* Internal $in-prefix merge-sort marker. It must be stripped before
+	 * execution, so the index-bounds and runtime paths throw if it is ever
+	 * seen. */
+	bool isMergeSortInPrefixMarker;
+
+	/* Index projection metadata conveyed to the index */
+	bool isIndexProjectionMetadata;
+	bson_value_t indexProjectionMetadata;
+} DollarRangeParams;
+
+DollarRangeParams * ParseQueryDollarRange(pgbsonelement *filterElement);
+
+bool IsBsonRangeArgsForFullScan(List *args);
+bool IsBsonRangeArgsForFullScanOrElemMatch(List *args);
+bool TryGetRangeParamsForRangeArgs(List *args, DollarRangeParams *params);
+bool IsBsonRangeArgsForReservoirSample(List *args);
+void InitializeQueryDollarRange(const bson_value_t *rangeValue,
+								DollarRangeParams *params);
+
+void ElemMatchIndexOpStrategyClassify(DollarRangeParams *params,
+									  int32_t *queryStrategy,
+									  bool *equalityPrefixes,
+									  bool *nonEqualityPrefixes);
+
+bool TryGetSingleFieldPathFromBsonValue(const bson_value_t *value,
+										pgbsonelement *element);
+
+#endif
