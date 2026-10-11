@@ -22,8 +22,9 @@ runs, with no migration.
 | [`extensions/ivm/`](extensions/ivm/) | Incremental view maintenance: change capture and stream tables that keep projections fresh |
 | [`services/embedder/`](services/embedder/) | Rust service that computes embeddings for vector projections |
 | [`operator/`](operator/) | Kubernetes operator (Go): `IsomerCluster` resources, online scale up/down with rebalance and drain. See [`operator/README.md`](operator/README.md) |
-| [`services/api/`](services/api/) | Rust HTTP API: projections by key, time travel, change feeds and live streams (SSE) |
-| [`tests/phase0.sh`](tests/phase0.sh) … [`phase3.sh`](tests/phase3.sh), [`native.sh`](tests/native.sh), [`multinode.sh`](tests/multinode.sh), [`routing.sh`](tests/routing.sh), [`history.sh`](tests/history.sh), [`freshness.sh`](tests/freshness.sh), [`operator.sh`](tests/operator.sh) | Acceptance tests: Phase 0 (attach, document and search projections), 1 (vector projections), 2 (primary mode: cutover, sharding, sync, read-your-writes, auditor), 3 (proposer, shard advisor, certificates, randomized concurrency) |
+| [`services/api/`](services/api/) | Rust HTTP API: projections by key, time travel, change feeds and live streams (SSE), and the admin endpoints the console and CLI use |
+| [`clients/`](clients/) | TypeScript: the API client (`sdk`), the `isomer` command line (`cli`) and the web console (`console`, served by the API at `/console`) |
+| [`tests/phase0.sh`](tests/phase0.sh) … [`phase3.sh`](tests/phase3.sh), [`native.sh`](tests/native.sh), [`multinode.sh`](tests/multinode.sh), [`routing.sh`](tests/routing.sh), [`history.sh`](tests/history.sh), [`freshness.sh`](tests/freshness.sh), [`console.sh`](tests/console.sh), [`operator.sh`](tests/operator.sh) | Acceptance tests: Phase 0 (attach, document and search projections), 1 (vector projections), 2 (primary mode: cutover, sharding, sync, read-your-writes, auditor), 3 (proposer, shard advisor, certificates, randomized concurrency) |
 | [`scripts/smoke.sh`](scripts/smoke.sh) | Checks every base component works in a running stack |
 | [`scripts/test-all.sh`](scripts/test-all.sh) | Every suite on fresh stacks, single-node then the three-node cluster |
 | [`docs/engineering-notes.md`](docs/engineering-notes.md) | What we learned building the stack (gateway auth, change capture and sharding quirks) |
@@ -36,6 +37,7 @@ docker compose up --build -d     # Postgres on :5432, MongoDB wire gateway on :1
 
 docker compose --profile attach up -d   # adds a stand-in customer Postgres (:5433) and a mock embeddings API
 ./tests/phase0.sh && ./tests/phase1.sh && ./tests/phase2.sh && ./tests/phase3.sh && ./tests/native.sh && ./tests/routing.sh && ./tests/history.sh && ./tests/freshness.sh
+(cd clients && npm ci && npm run build) && ./tests/console.sh   # console, CLI and admin API
 
 docker compose --profile cluster up -d  # adds two worker nodes
 ./tests/multinode.sh                    # joins them, rebalances online, tests across nodes
@@ -128,6 +130,30 @@ curl -H "Authorization: Bearer $KEY" -H "X-Isomer-After: $TOKEN" localhost:8080/
 curl -H "Authorization: Bearer $KEY" "localhost:8080/v1/projections/customer_profile/docs/42?as_of=2026-10-01T09:00:00Z"
 curl -H "Authorization: Bearer $KEY" "localhost:8080/v1/projections/customer_profile/changes?after=0&limit=100"
 curl -N -H "Authorization: Bearer $KEY" localhost:8080/v1/projections/customer_profile/live   # snapshot, then changes (SSE)
+```
+
+## Console and CLI
+
+Operators sign in with an API key for a role in `isomer_admin`:
+
+```sql
+CREATE ROLE ops; GRANT isomer_admin TO ops;
+SELECT isomer.create_api_key('ops', 'ops');   -- shown once
+```
+
+- Console: http://localhost:8080/console/: every projection's lag against its budget, drift
+  counters, alerts, proposals, the shard advisor, routes, attachments and events.
+- CLI (`clients/cli`, Node 20+):
+
+```sh
+(cd clients && npm ci && npm run build)
+alias isomer="node $PWD/clients/cli/dist/isomer.mjs"
+isomer login --url http://localhost:8080 --key "$KEY"
+isomer status          # exits 1 while there are alerts, so it works in scripts and health checks
+isomer watch
+isomer projection customer_profile
+isomer proposals && isomer accept 3 --sync && isomer route 3
+isomer audit --json
 ```
 
 - Postgres: `psql postgres://postgres:isomer@localhost:5432/postgres`

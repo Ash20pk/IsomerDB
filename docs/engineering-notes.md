@@ -45,6 +45,44 @@ opt-in setting.
    unmodified as its own import commit on a branch, then re-apply our changes. Update the tables
    above in the same change.
 
+## 2026-10-12 — Console and CLI (FR-O3)
+
+`tests/console.sh` passes. Operators get three things, all over the same admin API:
+
+- **`/v1/admin/*` on the HTTP API** (`services/api/src/admin.rs`): overview, one projection in
+  full, audit, repair, proposals (mine, accept, reject, route), routes on/off, the shard advisor,
+  attachments and the event log. The SQL behind it lives in the extension
+  (`isomer.admin_overview()`, `admin_projection()`, `admin_projections()`, isomer 0.10.0), so it
+  can be checked from psql and the API stays a thin layer.
+- **`isomer`, the CLI** (`clients/cli`, Node 20+, no runtime dependencies): `status`, `watch`,
+  `projection`, `drift`, `alerts`, `audit`, `proposals`, `accept`, `route`, `routes`, `advice`,
+  `attachments`, `events`, `get`. `--json` everywhere. Exit codes carry the outcome (`status` and
+  `drift` exit 1 while something is wrong, 75 for "not yet"), so it slots into scripts and health
+  checks.
+- **The console** (`clients/console`, Preact, served at `/console`): every projection as a row
+  whose lag travels toward its budget mark, drift counters, grouped alerts, a lag sparkline per
+  projection, proposals with accept/reject/route, the advisor, routes, attachments and events.
+  It loads no fonts or scripts from elsewhere, so it works air-gapped.
+
+Access: a key may use the admin API only if its role is a member of the new `isomer_admin` role.
+API keys never act as a superuser (that was already enforced by `create_api_key`), so membership
+is the only way in. Keys for other roles get 403 from `/v1/admin/*` and keep their projection reads.
+
+Things that bit us:
+
+- **`isomer.repair` re-derives only the keys the auditor found drifted,** not the whole
+  projection. The first labels said "re-derive every key"; the console and CLI now say "repair
+  drifted keys".
+- **`coalesce($1, 0)` makes Postgres type `$1` as `integer`,** and tokio-postgres then refuses to
+  bind an `i64`, which the API reported as "database unavailable". Cast parameters explicitly.
+- **Routing a proposal builds its own cache projection** (`route_<id>`) and points the proposal at
+  it, and keeps the route disabled when the measured speedup is under
+  `isomer.routing_min_speedup`. The console's routes page shows those and lets an operator turn
+  them on anyway.
+- **The event log repeats.** `isomer.alerts` includes every warning from the last 15 minutes, so a
+  projection that breached its budget a few times listed each one. The console groups alerts by
+  kind and subject with a count.
+
 ## 2026-10-12 — Read-your-writes without calling wait_for (FR-R4, FR-R4a, FR-R5)
 
 `tests/freshness.sh` passes, five runs in a row. It closes the read-your-writes gaps the Phase 2

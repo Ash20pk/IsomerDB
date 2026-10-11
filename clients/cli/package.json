@@ -1,0 +1,21 @@
+{
+  "name": "@isomerdb/cli",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "IsomerDB command line: projections, lag, drift, proposals, advisor and routes",
+  "bin": {
+    "isomer": "dist/isomer.mjs"
+  },
+  "scripts": {
+    "build": "esbuild src/main.ts --bundle --platform=node --format=esm --target=node20 --outfile=dist/isomer.mjs --banner:js='#!/usr/bin/env node'",
+    "typecheck": "tsc -p .",
+    "test": "node --experimental-strip-types --test test/*.test.ts"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@isomerdb/sdk": "0.1.0"
+  }
+}

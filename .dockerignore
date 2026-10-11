@@ -2,3 +2,5 @@
 docs
 **/target
 **/.DS_Store
+**/node_modules
+clients/*/dist

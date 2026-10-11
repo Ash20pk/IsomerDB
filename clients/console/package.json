@@ -1,0 +1,15 @@
+{
+  "name": "@isomerdb/console",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "IsomerDB console: projections, lag, drift, proposals, advisor and routes",
+  "scripts": {
+    "build": "node build.mjs",
+    "typecheck": "tsc -p ."
+  },
+  "dependencies": {
+    "@isomerdb/sdk": "0.1.0",
+    "preact": "10.29.8"
+  }
+}

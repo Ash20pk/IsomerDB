@@ -1,0 +1,19 @@
+{
+  "name": "isomerdb-clients",
+  "private": true,
+  "workspaces": [
+    "sdk",
+    "cli",
+    "console"
+  ],
+  "scripts": {
+    "build": "npm run build --workspaces",
+    "typecheck": "npm run typecheck --workspaces",
+    "test": "npm run test --workspaces --if-present"
+  },
+  "devDependencies": {
+    "esbuild": "0.28.2",
+    "typescript": "7.0.2",
+    "@types/node": "22.20.5"
+  }
+}

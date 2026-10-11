@@ -9,6 +9,7 @@ This product includes software developed by third parties:
   (image)                 pg_search 0.26.1      Copyright (c) ParadeDB, Inc.                AGPL-3.0
   (image)                 PostgreSQL 18.6, pgvector, pg_cron    PostgreSQL License
   (image)                 PostGIS                               GPL-2.0
+  (console)               Preact 10.29.8        Copyright (c) Jason Miller                  MIT
 
 The directories above contain modifications by IsomerDB, marked "IsomerDB:" at each change.
 Full license texts and upstream notices are in each directory's LICENSE and NOTICE files, and in

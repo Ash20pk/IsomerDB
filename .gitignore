@@ -1,3 +1,5 @@
 .DS_Store
 target/
 operator/.kubeconfig-kind
+node_modules/
+clients/*/dist/

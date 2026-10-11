@@ -7,6 +7,8 @@
 //!   GET /v1/projections/{name}/snapshot               all documents plus the feed cursor they are as of
 //!   GET /v1/projections/{name}/changes?after=&limit=  the change feed, in commit order, gap-free
 //!   GET /v1/projections/{name}/live?after=            the same feed as server-sent events
+//!   /v1/admin/...                                     operator endpoints for the console and CLI (admin.rs)
+//!   GET /console/                                     the console (static files)
 //!
 //! Every request carries `Authorization: Bearer <key>` (from `isomer.create_api_key`). A key acts
 //! as a Postgres role and reads a projection only where `isomer.can_read` allows it: the role can
@@ -22,6 +24,9 @@
 //!   ISOMER_API_LISTEN    address to listen on (default 0.0.0.0:8080)
 //!   ISOMER_API_POOL      database connections (default 16)
 //!   ISOMER_API_WAIT_MS   longest wait for X-Isomer-After (default 5000)
+//!   ISOMER_CONSOLE_DIR   the built console (default /usr/share/isomer/console)
+
+mod admin;
 
 use std::convert::Infallible;
 use std::sync::Arc;
@@ -31,7 +36,7 @@ use anyhow::{Context, Result};
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
-use axum::response::{IntoResponse, Response};
+use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::get;
 use axum::{Json, Router};
 use deadpool_postgres::{Manager, ManagerConfig, Pool, RecyclingMethod};
@@ -40,6 +45,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::sync::broadcast;
 use tokio_postgres::{AsyncMessage, NoTls};
+use tower_http::services::{ServeDir, ServeFile};
 use tracing::{error, info, warn};
 
 struct App {
@@ -75,7 +81,15 @@ async fn main() -> Result<()> {
         .route("/v1/projections/:name/snapshot", get(get_snapshot))
         .route("/v1/projections/:name/changes", get(get_changes))
         .route("/v1/projections/:name/live", get(live))
+        .merge(admin::routes())
         .with_state(app);
+    let console = std::env::var("ISOMER_CONSOLE_DIR").unwrap_or_else(|_| "/usr/share/isomer/console".into());
+    let router = router
+        .route("/", get(|| async { Redirect::temporary("/console/") }))
+        .nest_service(
+            "/console",
+            ServeDir::new(&console).fallback(ServeFile::new(format!("{console}/index.html"))),
+        );
     let socket = tokio::net::TcpListener::bind(&listen).await?;
     info!(%listen, "isomer api listening");
     axum::serve(socket, router)
