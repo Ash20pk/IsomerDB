@@ -17,7 +17,8 @@ runs, with no migration.
 | [`vendor/`](vendor/) | Upstream code we modify: Citus, DocumentDB, pg_trickle. See [`vendor/README.md`](vendor/README.md) for versions, licenses and the rules for changing it |
 | [`docker/`](docker/) | Base image: Postgres 18 + Citus + DocumentDB + gateway + pg_search + pgvector + pg_trickle |
 | [`extensions/isomer/`](extensions/isomer/) | The `isomer` Postgres extension: projections and attach mode |
-| [`tests/phase0.sh`](tests/phase0.sh) | Phase 0 acceptance test (attach, document and search projections) |
+| [`services/embedder/`](services/embedder/) | Rust service that computes embeddings for vector projections |
+| [`tests/phase0.sh`](tests/phase0.sh), [`tests/phase1.sh`](tests/phase1.sh) | Acceptance tests: Phase 0 (attach, document and search projections), Phase 1 (vector projections) |
 | [`scripts/smoke.sh`](scripts/smoke.sh) | Checks every base component works in a running stack |
 | [`docs/engineering-notes.md`](docs/engineering-notes.md) | What we learned building the stack (gateway auth, pg_trickle and Citus quirks) |
 
@@ -27,8 +28,9 @@ runs, with no migration.
 docker compose up --build -d     # Postgres on :5432, MongoDB wire gateway on :10260
 ./scripts/smoke.sh
 
-docker compose --profile attach up -d   # also start a stand-in "customer" Postgres on :5433
+docker compose --profile attach up -d   # adds a stand-in customer Postgres (:5433) and a mock embeddings API
 ./tests/phase0.sh
+./tests/phase1.sh
 ```
 
 ## Using it
@@ -51,7 +53,16 @@ SELECT isomer.create_projection(name => 'order_search', kind => 'search', key =>
   query => $$ SELECT o.id, c.name, o.status FROM orders o JOIN customers c ON c.id = o.customer_id $$);
 SELECT * FROM order_search WHERE name @@@ 'asha';
 
+-- A vector projection: re-embeds a row only when its text changes
+SELECT isomer.create_projection(name => 'product_vectors', kind => 'vector', key => 'sku',
+  model => 'text-embedding-3-small', lag => '30 seconds',
+  query => $$ SELECT sku, title || ' ' || description AS input FROM products $$,
+  sources => '{"products": "sku"}');
+SELECT sku FROM product_vectors
+ORDER BY embedding <=> isomer.embed_for('product_vectors', 'quiet mechanical keyboard') LIMIT 10;
+
 SELECT * FROM isomer.projection_status;
+SELECT * FROM isomer.alerts;
 SELECT * FROM isomer.attachment_status();
 ```
 

@@ -1,6 +1,6 @@
 comment = 'IsomerDB: projections maintained from SQL tables, and attach mode'
-default_version = '0.1.0'
+default_version = '0.2.0'
 relocatable = false
 schema = isomer
-requires = 'dblink, documentdb, pg_trickle, pg_search, pg_cron'
+requires = 'dblink, documentdb, pg_trickle, pg_search, pg_cron, vector'
 superuser = true

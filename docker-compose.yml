@@ -34,6 +34,33 @@ services:
     ports:
       - "10260:10260"
 
+  # Computes embeddings for vector projections, outside Postgres. API keys come from the
+  # environment variables named in isomer.embedding_models.api_key_env.
+  embedder:
+    build:
+      context: .
+      dockerfile: services/embedder/Dockerfile
+    image: isomer-embedder:dev
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      ISOMER_DATABASE_URL: host=/var/run/postgresql user=postgres dbname=postgres
+      MOCKAI_KEY: test-key
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+    volumes:
+      - pgsocket:/var/run/postgresql
+
+  # A stand-in OpenAI-compatible embeddings API, for tests (rate-limits every 5th request).
+  mockai:
+    image: python:3.12-alpine
+    profiles: ["attach", "test"]
+    command: ["python", "/srv/server.py"]
+    environment:
+      RATE_LIMIT_EVERY: "3"
+    volumes:
+      - ./tests/mockai/server.py:/srv/server.py:ro
+
   # Stand-in for a customer's existing Postgres, used to develop and test attach mode.
   #   docker compose --profile attach up -d source
   source:

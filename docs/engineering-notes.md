@@ -2,6 +2,60 @@
 
 Things we learned building the stack that are not obvious from the upstream docs. Newest first.
 
+## 2026-10-11 — Phase 1: vector projections and the embedder
+
+`tests/phase1.sh` passes. It runs against `tests/mockai`, an OpenAI-compatible stand-in that
+rate-limits every third request and counts every input it embeds. It covers:
+
+- the cost estimate before creating;
+- backfill, with one bad input isolated in the dead letter;
+- each text sent to the provider exactly once despite 429 retries;
+- query-time embedding, with the HNSW index used;
+- only changed text re-embedded (a price change embeds nothing);
+- deletes;
+- spend tracking by phase, plus a monthly cap that pauses and resumes;
+- a model upgrade with an atomic swap from 8 to 16 dimensions;
+- the network-free test embedder;
+- alerts.
+
+How it works:
+
+- **The database decides what needs embedding; the embedder decides how.** Source writes queue
+  keys exactly as for document projections. Draining recomputes each key's `input` text and only
+  writes an `embed_jobs` row when `md5(input)` differs from the stored embedding's hash.
+- **`services/embedder` (Rust) leases jobs** by pushing `not_before` forward (a visibility
+  timeout, so a crashed worker's jobs come back). It packs batches by estimated tokens, takes
+  steady-state work before backfill, and rate-limits each model with token buckets. Results go
+  back through `isomer.embed_complete`, which only writes if the job still has the same text
+  hash, so a slow result can never overwrite a newer one.
+- **Failures** go through `isomer.embed_failed`: exponential backoff with jitter, the provider's
+  `Retry-After` on 429, and the dead letter after 8 attempts. A permanent failure (4xx) on a
+  batch is retried item by item, so one bad input doesn't dead-letter its neighbours.
+- **`isomer.embed()` answers query-time requests without HTTP in Postgres.** It inserts the
+  request over a loopback connection (so the embedder sees it before the caller's transaction
+  ends), the embedder answers it first, and the caller polls for the result. This needs READ
+  COMMITTED and is checked.
+- **Model upgrades.** `set_projection_model` creates the new model's partial HNSW index and
+  re-embeds in the background, while the view keeps serving the old model. When every key has a
+  new embedding, the drain swaps the view, the catalog and the indexes in one transaction.
+- **Storage.** `isomer_vectors.<name>` holds `(key, model, embedding, source_hash)` with one
+  partial HNSW index per model, on `embedding::vector(dims)`. The public view casts to the same
+  expression, so `ORDER BY embedding <=> …` uses the index.
+
+Gaps:
+
+- **No real provider has been exercised.** The OpenAI-compatible path is tested against the mock
+  only. A real key just needs `OPENAI_API_KEY` set on the embedder and
+  `isomer.add_embedding_model('text-embedding-3-small', 'openai', 'text-embedding-3-small', 1536,
+  endpoint => 'https://api.openai.com/v1', api_key_env => 'OPENAI_API_KEY', price_per_million => 0.02)`.
+- **The in-cluster CPU model (gte-small / bge-small ONNX) is not built.** `local-hash-64` is a
+  deterministic word-hashing embedder for tests and air-gapped smoke checks, with no semantic
+  understanding.
+- **Token counts are estimated** at 4 characters per token for batching and estimates. Billing
+  uses the provider's reported usage when it gives one.
+- **Bundled-model billing** (list price plus markup) is a pricing decision; `price_per_million`
+  is whatever is registered.
+
 ## 2026-10-11 — Phase 0: attach mode, document and search projections
 
 `tests/phase0.sh` passes against a stand-in customer database (the compose `source` service). It
