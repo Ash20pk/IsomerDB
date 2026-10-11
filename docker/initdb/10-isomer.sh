@@ -1,6 +1,31 @@
 #!/bin/bash
-# First-boot setup of a single-node IsomerDB cluster: the coordinator also holds shards.
+# First-boot setup. ISOMER_ROLE=coordinator (default) sets up the coordinator, which also holds
+# shards; ISOMER_ROLE=worker sets up a Citus worker node (extensions only; the coordinator adds it).
 set -euo pipefail
+
+# Nodes connect to each other as postgres with the cluster password (dev setup; use certificates
+# and pg_dist_authinfo in production).
+echo "*:*:*:postgres:${POSTGRES_PASSWORD}" > "$HOME/.pgpass"
+chmod 600 "$HOME/.pgpass"
+
+if [ "${ISOMER_ROLE:-coordinator}" = "worker" ]; then
+  psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname postgres <<'SQL'
+CREATE EXTENSION IF NOT EXISTS citus;
+CREATE EXTENSION IF NOT EXISTS documentdb_distributed CASCADE;
+CREATE EXTENSION IF NOT EXISTS documentdb_extended_rum;
+CREATE EXTENSION IF NOT EXISTS pg_search;
+CREATE EXTENSION IF NOT EXISTS vector;
+CREATE EXTENSION IF NOT EXISTS pg_trickle CASCADE;
+GRANT USAGE ON SCHEMA documentdb_core, documentdb_api_catalog TO PUBLIC;
+CREATE EXTENSION IF NOT EXISTS dblink;
+CREATE EXTENSION IF NOT EXISTS pg_stat_statements;
+-- Workers run IsomerDB's capture triggers on their shards and queue keys locally; the
+-- coordinator pulls the queues and does all the scheduled work.
+CREATE EXTENSION IF NOT EXISTS isomer;
+SELECT cron.unschedule(jobname) FROM cron.job WHERE jobname LIKE 'isomer-%';
+SQL
+  exit 0
+fi
 
 psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname postgres <<'SQL'
 CREATE EXTENSION IF NOT EXISTS citus;
@@ -22,9 +47,15 @@ CREATE EXTENSION IF NOT EXISTS dblink;
 CREATE EXTENSION IF NOT EXISTS pg_stat_statements;
 CREATE EXTENSION IF NOT EXISTS isomer;
 -- Bounded projections are drained every second; attachments are health-checked every 10s.
-SELECT cron.schedule('isomer-drain', '1 seconds', 'SELECT isomer.drain()');
-SELECT cron.schedule('isomer-check-attachments', '10 seconds', 'SELECT isomer.check_attachments()');
+SELECT cron.schedule('isomer-drain', '1 seconds', 'SELECT isomer.drain()') WHERE citus_is_coordinator();
+SELECT cron.schedule('isomer-check-attachments', '10 seconds', 'SELECT isomer.check_attachments()') WHERE citus_is_coordinator();
 SQL
+
+# The name worker nodes use to reach this coordinator (compose sets it; single-node can stay local).
+if [ -n "${ISOMER_COORDINATOR_HOST:-}" ]; then
+  psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname postgres \
+    -c "SELECT citus_set_coordinator_host('${ISOMER_COORDINATOR_HOST}', 5432)"
+fi
 
 if [ -n "${ISOMER_MONGO_USER:-}" ] && [ -n "${ISOMER_MONGO_PASSWORD:-}" ]; then
   psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname postgres -c \

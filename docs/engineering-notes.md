@@ -2,6 +2,68 @@
 
 Things we learned building the stack that are not obvious from the upstream docs. Newest first.
 
+## 2026-10-11 — Multi-node clusters (FR-P5, FR-P6 for key-maintained projections)
+
+`tests/multinode.sh` passes (19 checks) on a coordinator plus two Citus workers, both fresh and on a
+rerun. It covers:
+
+- bounded projections maintained from writes on every node, with read-your-writes across nodes;
+- a reference-table change re-deriving documents everywhere;
+- sync refused across nodes;
+- the certificate checking triggers on every shard placement;
+- adding a node with Citus's online rebalancer, with capture still working on moved shards;
+- three concurrent workers making 360 random transactions across nodes, after which every key
+  equals recomputation.
+
+How it works:
+
+- **Citus runs IsomerDB's capture triggers on every shard on every node.** Shard triggers get the
+  shard id appended to their name, which is why a plain `pg_trigger` count by name misses them.
+  On a worker there is no projection catalog, so the trigger queues the key in
+  `isomer.node_queue`, using `*` for "every key" (lookup tables, TRUNCATE).
+- **`isomer.pull_node_queues()`** (a procedure, every second, coordinator only) takes each worker's
+  queue inside a worker transaction, inserts it into `isomer.pending`, commits locally, then
+  commits on the worker. A crash in between duplicates keys (harmless) and never loses them.
+- **On a multi-node cluster `wait_for` is a barrier.** A write routed to a worker runs its
+  trigger in the worker's session, so the client's session never sees that write's token, and
+  tokens from different nodes' clocks don't compare safely anyway. `wait_for` reads every node's
+  clock once and waits until no queue holds a change from before then. It fails closed: a worker
+  that doesn't answer counts as still having work queued.
+- **`isomer.add_node`** joins a node and starts `citus_rebalance_start()`. Moved shards keep their
+  triggers; `isomer.rebalance_finished()` re-checks and repairs them.
+
+What bit us:
+
+- **Citus propagates extension DDL to every worker**, so `CREATE` and `ALTER EXTENSION isomer` ran
+  IsomerDB's `cron.schedule` calls on the workers too. A worker then ran the pull job itself: it
+  took keys from its own queue, found no projection in its empty catalog, and committed the
+  delete, silently losing writes. Jobs are now scheduled only `WHERE citus_is_coordinator()`, and
+  the pull refuses to run anywhere else.
+- **Citus refuses `INSERT … SELECT` whose subquery runs queries over distributed tables**
+  ("subqueries are not supported within INSERT queries"). The pull's error handler swallowed it,
+  and the test's reset cleared the event log, so the failure was invisible until traced. The pull
+  now fetches into a variable, expands `*` keys separately, and inserts from arrays.
+- **Dropping a projection's collection with DDL propagation off orphaned Citus metadata.**
+  `pg_dist_partition` kept the dropped table, and the next `citus_add_node` failed with "cache
+  lookup failed for relation". `_install` and `drop_projection` now always run with propagation
+  on; only purely local objects (probe views, vector and cache storage) turn it off.
+- **A procedure with a `SET` clause can't `COMMIT`** ("invalid transaction termination"), so the
+  pull pins nothing and qualifies every name instead. `LEAST` and `COALESCE` are syntax, not
+  functions, so they can't be schema-qualified.
+- **Workers must reach the coordinator by name.** `citus_add_node` refuses while the coordinator
+  is registered as `localhost`; the image sets it from `ISOMER_COORDINATOR_HOST`.
+- **Citus connects to workers as each client's own role**, including a MongoDB user's role, so
+  every role needs inter-node auth. The dev compose trusts the private network on workers.
+  Production needs certificate auth (`citus.node_conninfo`) or `pg_dist_authinfo`.
+
+Still open:
+
+- **Sync projections across nodes.** A write's documents would have to be written from the worker
+  holding the shard.
+- **Search projections over distributed tables**, which pg_trickle doesn't support.
+- **The barrier `wait_for` waits for everything queued before the call on the given projection**,
+  not just the caller's own write. That is correct, but it can wait longer under heavy load.
+
 ## 2026-10-11 — Native DDL for projections (FR-S1a)
 
 `tests/native.sh` passes (19 checks). A document projection is declared with ordinary DDL:

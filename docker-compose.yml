@@ -13,6 +13,7 @@ services:
       POSTGRES_PASSWORD: isomer
       ISOMER_MONGO_USER: isomer
       ISOMER_MONGO_PASSWORD: isomer
+      ISOMER_COORDINATOR_HOST: db
     ports:
       - "5432:5432"
     volumes:
@@ -61,6 +62,39 @@ services:
     volumes:
       - ./tests/mockai/server.py:/srv/server.py:ro
 
+  # Citus worker nodes, for multi-node clusters:
+  #   docker compose --profile cluster up -d   then   SELECT isomer.add_node('worker1');
+  worker1:
+    image: isomerdb:dev
+    profiles: ["cluster"]
+    environment:
+      POSTGRES_PASSWORD: isomer
+      ISOMER_ROLE: worker
+      # Workers are reachable only on the compose network, and Citus connects to them as each
+      # client's own role (e.g. a MongoDB user's). Dev only: production uses certificate auth
+      # (citus.node_conninfo) or pg_dist_authinfo.
+      POSTGRES_HOST_AUTH_METHOD: trust
+    volumes:
+      - worker1data:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -h localhost && psql -U postgres -tAc \"SELECT 1 FROM pg_extension WHERE extname = 'isomer'\" | grep -q 1"]
+      interval: 5s
+      retries: 60
+
+  worker2:
+    image: isomerdb:dev
+    profiles: ["cluster"]
+    environment:
+      POSTGRES_PASSWORD: isomer
+      ISOMER_ROLE: worker
+      POSTGRES_HOST_AUTH_METHOD: trust
+    volumes:
+      - worker2data:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -h localhost && psql -U postgres -tAc \"SELECT 1 FROM pg_extension WHERE extname = 'isomer'\" | grep -q 1"]
+      interval: 5s
+      retries: 60
+
   # Stand-in for a customer's existing Postgres, used to develop and test attach mode.
   #   docker compose --profile attach up -d source
   source:
@@ -79,3 +113,5 @@ services:
 volumes:
   pgdata:
   pgsocket:
+  worker1data:
+  worker2data:

@@ -1313,4 +1313,5 @@ SELECT level, subject, message FROM isomer.events
 WHERE level IN ('error', 'warning') AND at > now() - interval '15 minutes';
 
 -- The auditor runs every 30 seconds.
-SELECT cron.schedule('isomer-audit', '30 seconds', 'SELECT isomer.audit()');
+SELECT cron.schedule('isomer-audit', '30 seconds', 'SELECT isomer.audit()')
+    WHERE pg_catalog.citus_is_coordinator();  -- Citus propagates extension DDL to workers; jobs run on the coordinator only

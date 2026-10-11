@@ -589,8 +589,10 @@ END $$;
 
 -- ── Schedules ───────────────────────────────────────────────────────────────
 
-SELECT cron.schedule('isomer-propose', '17 * * * *', 'SELECT isomer.propose()');
-SELECT cron.schedule('isomer-track-reads', '*/5 * * * *', 'SELECT isomer.track_reads()');
+SELECT cron.schedule('isomer-propose', '17 * * * *', 'SELECT isomer.propose()')
+    WHERE pg_catalog.citus_is_coordinator();  -- Citus propagates extension DDL to workers; jobs run on the coordinator only
+SELECT cron.schedule('isomer-track-reads', '*/5 * * * *', 'SELECT isomer.track_reads()')
+    WHERE pg_catalog.citus_is_coordinator();  -- Citus propagates extension DDL to workers; jobs run on the coordinator only
 
 -- Alerts gain unused projections.
 CREATE OR REPLACE VIEW isomer.alerts AS
