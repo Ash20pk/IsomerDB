@@ -46,10 +46,41 @@ type IsomerClusterSpec struct {
 	// +kubebuilder:default=IfNotPresent
 	ImagePullPolicy corev1.PullPolicy `json:"imagePullPolicy,omitempty"`
 
+	// HA runs a streaming standby beside the coordinator and every worker, and fails over to it.
+	// +optional
+	HA HASpec `json:"ha,omitempty"`
+
 	// DeleteVolumes removes the data volumes when the IsomerCluster is deleted. Off by default:
 	// deleting the resource keeps the data.
 	// +optional
 	DeleteVolumes bool `json:"deleteVolumes,omitempty"`
+}
+
+// HASpec configures standbys and failover.
+type HASpec struct {
+	// Standbys per node: 0 (no standbys) or 1. Each standby streams from its node's primary and
+	// takes over when the primary stays unready for FailoverAfter.
+	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:validation:Maximum=1
+	// +optional
+	Standbys int32 `json:"standbys,omitempty"`
+
+	// FailoverAfter is how long a primary may be unready before its standby is promoted.
+	// +kubebuilder:default="30s"
+	// +optional
+	FailoverAfter metav1.Duration `json:"failoverAfter,omitempty"`
+
+	// Synchronous makes every commit wait until its node's standby has the WAL, so a failover
+	// loses nothing. Writes then stop while a standby is down. Off by default (asynchronous: a
+	// failover can lose the last moments of commits).
+	// +optional
+	Synchronous bool `json:"synchronous,omitempty"`
+
+	// MaxRetainedWAL caps the WAL a primary keeps for a disconnected standby. Past it, the
+	// standby's slot is invalidated and the operator re-clones the standby.
+	// +kubebuilder:default="4GB"
+	// +optional
+	MaxRetainedWAL string `json:"maxRetainedWAL,omitempty"`
 }
 
 // ComponentSpec turns a stateless component on or off.
@@ -76,6 +107,29 @@ type WorkerStatus struct {
 	Shards   int64 `json:"shards"`
 }
 
+// GroupStatus is one node group: a primary and, with spec.ha, its standby.
+type GroupStatus struct {
+	// Name: coordinator-0, worker-0, worker-1, ...
+	Name string `json:"name"`
+	// Primary is the pod that is the group's primary.
+	Primary string `json:"primary"`
+	// Standby is the pod that follows it, if any.
+	Standby string `json:"standby,omitempty"`
+	// StandbyStreaming: the standby is connected and replaying the primary's WAL.
+	StandbyStreaming bool `json:"standbyStreaming,omitempty"`
+	// ReplayLagBytes is how far the standby's replay is behind the primary.
+	ReplayLagBytes int64 `json:"replayLagBytes,omitempty"`
+}
+
+// Failover is the last time a standby was promoted.
+type Failover struct {
+	Group  string      `json:"group"`
+	From   string      `json:"from"`
+	To     string      `json:"to"`
+	At     metav1.Time `json:"at"`
+	Reason string      `json:"reason"`
+}
+
 // IsomerClusterStatus is what the operator last observed.
 type IsomerClusterStatus struct {
 	// Phase: Provisioning, Ready, Scaling, or Degraded.
@@ -87,8 +141,15 @@ type IsomerClusterStatus struct {
 	Rebalance string `json:"rebalance,omitempty"`
 	// LastRepairedJob is the last rebalance job after which capture triggers were re-checked.
 	LastRepairedJob int64 `json:"lastRepairedJob,omitempty"`
+	// Groups: each node group's primary and standby.
+	Groups []GroupStatus `json:"groups,omitempty"`
+	// LastFailover is the last standby promotion, planned or not.
+	LastFailover *Failover `json:"lastFailover,omitempty"`
 	// IsomerVersion is the isomer extension version on the coordinator.
 	IsomerVersion string `json:"isomerVersion,omitempty"`
+	// CertificatesIssuedAt is when the node certificates were last issued. Nodes reload their
+	// configuration for a few minutes afterwards, as the new files reach their volumes.
+	CertificatesIssuedAt *metav1.Time `json:"certificatesIssuedAt,omitempty"`
 	// Endpoints clients connect to.
 	Endpoints          Endpoints          `json:"endpoints,omitempty"`
 	Conditions         []metav1.Condition `json:"conditions,omitempty"`

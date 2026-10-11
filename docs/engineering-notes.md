@@ -45,6 +45,42 @@ opt-in setting.
    unmodified as its own import commit on a branch, then re-apply our changes. Update the tables
    above in the same change.
 
+## 2026-10-12 — Operator: certificates between nodes, standbys and failover (FR-CL1)
+
+`tests/operator.sh` passes on kind. It now also checks that workers refuse anything but the node
+certificate, that every connection between nodes is encrypted and certificate-authenticated, that
+a reissued certificate is picked up without a restart, and that a standby takes over when a
+worker's or the coordinator's postmaster is frozen: Citus is repointed, every row stays readable,
+SQL, MongoDB and HTTP clients carry on through the same Services, projections keep being
+maintained, the old primary rejoins as a standby, and turning standbys off moves the primaries
+back with nothing lost. See `operator/README.md` for how it works.
+
+Things that bit us:
+
+- **Kubernetes stops containers with SIGTERM, Postgres's smart shutdown.** It waits for every
+  client to leave; Citus caches connections, so every pod deletion ran into the 60s grace period
+  and was killed uncleanly. A `preStop` hook sends SIGINT (fast shutdown: well under a second,
+  and a standby is sent all WAL first). The hook must only send the signal: one that waits for
+  PID 1 to exit hangs itself until the grace period ends.
+- **A rolling restart looked like a failure.** The pod is missing (or terminating) for a moment,
+  and "missing" first triggered an immediate failover. Missing now gets the same
+  `failoverAfter` grace as unready.
+- **Turning standbys on restarted every primary** while the standbys were being cloned, because
+  the replication settings were server arguments. The operator now sets
+  `max_slot_wal_keep_size` and `synchronous_standby_names` with `ALTER SYSTEM` on each primary.
+- **`citus_set_coordinator_host` refuses while a metadata node is out of sync,** which a worker
+  failover a minute earlier leaves behind. Promotion now does only the promotion; every pass
+  brings Citus's metadata in line with the topology and syncs it, so a refused step is retried.
+- **A container's PID 1 ignores SIGSTOP sent from inside its namespace** (it is the namespace's
+  init). The test freezes the postmaster from the kind node instead, via `crictl`, and must pick
+  the ready sandbox: a recreated pod has two.
+- **`pg_ident.conf` maps the node certificate to every role** with `isomer-nodes isomer-node all`
+  (Postgres 16+), which is what Citus needs: it connects to workers as each client's own role.
+
+Limits: one standby per node; a failover is decided by the operator's view of pod readiness, so
+an operator that is down delays failover (the database keeps running). Logical replication slots
+on the coordinator (cutover rollback) are not carried over to its standby.
+
 ## 2026-10-12 — Embeddings on the cluster's own CPU (FR-V1b)
 
 `tests/local_model.sh` passes. A vector projection can now use `model => 'bge-small-en-v1.5'`:

@@ -478,6 +478,36 @@ spec:
                 required:
                 - enabled
                 type: object
+              ha:
+                description: HA runs a streaming standby beside the coordinator and
+                  every worker, and fails over to it.
+                properties:
+                  failoverAfter:
+                    default: 30s
+                    description: FailoverAfter is how long a primary may be unready
+                      before its standby is promoted.
+                    type: string
+                  maxRetainedWAL:
+                    default: 4GB
+                    description: |-
+                      MaxRetainedWAL caps the WAL a primary keeps for a disconnected standby. Past it, the
+                      standby's slot is invalidated and the operator re-clones the standby.
+                    type: string
+                  standbys:
+                    description: |-
+                      Standbys per node: 0 (no standbys) or 1. Each standby streams from its node's primary and
+                      takes over when the primary stays unready for FailoverAfter.
+                    format: int32
+                    maximum: 1
+                    minimum: 0
+                    type: integer
+                  synchronous:
+                    description: |-
+                      Synchronous makes every commit wait until its node's standby has the WAL, so a failover
+                      loses nothing. Writes then stop while a standby is down. Off by default (asynchronous: a
+                      failover can lose the last moments of commits).
+                    type: boolean
+                type: object
               image:
                 default: isomerdb:dev
                 description: Image of the database (Postgres + Citus + DocumentDB
@@ -572,6 +602,12 @@ spec:
           status:
             description: IsomerClusterStatus is what the operator last observed.
             properties:
+              certificatesIssuedAt:
+                description: |-
+                  CertificatesIssuedAt is when the node certificates were last issued. Nodes reload their
+                  configuration for a few minutes afterwards, as the new files reach their volumes.
+                format: date-time
+                type: string
               conditions:
                 items:
                   description: Condition contains details for one aspect of the current
@@ -642,10 +678,61 @@ spec:
                   postgres:
                     type: string
                 type: object
+              groups:
+                description: 'Groups: each node group''s primary and standby.'
+                items:
+                  description: 'GroupStatus is one node group: a primary and, with
+                    spec.ha, its standby.'
+                  properties:
+                    name:
+                      description: 'Name: coordinator-0, worker-0, worker-1, ...'
+                      type: string
+                    primary:
+                      description: Primary is the pod that is the group's primary.
+                      type: string
+                    replayLagBytes:
+                      description: ReplayLagBytes is how far the standby's replay
+                        is behind the primary.
+                      format: int64
+                      type: integer
+                    standby:
+                      description: Standby is the pod that follows it, if any.
+                      type: string
+                    standbyStreaming:
+                      description: 'StandbyStreaming: the standby is connected and
+                        replaying the primary''s WAL.'
+                      type: boolean
+                  required:
+                  - name
+                  - primary
+                  type: object
+                type: array
               isomerVersion:
                 description: IsomerVersion is the isomer extension version on the
                   coordinator.
                 type: string
+              lastFailover:
+                description: LastFailover is the last standby promotion, planned or
+                  not.
+                properties:
+                  at:
+                    format: date-time
+                    type: string
+                  from:
+                    type: string
+                  group:
+                    type: string
+                  reason:
+                    type: string
+                  to:
+                    type: string
+                required:
+                - at
+                - from
+                - group
+                - reason
+                - to
+                type: object
               lastRepairedJob:
                 description: LastRepairedJob is the last rebalance job after which
                   capture triggers were re-checked.

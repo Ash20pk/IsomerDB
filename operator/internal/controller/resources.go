@@ -2,6 +2,7 @@ package controller
 
 import (
 	"fmt"
+	"strings"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -14,8 +15,10 @@ import (
 )
 
 const (
-	roleCoordinator = "coordinator"
-	roleWorker      = "worker"
+	roleCoordinator        = "coordinator"
+	roleWorker             = "worker"
+	roleCoordinatorReplica = "coordinator-replica"
+	roleWorkerReplica      = "worker-replica"
 	roleAPI         = "api"
 	roleEmbedder    = "embedder"
 
@@ -38,6 +41,13 @@ func (n names) worker() string      { return n.c.Name + "-worker" }
 func (n names) client() string      { return n.c.Name }
 func (n names) api() string         { return n.c.Name + "-api" }
 func (n names) embedder() string    { return n.c.Name + "-embedder" }
+func (n names) auth() string        { return n.c.Name + "-auth" }
+func (n names) topology() string    { return n.c.Name + "-topology" }
+
+// Standbys (spec.ha) run in StatefulSets beside the primaries: pod i of <name>-worker-replica
+// replicates pod i of <name>-worker, and either may be the group's primary after a failover.
+func (n names) coordinatorReplica() string { return n.c.Name + "-coordinator-replica" }
+func (n names) workerReplica() string      { return n.c.Name + "-worker-replica" }
 
 // coordinatorHost is the coordinator pod's stable DNS name, which workers use to reach it.
 func (n names) coordinatorHost() string {
@@ -48,6 +58,15 @@ func (n names) coordinatorHost() string {
 func (n names) workerHost(i int) string {
 	return fmt.Sprintf("%s-%d.%s.%s.svc.cluster.local", n.worker(), i, n.worker(), n.c.Namespace)
 }
+
+// podHost is a database pod's stable DNS name: <pod>.<its StatefulSet>.<namespace>.svc.cluster.local.
+func (n names) podHost(pod string) string {
+	set := pod[:strings.LastIndex(pod, "-")]
+	return fmt.Sprintf("%s.%s.%s.svc.cluster.local", pod, set, n.c.Namespace)
+}
+
+// setFor is the StatefulSet (and headless Service) name for a database role.
+func (n names) setFor(role string) string { return n.c.Name + "-" + role }
 
 // clientHost is the Service clients (and the operator) use for Postgres.
 func (n names) clientHost() string {
@@ -66,6 +85,14 @@ func labels(c *isomerv1.IsomerCluster, role string) map[string]string {
 func selector(c *isomerv1.IsomerCluster, role string) map[string]string {
 	return map[string]string{"app.kubernetes.io/instance": c.Name, "isomerdb.io/role": role}
 }
+
+const (
+	labelNode    = "isomerdb.io/node"    // coordinator | worker, on primaries and standbys alike
+	labelPrimary = "isomerdb.io/primary" // "true" on each group's primary pod (set by the operator)
+)
+
+// nodeKind is the kind of node a database role runs: a coordinator or a worker.
+func nodeKind(role string) string { return strings.TrimSuffix(role, "-replica") }
 
 func secretEnv(name, secret, key string) corev1.EnvVar {
 	return corev1.EnvVar{Name: name, ValueFrom: &corev1.EnvVarSource{
@@ -97,7 +124,11 @@ func clientService(c *isomerv1.IsomerCluster) *corev1.Service {
 	}
 	return &corev1.Service{
 		ObjectMeta: metav1.ObjectMeta{Name: n.client(), Namespace: c.Namespace, Labels: labels(c, roleCoordinator)},
-		Spec:       corev1.ServiceSpec{Selector: selector(c, roleCoordinator), Ports: ports},
+		// Whichever coordinator pod is the primary (the operator labels it).
+		Spec: corev1.ServiceSpec{
+			Selector: map[string]string{"app.kubernetes.io/instance": c.Name, labelNode: roleCoordinator, labelPrimary: "true"},
+			Ports:    ports,
+		},
 	}
 }
 
@@ -111,6 +142,52 @@ func apiService(c *isomerv1.IsomerCluster) *corev1.Service {
 	}
 }
 
+// ── authentication ──────────────────────────────────────────────────────────
+
+// Node-to-node connections (Citus, IsomerDB's own, replication) use TLS and the node client
+// certificate, which maps to any role. Applications reach the coordinator with a password; workers
+// accept nothing but the node certificate. Inside the pod (socket, loopback) trust is kept: the
+// init scripts and the MongoDB gateway connect that way.
+const hbaCommon = `# Managed by the IsomerDB operator.
+local    all          all                  trust
+host     all          all   127.0.0.1/32   trust
+host     all          all   ::1/128        trust
+hostssl  replication  all   all            cert map=isomer-nodes
+`
+
+func authConfigMap(c *isomerv1.IsomerCluster) *corev1.ConfigMap {
+	return &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: names{c}.auth(), Namespace: c.Namespace, Labels: labels(c, roleCoordinator)},
+		Data: map[string]string{
+			"pg_hba-coordinator.conf": hbaCommon + "host     all          all   all            scram-sha-256\n",
+			"pg_hba-worker.conf":      hbaCommon + "hostssl  all          all   all            cert map=isomer-nodes\n",
+			"pg_ident.conf":           "# Managed by the IsomerDB operator: the node certificate may act as any role.\nisomer-nodes  " + nodeCertCN + "  all\n",
+		},
+	}
+}
+
+// postgresArgs points the server at the operator's TLS files and authentication rules, and makes
+// every connection Citus opens to another node verify it and present the node certificate.
+//
+// Replication settings (max_slot_wal_keep_size, synchronous_standby_names) are not here: the
+// operator sets them on each primary with ALTER SYSTEM (replicationSettings), so turning standbys
+// on or off never restarts a primary.
+func postgresArgs(c *isomerv1.IsomerCluster, role string) []string {
+	args := []string{
+		"postgres",
+		"-c", "ssl=on",
+		"-c", "ssl_cert_file=" + tlsDir + "/tls.crt",
+		"-c", "ssl_key_file=" + tlsDir + "/tls.key",
+		"-c", "ssl_ca_file=" + tlsDir + "/ca.crt",
+		"-c", "hba_file=/etc/isomerdb/auth/pg_hba-" + role + ".conf",
+		"-c", "ident_file=/etc/isomerdb/auth/pg_ident.conf",
+		"-c", "citus.node_conninfo=" + nodeConninfo,
+	}
+	return args
+}
+
+const nodeConninfo = "sslmode=verify-full sslrootcert=" + tlsDir + "/ca.crt sslcert=" + tlsDir + "/client.crt sslkey=" + tlsDir + "/client.key"
+
 // ── database nodes ──────────────────────────────────────────────────────────
 
 // isomerReady passes once the server accepts TCP connections and the isomer extension exists. The
@@ -120,32 +197,25 @@ var isomerReady = []string{"sh", "-c",
 
 func databaseStatefulSet(c *isomerv1.IsomerCluster, role string, replicas int32) *appsv1.StatefulSet {
 	n := names{c}
-	name := n.coordinator()
-	if role == roleWorker {
-		name = n.worker()
-	}
+	name := n.setFor(role)
+	kind := nodeKind(role)
 	env := []corev1.EnvVar{
 		secretEnv("POSTGRES_PASSWORD", n.credentials(), keyPostgresPassword),
-		{Name: "ISOMER_ROLE", Value: role},
+		{Name: "ISOMER_ROLE", Value: kind},
 	}
-	if role == roleCoordinator {
+	if kind == roleCoordinator {
 		env = append(env,
 			corev1.EnvVar{Name: "ISOMER_COORDINATOR_HOST", Value: n.coordinatorHost()},
 			secretEnv("ISOMER_MONGO_USER", n.credentials(), keyMongoUser),
 			secretEnv("ISOMER_MONGO_PASSWORD", n.credentials(), keyMongoPassword),
 		)
-	} else {
-		// Citus connects to workers as each client's own role (a MongoDB user's, for example),
-		// whose password the coordinator does not hold. Development setting, as in docker-compose:
-		// a NetworkPolicy keeps workers reachable from the cluster's own pods only. Production
-		// uses certificate authentication (citus.node_conninfo) or pg_dist_authinfo.
-		env = append(env, corev1.EnvVar{Name: "POSTGRES_HOST_AUTH_METHOD", Value: "trust"})
 	}
 
 	postgres := corev1.Container{
 		Name:            "postgres",
 		Image:           c.Spec.Image,
 		ImagePullPolicy: c.Spec.ImagePullPolicy,
+		Args:            postgresArgs(c, kind),
 		Env:             env,
 		Ports:           []corev1.ContainerPort{{Name: "postgres", ContainerPort: 5432}},
 		Resources:       c.Spec.Resources,
@@ -153,7 +223,17 @@ func databaseStatefulSet(c *isomerv1.IsomerCluster, role string, replicas int32)
 			{Name: "data", MountPath: "/var/lib/postgresql"},
 			{Name: "socket", MountPath: "/var/run/postgresql"},
 			{Name: "dshm", MountPath: "/dev/shm"},
+			{Name: "tls", MountPath: tlsDir, ReadOnly: true},
+			{Name: "auth", MountPath: "/etc/isomerdb/auth", ReadOnly: true},
 		},
+		// Kubernetes stops containers with SIGTERM, which is Postgres's smart shutdown: it waits for
+		// every client to leave, and Citus keeps connections cached, so it would run into the
+		// grace period and be killed. A fast shutdown (SIGINT) finishes cleanly in well under a
+		// second, after sending a standby all of its WAL. The hook only sends the signal: a hook
+		// that waits for PID 1 to exit is itself left hanging until the grace period ends.
+		Lifecycle: &corev1.Lifecycle{PreStop: &corev1.LifecycleHandler{Exec: &corev1.ExecAction{
+			Command: []string{"sh", "-c", "kill -INT 1"},
+		}}},
 		// First boot (initdb, extensions, DocumentDB setup) takes a minute or two.
 		StartupProbe: &corev1.Probe{
 			ProbeHandler:     corev1.ProbeHandler{Exec: &corev1.ExecAction{Command: []string{"pg_isready", "-U", "postgres", "-h", "127.0.0.1", "-q"}}},
@@ -173,7 +253,7 @@ func databaseStatefulSet(c *isomerv1.IsomerCluster, role string, replicas int32)
 		},
 	}
 	containers := []corev1.Container{postgres}
-	if role == roleCoordinator && c.Spec.Gateway.Enabled {
+	if kind == roleCoordinator && c.Spec.Gateway.Enabled {
 		// The gateway only connects to Postgres over its Unix socket, so it shares the pod.
 		containers = append(containers, corev1.Container{
 			Name:            "gateway",
@@ -199,6 +279,26 @@ func databaseStatefulSet(c *isomerv1.IsomerCluster, role string, replicas int32)
 	}
 	fsGroup := int64(postgresUID)
 	shm := resource.MustParse("1Gi")
+	// Before Postgres starts: keep a primary's data, clone or rewind a standby (isomer-node-init).
+	initNode := corev1.Container{
+		Name:            "node-init",
+		Image:           c.Spec.Image,
+		ImagePullPolicy: c.Spec.ImagePullPolicy,
+		Command:         []string{"isomer-node-init"},
+		SecurityContext: &corev1.SecurityContext{RunAsUser: ptr(int64(postgresUID)), RunAsGroup: ptr(int64(postgresUID))},
+		Env: []corev1.EnvVar{
+			{Name: "ISOMER_CLUSTER", Value: c.Name},
+			{Name: "POD_NAMESPACE", ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.namespace"}}},
+			secretEnv("PGPASSWORD", n.credentials(), keyPostgresPassword),
+		},
+		VolumeMounts: []corev1.VolumeMount{
+			{Name: "data", MountPath: "/var/lib/postgresql"},
+			{Name: "tls", MountPath: tlsDir, ReadOnly: true},
+			{Name: "topology", MountPath: "/etc/isomerdb/topology", ReadOnly: true},
+		},
+	}
+	podLabels := labels(c, role)
+	podLabels[labelNode] = kind
 	return &appsv1.StatefulSet{
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: c.Namespace, Labels: labels(c, role)},
 		Spec: appsv1.StatefulSetSpec{
@@ -213,12 +313,18 @@ func databaseStatefulSet(c *isomerv1.IsomerCluster, role string, replicas int32)
 				WhenScaled:  appsv1.DeletePersistentVolumeClaimRetentionPolicyType,
 			},
 			Template: corev1.PodTemplateSpec{
-				ObjectMeta: metav1.ObjectMeta{Labels: labels(c, role)},
+				ObjectMeta: metav1.ObjectMeta{Labels: podLabels},
 				Spec: corev1.PodSpec{
 					SecurityContext:               &corev1.PodSecurityContext{FSGroup: &fsGroup},
 					TerminationGracePeriodSeconds: ptr(int64(60)),
+					InitContainers:                []corev1.Container{initNode},
 					Containers:                    containers,
 					Volumes: []corev1.Volume{
+						// Keys are root-owned and group-readable (0640, group postgres via fsGroup),
+						// which both the server and libpq accept.
+						{Name: "tls", VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{SecretName: n.tlsSecret(), DefaultMode: ptr(int32(0o640))}}},
+						{Name: "auth", VolumeSource: corev1.VolumeSource{ConfigMap: &corev1.ConfigMapVolumeSource{LocalObjectReference: corev1.LocalObjectReference{Name: n.auth()}}}},
+						{Name: "topology", VolumeSource: corev1.VolumeSource{ConfigMap: &corev1.ConfigMapVolumeSource{LocalObjectReference: corev1.LocalObjectReference{Name: n.topology()}, Optional: ptr(true)}}},
 						{Name: "socket", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}},
 						{Name: "dshm", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{Medium: corev1.StorageMediumMemory, SizeLimit: &shm}}},
 					},
@@ -282,18 +388,25 @@ func serviceDeployment(c *isomerv1.IsomerCluster, role string, spec isomerv1.Com
 
 func ptr[T any](v T) *T { return &v }
 
-// workerNetworkPolicy admits connections to workers only from this cluster's own database pods
-// (the coordinator and the other workers), since workers trust connections (see above).
+// workerNetworkPolicy admits connections to workers (primaries and standbys) only from this
+// cluster's own database pods and the operator: defence in depth on top of certificate auth.
 func workerNetworkPolicy(c *isomerv1.IsomerCluster) *networkingv1.NetworkPolicy {
+	database := &metav1.LabelSelector{
+		MatchLabels:      map[string]string{"app.kubernetes.io/instance": c.Name},
+		MatchExpressions: []metav1.LabelSelectorRequirement{{Key: labelNode, Operator: metav1.LabelSelectorOpExists}},
+	}
 	return &networkingv1.NetworkPolicy{
 		ObjectMeta: metav1.ObjectMeta{Name: names{c}.worker(), Namespace: c.Namespace, Labels: labels(c, roleWorker)},
 		Spec: networkingv1.NetworkPolicySpec{
-			PodSelector: metav1.LabelSelector{MatchLabels: selector(c, roleWorker)},
+			PodSelector: metav1.LabelSelector{MatchLabels: map[string]string{"app.kubernetes.io/instance": c.Name, labelNode: roleWorker}},
 			PolicyTypes: []networkingv1.PolicyType{networkingv1.PolicyTypeIngress},
 			Ingress: []networkingv1.NetworkPolicyIngressRule{{
 				From: []networkingv1.NetworkPolicyPeer{
-					{PodSelector: &metav1.LabelSelector{MatchLabels: selector(c, roleCoordinator)}},
-					{PodSelector: &metav1.LabelSelector{MatchLabels: selector(c, roleWorker)}},
+					{PodSelector: database},
+					{
+						NamespaceSelector: &metav1.LabelSelector{},
+						PodSelector:       &metav1.LabelSelector{MatchLabels: map[string]string{"app.kubernetes.io/name": "isomerdb-operator"}},
+					},
 				},
 			}},
 		},

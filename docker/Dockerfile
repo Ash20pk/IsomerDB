@@ -94,6 +94,7 @@ COPY extensions/isomer/isomer.control extensions/isomer/isomer--*.sql /usr/share
 COPY docker/postgresql.isomer.conf /usr/share/postgresql/isomer.conf
 RUN printf "\ninclude = '/usr/share/postgresql/isomer.conf'\n" >> /usr/share/postgresql/postgresql.conf.sample
 COPY docker/initdb/ /docker-entrypoint-initdb.d/
+COPY docker/isomer-node-init.sh /usr/local/bin/isomer-node-init
 COPY docker/gateway.json /etc/isomerdb/gateway.json
 COPY NOTICE /usr/share/doc/isomerdb/NOTICE
 COPY extensions/sharding/LICENSE /usr/share/doc/isomerdb/licenses/citus.LICENSE
