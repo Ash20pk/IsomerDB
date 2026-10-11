@@ -3,9 +3,11 @@
 # shards; ISOMER_ROLE=worker sets up a Citus worker node (extensions only; the coordinator adds it).
 set -euo pipefail
 
-# Nodes connect to each other as postgres with the cluster password (dev setup; use certificates
-# and pg_dist_authinfo in production).
-echo "*:*:*:postgres:${POSTGRES_PASSWORD}" > "$HOME/.pgpass"
+# Nodes connect to each other with the cluster password (dev setup; use certificates and
+# pg_dist_authinfo in production). Citus moves a shard as its table's owner, and DocumentDB's
+# collection tables belong to documentdb_admin_role, so that role needs the password too (set
+# below, on the coordinator; Citus propagates it to the workers).
+printf '%s\n' "*:*:*:postgres:${POSTGRES_PASSWORD}" "*:*:*:documentdb_admin_role:${POSTGRES_PASSWORD}" > "$HOME/.pgpass"
 chmod 600 "$HOME/.pgpass"
 
 if [ "${ISOMER_ROLE:-coordinator}" = "worker" ]; then
@@ -51,6 +53,11 @@ CREATE EXTENSION IF NOT EXISTS isomer;
 -- Bounded projections are drained every second; attachments are health-checked every 10s.
 SELECT cron.schedule('isomer-drain', '1 seconds', 'SELECT isomer.drain()') WHERE citus_is_coordinator();
 SELECT cron.schedule('isomer-check-attachments', '10 seconds', 'SELECT isomer.check_attachments()') WHERE citus_is_coordinator();
+SQL
+
+# Shard moves connect as the table's owner (see .pgpass above).
+psql -v ON_ERROR_STOP=1 -v pw="${POSTGRES_PASSWORD}" --username "$POSTGRES_USER" --dbname postgres <<'SQL'
+ALTER ROLE documentdb_admin_role PASSWORD :'pw';
 SQL
 
 # The name worker nodes use to reach this coordinator (compose sets it; single-node can stay local).

@@ -2,6 +2,82 @@
 
 Things we learned building the stack that are not obvious from the upstream docs. Newest first.
 
+## 2026-10-11 — History, time travel, change feeds, and projections over HTTP (roadmap)
+
+`tests/history.sh` passes (37 checks) on a single node and on the three-node cluster. Isomer 0.8.0
+keeps an opt-in change log per projection (`isomer.set_history(name, retention)`), and three
+roadmap items read from it:
+
+- **Time travel.** `isomer.as_of(projection, key, at)` returns one document as it was at a moment;
+  `isomer.as_of(projection, at)` returns the whole projection; `isomer.history(projection, key)`
+  lists every version kept. A moment before the horizon (retention, or when history began) is
+  refused with IS002 instead of answering wrongly.
+- **Event feeds.** `isomer.changes_since(projection, cursor)` returns every change in commit order,
+  with no gaps. `isomer.snapshot(projection)` gives a consistent starting point: the documents and
+  the cursor they are as of. A cursor that retention has pruned past fails with IS003 (re-snapshot).
+- **Projections as API, and live sync.** `services/api` (Rust, axum) serves key lookup, `?as_of`,
+  history, the feed, and `/live` as server-sent events. `/live` opens with a snapshot event, then
+  sends change events with the feed id as the SSE id, so `Last-Event-ID` resumes exactly where a
+  client stopped. Live delivery is woken by `NOTIFY isomer_changes`, with a one-second poll as a
+  fallback (measured in the test at about 20 ms). `X-Isomer-After: <token>` gives read-your-writes
+  over HTTP (503 with `Retry-After` if not caught up).
+
+How it is built:
+
+- **One log, written where the projection is written.** `_apply` (the only path that writes
+  document and cache projections, for sync and bounded alike) records each key's new document, or a
+  delete, in `isomer.changes`. Unchanged documents are skipped, so a no-op update logs nothing.
+  Search and vector projections don't keep history: their storage is pg_trickle and the embedder,
+  not `_apply`.
+- **Commit order is what makes the feed gap-free.** Ids come from a sequence, but are taken while
+  holding a per-projection transaction lock, so within a projection they are assigned in commit
+  order. Once id N is visible, nothing smaller can still appear. The obvious alternatives don't
+  hold: a plain sequence lets a slow transaction commit a smaller id after a reader has passed it,
+  and ordering by transaction id breaks per-key order (a transaction that started earlier can
+  commit a key's later version). **Cost:** sync writers to a projection with history are
+  serialised on that lock. Bounded projections are unaffected, because one drain applies them.
+- **Starting history is consistent.** The baseline is taken with the source tables locked in
+  SHARE mode, so no write can fall between the baseline and the log.
+- **Retention keeps the version at the cutoff.** `prune_history()` (every minute) deletes versions
+  superseded before the cutoff, and deletes older than it, so `as_of` still answers at the horizon.
+- **The API never widens access.** An API key (`isomer.create_api_key(name, role)`, stored only as a
+  SHA-256 hash) acts as a Postgres role. `isomer.can_read(role, projection)` applies the routing
+  rule: the role can SELECT every table behind the projection, and none has row-level security. A
+  projection the role may not read answers 404, the same as a missing one. Keys cannot act as a
+  superuser.
+
+What bit us:
+
+- **Lost document updates on a cluster (a bug that predated history).** The concurrency test
+  replayed the feed and found three keys where storage was stale while the log was right, and
+  `verify` agreed. The collection's shard lives on a worker, written in a two-phase commit. The
+  coordinator commits first, releasing the per-key lock, while the worker's `COMMIT PREPARED` is
+  still in flight. The next writer's DocumentDB update then meets a row whose newer version is not
+  yet committed, and can match nothing and lose the write. `_apply` now locks the documents
+  (`SELECT … FOR UPDATE`, routed to the shard, using the `_id` index) before computing them on a
+  multi-node cluster. That waits out any such commit. The single-node phase 3 concurrency test
+  could never catch this, because there the collection is local.
+- **`wait_for` could return early across nodes (the long-standing multinode flake).** A queued key
+  moves from a worker's `node_queue` to the coordinator's `pending`: the pull commits the
+  coordinator's copy, then the worker's delete. `_queued_before` checked both in one expression, so
+  `pending` was read with a snapshot taken *before* the workers were asked. A key moving in between
+  was seen in neither place. A loop of write, `wait_for`, read against a freshly added node missed
+  9 of 50. Now the workers are asked first, then `pending` is read in a separate statement whose
+  fresh snapshot covers anything the workers no longer hold: 0 of 100. This, not the router, was
+  behind the intermittent "a write to a shard moved to worker2" failure.
+- **Shard moves onto the coordinator failed authentication.** Citus moves a shard as its table's
+  owner, and DocumentDB's collection tables belong to `documentdb_admin_role`, which had no
+  password. Any rebalance moving a collection shard to the coordinator retried forever
+  ("fe_sendauth: no password supplied"). The init script now gives that role the cluster password
+  and adds it to `.pgpass` on every node (dev setup; production uses certificates and
+  `pg_dist_authinfo`).
+- **`citus_rebalance_start()` is asynchronous.** Polling `citus_rebalance_status()` right after it
+  can read "finished" before the job is picked up, and shards then move mid-test.
+  `citus_rebalance_wait()` is the reliable wait.
+- **Not verified yet:** capture for writes made *during* a shard move. The tests write after a
+  rebalance finishes. Citus keeps triggers on moved shards, and the source shard's trigger fires
+  for writes before cutover, but we have not tested a write racing the cutover itself.
+
 ## 2026-10-11 — Query routing (FR-M4)
 
 `tests/routing.sh` passes (12 checks). An application's unchanged prepared statement (a keyed join

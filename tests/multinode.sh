@@ -16,7 +16,7 @@ pass() { printf '  ok   %s\n' "$1"; }
 fail() {
   printf '  FAIL %s\n       expected: %s\n       got:      %s\n' "$1" "$2" "$3"
   echo "-- state at failure --"
-  $ISO_NOFAIL -c "SELECT 'pending', string_agg(projection || ':' || key, ',') FROM isomer.pending" \
+  $ISO_NOFAIL -c "SELECT 'pending', string_agg(projection || ':' || key || ' token ' || token || ' at ' || enqueued_at, ', ') FROM isomer.pending" \
               -c "SELECT 'node_queue ' || nodename, result FROM run_command_on_workers('SELECT string_agg(projection || '':'' || key, '','') FROM isomer.node_queue')" \
               -c "SELECT command, status, start_time FROM cron.job_run_details WHERE command ~ 'pull|drain' ORDER BY start_time DESC LIMIT 4" \
               -c "SELECT level, left(message, 160) FROM isomer.events ORDER BY id DESC LIMIT 4" \
@@ -106,8 +106,11 @@ if [ "$($ISO -c "SELECT count(*) FROM pg_dist_node WHERE nodename = 'worker2'")"
   contains "worker2 added and rebalancing" "worker2:5432 added" "$($ISO -c "SELECT isomer.add_node('worker2')")"
 else
   $ISO -c "SELECT citus_rebalance_start()" >/dev/null 2>&1 || true
-  pass "worker2 already in the cluster (rerun): rebalancing"
+  # The job is picked up asynchronously, so its status can still read "finished" for a moment.
+  $ISO -c "SELECT citus_rebalance_wait()" >/dev/null 2>&1 || true
+  pass "worker2 already in the cluster (rerun): rebalanced"
 fi
+$ISO -c "SELECT citus_rebalance_wait()" >/dev/null 2>&1 || true
 eventually "rebalance finished" "finished" "$ISO -c \"SELECT coalesce((SELECT state::text FROM citus_rebalance_status()), 'finished')\"" 180
 expect "shards now on three nodes" "3" "$($ISO -c "SELECT count(DISTINCT nodename) FROM citus_shards WHERE table_name = 'mn.orders'::regclass")"
 repaired=$($ISO -c "SELECT count(*) FROM isomer.rebalance_finished()")

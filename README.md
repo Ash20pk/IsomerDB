@@ -19,21 +19,25 @@ runs, with no migration.
 | [`extensions/isomer/`](extensions/isomer/) | The `isomer` Postgres extension: projections, attach mode, advisors |
 | [`extensions/isomer_router/`](extensions/isomer_router/) | C planner hook that routes keyed reads onto projections |
 | [`services/embedder/`](services/embedder/) | Rust service that computes embeddings for vector projections |
-| [`tests/phase0.sh`](tests/phase0.sh) … [`phase3.sh`](tests/phase3.sh), [`native.sh`](tests/native.sh), [`multinode.sh`](tests/multinode.sh), [`routing.sh`](tests/routing.sh) | Acceptance tests: Phase 0 (attach, document and search projections), 1 (vector projections), 2 (primary mode: cutover, sharding, sync, read-your-writes, auditor), 3 (proposer, shard advisor, certificates, randomized concurrency) |
+| [`services/api/`](services/api/) | Rust HTTP API: projections by key, time travel, change feeds and live streams (SSE) |
+| [`tests/phase0.sh`](tests/phase0.sh) … [`phase3.sh`](tests/phase3.sh), [`native.sh`](tests/native.sh), [`multinode.sh`](tests/multinode.sh), [`routing.sh`](tests/routing.sh), [`history.sh`](tests/history.sh) | Acceptance tests: Phase 0 (attach, document and search projections), 1 (vector projections), 2 (primary mode: cutover, sharding, sync, read-your-writes, auditor), 3 (proposer, shard advisor, certificates, randomized concurrency) |
 | [`scripts/smoke.sh`](scripts/smoke.sh) | Checks every base component works in a running stack |
+| [`scripts/test-all.sh`](scripts/test-all.sh) | Every suite on fresh stacks, single-node then the three-node cluster |
 | [`docs/engineering-notes.md`](docs/engineering-notes.md) | What we learned building the stack (gateway auth, pg_trickle and Citus quirks) |
 
 ## Run locally
 
 ```sh
-docker compose up --build -d     # Postgres on :5432, MongoDB wire gateway on :10260
+docker compose up --build -d     # Postgres on :5432, MongoDB wire gateway on :10260, HTTP API on :8080
 ./scripts/smoke.sh
 
 docker compose --profile attach up -d   # adds a stand-in customer Postgres (:5433) and a mock embeddings API
-./tests/phase0.sh && ./tests/phase1.sh && ./tests/phase2.sh && ./tests/phase3.sh && ./tests/native.sh && ./tests/routing.sh
+./tests/phase0.sh && ./tests/phase1.sh && ./tests/phase2.sh && ./tests/phase3.sh && ./tests/native.sh && ./tests/routing.sh && ./tests/history.sh
 
 docker compose --profile cluster up -d  # adds two Citus worker nodes
 ./tests/multinode.sh                    # joins them, rebalances online, tests across nodes
+
+./scripts/test-all.sh                   # or all of it, on fresh stacks (destroys this project's volumes)
 ```
 
 ## Using it
@@ -94,6 +98,25 @@ SELECT * FROM isomer.shard_advice();
 -- Route a slow keyed read onto a projection: the application's SQL doesn't change
 SELECT isomer.route_proposal(1);   -- verified on sample keys, enabled only if measurably faster
 SELECT * FROM isomer.attachment_status();
+
+-- History: time travel and a change feed (document and cache projections)
+SELECT isomer.set_history('customer_profile', '7 days');
+SELECT isomer.as_of('customer_profile', '42', now() - interval '1 hour');   -- one document, then
+SELECT * FROM isomer.as_of('customer_profile', '2026-10-01 09:00+00');       -- the whole projection, then
+SELECT * FROM isomer.history('customer_profile', '42');                      -- every version kept
+SELECT * FROM isomer.changes_since('customer_profile', 0);                   -- the feed, in commit order
+
+-- Serve projections over HTTP: an API key acts as a Postgres role, and reads only what it could
+-- read from the tables behind the projection
+SELECT isomer.create_api_key('storefront', 'storefront_reader');   -- shown once
+```
+
+```sh
+curl -H "Authorization: Bearer $KEY" localhost:8080/v1/projections/customer_profile/docs/42
+curl -H "Authorization: Bearer $KEY" -H "X-Isomer-After: $TOKEN" localhost:8080/v1/projections/customer_profile/docs/42
+curl -H "Authorization: Bearer $KEY" "localhost:8080/v1/projections/customer_profile/docs/42?as_of=2026-10-01T09:00:00Z"
+curl -H "Authorization: Bearer $KEY" "localhost:8080/v1/projections/customer_profile/changes?after=0&limit=100"
+curl -N -H "Authorization: Bearer $KEY" localhost:8080/v1/projections/customer_profile/live   # snapshot, then changes (SSE)
 ```
 
 - Postgres: `psql postgres://postgres:isomer@localhost:5432/postgres`

@@ -52,6 +52,23 @@ services:
     volumes:
       - pgsocket:/var/run/postgresql
 
+  # Serves projections over HTTP: key lookup, time travel, change feeds, live streams (SSE).
+  # Requests carry an API key from isomer.create_api_key(name, role).
+  api:
+    build:
+      context: .
+      dockerfile: services/api/Dockerfile
+    image: isomer-api:dev
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      ISOMER_DATABASE_URL: host=/var/run/postgresql user=postgres dbname=postgres
+    volumes:
+      - pgsocket:/var/run/postgresql
+    ports:
+      - "8080:8080"
+
   # A stand-in OpenAI-compatible embeddings API, for tests (rate-limits every 5th request).
   mockai:
     image: python:3.12-alpine
