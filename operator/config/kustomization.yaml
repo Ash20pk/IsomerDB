@@ -1,0 +1,5 @@
+# kubectl apply -k operator/config
+resources:
+  - crd/isomerdb.io_isomerclusters.yaml
+  - rbac/role.yaml
+  - manager/manager.yaml

@@ -19,8 +19,9 @@ runs, with no migration.
 | [`extensions/isomer/`](extensions/isomer/) | The `isomer` Postgres extension: projections, attach mode, advisors |
 | [`extensions/isomer_router/`](extensions/isomer_router/) | C planner hook that routes keyed reads onto projections |
 | [`services/embedder/`](services/embedder/) | Rust service that computes embeddings for vector projections |
+| [`operator/`](operator/) | Kubernetes operator (Go): `IsomerCluster` resources, online scale up/down with rebalance and drain. See [`operator/README.md`](operator/README.md) |
 | [`services/api/`](services/api/) | Rust HTTP API: projections by key, time travel, change feeds and live streams (SSE) |
-| [`tests/phase0.sh`](tests/phase0.sh) … [`phase3.sh`](tests/phase3.sh), [`native.sh`](tests/native.sh), [`multinode.sh`](tests/multinode.sh), [`routing.sh`](tests/routing.sh), [`history.sh`](tests/history.sh) | Acceptance tests: Phase 0 (attach, document and search projections), 1 (vector projections), 2 (primary mode: cutover, sharding, sync, read-your-writes, auditor), 3 (proposer, shard advisor, certificates, randomized concurrency) |
+| [`tests/phase0.sh`](tests/phase0.sh) … [`phase3.sh`](tests/phase3.sh), [`native.sh`](tests/native.sh), [`multinode.sh`](tests/multinode.sh), [`routing.sh`](tests/routing.sh), [`history.sh`](tests/history.sh), [`operator.sh`](tests/operator.sh) | Acceptance tests: Phase 0 (attach, document and search projections), 1 (vector projections), 2 (primary mode: cutover, sharding, sync, read-your-writes, auditor), 3 (proposer, shard advisor, certificates, randomized concurrency) |
 | [`scripts/smoke.sh`](scripts/smoke.sh) | Checks every base component works in a running stack |
 | [`scripts/test-all.sh`](scripts/test-all.sh) | Every suite on fresh stacks, single-node then the three-node cluster |
 | [`docs/engineering-notes.md`](docs/engineering-notes.md) | What we learned building the stack (gateway auth, pg_trickle and Citus quirks) |
@@ -38,6 +39,8 @@ docker compose --profile cluster up -d  # adds two Citus worker nodes
 ./tests/multinode.sh                    # joins them, rebalances online, tests across nodes
 
 ./scripts/test-all.sh                   # or all of it, on fresh stacks (destroys this project's volumes)
+
+./tests/operator.sh                     # the operator on a local kind cluster (its own kubeconfig)
 ```
 
 ## Using it

@@ -2,6 +2,59 @@
 
 Things we learned building the stack that are not obvious from the upstream docs. Newest first.
 
+## 2026-10-11 — Kubernetes operator on kind
+
+`tests/operator.sh` passes on a local kind cluster (Kubernetes 1.36), with nothing spent on cloud
+resources. One `IsomerCluster` resource brings up a coordinator, two workers and the HTTP API, all
+Ready in about 25 seconds. Over the run, the test:
+
+- serves SQL, MongoDB (through the gateway) and HTTP;
+- scales to three workers online and back to two (drain, then remove) without losing a row;
+- keeps the projection equal to recomputation throughout;
+- survives coordinator and worker pod restarts on their volumes;
+- cleans up everything on delete.
+
+Design choices:
+
+- **StatefulSets, not CloudNativePG.** CloudNativePG runs one Postgres primary with replicas. It
+  has no model for Citus workers, and it replaces the image's entrypoint, while our first-boot
+  setup lives in the official image's init scripts. The operator manages a coordinator
+  StatefulSet and a worker StatefulSet directly. Each pod gets a stable DNS name from a headless
+  Service that publishes addresses before the pod is ready. Citus and the init scripts must
+  resolve nodes that are still starting.
+- **The gateway is a sidecar.** It only connects to Postgres over the Unix socket, so it shares
+  the coordinator pod and an `emptyDir` mounted at `/var/run/postgresql`.
+- **Readiness means "isomer is installed"**, checked over TCP. The image's first-boot setup runs
+  against a socket-only server, so a plain `pg_isready` over the socket would pass too early. A
+  startup probe allows up to ten minutes for first boot.
+- **Membership follows `spec.workers`, never the other way round.** Workers register only once
+  their pod is ready, and one rebalance runs for a batch of new nodes, since Citus allows only one
+  background rebalance at a time. A worker above the desired count is first marked
+  `shouldhaveshards = false`, then drained by a drain-only rebalance and removed from Citus. Only
+  then does the StatefulSet shrink: the worker StatefulSet keeps every pod still registered.
+  Removed workers' volumes are deleted (`WhenScaled: Delete`), so a node added later starts empty
+  instead of carrying stale Citus metadata.
+- **`isomer.rebalance_finished()` runs after every finished rebalance job** (tracked in
+  `status.lastRepairedJob`).
+- **Server-side apply** for every child object, so defaults the API server adds don't cause
+  update loops.
+- **`kubectl scale isomer`** works through the scale subresource (`.spec.workers`).
+- **Credentials** are generated once into `<name>-credentials` and never rewritten.
+
+What bit us:
+
+- **The current kubectl context on this machine is a production EKS cluster.** `kind create
+  cluster` normally switches the global context to the new cluster. Everything here uses a
+  separate kubeconfig (`operator/.kubeconfig-kind`, git-ignored), and the test exports it, so
+  nothing can reach another cluster by accident.
+- **`kind load docker-image` fails for multi-platform images** such as `mongo:8` ("content digest
+  … not found"). The test lets the node pull that one from the registry instead.
+- **A status can still read Ready just after a pod is deleted.** The restart checks wait for the
+  replacement pod (a new uid) to be ready, then run a query over every shard.
+
+Not done yet (also in `operator/README.md`): HA with standbys and failover, backups, certificate
+authentication between nodes, and version upgrades.
+
 ## 2026-10-11 — History, time travel, change feeds, and projections over HTTP (roadmap)
 
 `tests/history.sh` passes (37 checks) on a single node and on the three-node cluster. Isomer 0.8.0

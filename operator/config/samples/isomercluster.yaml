@@ -1,0 +1,17 @@
+# A coordinator (with the MongoDB gateway), two Citus workers, and the HTTP API.
+#   kubectl apply -f operator/config/samples/isomercluster.yaml
+#   kubectl scale isomercluster demo --replicas=3     # add a worker, rebalance online
+apiVersion: isomerdb.io/v1alpha1
+kind: IsomerCluster
+metadata:
+  name: demo
+spec:
+  image: isomerdb:dev
+  workers: 2
+  storage: 5Gi
+  deleteVolumes: true   # a demo: drop the data with the resource
+  resources:
+    requests: { cpu: 250m, memory: 768Mi }
+  api:
+    enabled: true
+    image: isomer-api:dev
