@@ -19,6 +19,7 @@ SELECT documentdb_api_distributed.initialize_cluster();
 GRANT USAGE ON SCHEMA documentdb_core, documentdb_api_catalog TO PUBLIC;
 
 CREATE EXTENSION IF NOT EXISTS dblink;
+CREATE EXTENSION IF NOT EXISTS pg_stat_statements;
 CREATE EXTENSION IF NOT EXISTS isomer;
 -- Bounded projections are drained every second; attachments are health-checked every 10s.
 SELECT cron.schedule('isomer-drain', '1 seconds', 'SELECT isomer.drain()');

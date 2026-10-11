@@ -2,6 +2,74 @@
 
 Things we learned building the stack that are not obvious from the upstream docs. Newest first.
 
+## 2026-10-11 — Phase 3 (single-node parts): advisors, certificates, concurrency
+
+`tests/phase3.sh` passes (26 checks), including three back-to-back runs of its randomized
+concurrency test. In each run, 4 workers make 600 random transactions with rollbacks and key moves
+across a sync projection over shards and a bounded one. Every read-your-writes check holds, and
+`isomer.verify` finds every projection equal to recomputation for every key.
+
+What exists:
+
+- **The proposer** (`isomer.propose`, hourly). It reads `pg_stat_statements`, stripping the
+  `PREPARE … AS` wrapper that driver-prepared statements carry, for frequent reads of the form
+  `… JOIN … WHERE alias.col = $1`.
+  - It drafts a per-key document projection: it maps each joined table to the key through the join
+    equalities, and canonicalises the draft.
+  - It estimates benefit (calls/s × time saved over a ~0.3 ms keyed read) and cost (source
+    writes/s × one run of the query, the cost of re-deriving a key).
+  - Drafts that can't be mapped are `needs_review`, with the reason.
+  - Auto-accept happens only under `proposer.auto_accept_max_write_ms_per_s`, and is off by
+    default.
+  - `isomer.unused_projections` flags projections with no reads for a quiet period, net of the
+    auditor's own scans.
+- **The shard advisor** (`isomer.shard_advice`) reports:
+  - fan-out joins from `citus_stat_statements`, with the column to co-locate on;
+  - small tables that take part in fan-out joins (reference candidates);
+  - bounded projections that are sync-ready, or blocked only by co-location.
+
+  `isomer.reshard_plan` and `isomer.reshard` change a shard key with `alter_distributed_table` and
+  recreate the shard triggers.
+- **Certificates** (`isomer.certificate`) state the maintenance rule and its assumptions, and check
+  them live: completeness, capture triggers present and `ENABLE ALWAYS` on every source and shard,
+  sync preconditions, pg_trickle health, and the auditor's record. A disabled trigger makes the
+  certificate invalid.
+- **`isomer.verify`** checks every key, from both sides, where the auditor samples.
+
+Bugs the randomized test found, which every earlier test missed:
+
+- **Sync lost update.** Transaction A renames account 82 while B inserts an event for it. B
+  derives the document from a snapshot taken before A commits, waits on the document's row lock,
+  then overwrites A's result with stale data. Fixed with a per-key transaction lock (in key order)
+  before deriving, so every derivation sees all earlier commits to its key.
+- **Bounded missed write.** A write that found its key already queued did nothing; a drain that had
+  read the queue just before could then miss it. The conflict now row-locks the queued key (the
+  drain skips locked keys until the write commits), and keeps the oldest real token for
+  read-your-writes.
+
+Other things that bit us:
+
+- **Citus won't plan correlated subqueries across non-co-located tables.** IsomerDB enables
+  `citus.enable_repartition_joins` so bounded projections can join them (as inner joins with
+  `GROUP BY`). Sync still requires co-location.
+- **Citus's `citus_stat_statements` calls `pg_stat_statements()` unqualified**, so the advisor
+  runs with `public` on its search path.
+- **All tables with the same key type and shard count share Citus's default co-location group**,
+  so "table alone in its group" is not a usable reference-table signal; taking part in fan-out
+  joins is.
+- **Session statistics are flushed lazily** (about once a second), so a baseline taken in the
+  same session as a bulk load doesn't include it.
+
+Not built from Phase 3 yet:
+
+- **Predicted-benefit query routing (FR-M4)** needs a planner hook in C.
+- **Multi-node clusters.** Projections over several Citus nodes are still refused, and online
+  rebalancing is untested.
+- **A DBSP engine for cross-shard projections.** Key-recompute plus pg_trickle cover today's
+  cases.
+- **A real Jepsen run.** The randomized concurrency test is the stand-in.
+- **The managed cloud and its Kubernetes operator.**
+
 ## 2026-10-11 — Phase 2: primary mode
 
 `tests/phase2.sh` passes. It covers:
