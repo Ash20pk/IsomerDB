@@ -11,6 +11,6 @@ runs, with no migration.
 
 | Path | What it is |
 |---|---|
-| [`PRD.md`](PRD.md) | Product requirements document |
-| [`research/`](research/) | Research behind the PRD's open questions: naming, DDL and read-your-writes tokens, embeddings and attach-mode providers, pricing / design partners / NFR targets |
-| [`reference/system-design-draft-3.html`](reference/system-design-draft-3.html) | The system design the PRD is based on (written under the earlier working name "Prism") |
+| [`docs/PRD.md`](docs/PRD.md) | Product requirements document |
+| [`docs/research/`](docs/research/) | Research behind the PRD's open questions: naming, DDL and read-your-writes tokens, embeddings and attach-mode providers, pricing / design partners / NFR targets |
+| [`docs/reference/system-design-draft-3.html`](docs/reference/system-design-draft-3.html) | The system design the PRD is based on (written under the earlier working name "Prism") |
