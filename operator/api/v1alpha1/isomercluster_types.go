@@ -50,6 +50,16 @@ type IsomerClusterSpec struct {
 	// +optional
 	HA HASpec `json:"ha,omitempty"`
 
+	// Backup archives every node's WAL continuously and takes base backups, to S3-compatible
+	// storage, and creates cluster-consistent restore points.
+	// +optional
+	Backup *BackupSpec `json:"backup,omitempty"`
+
+	// Restore builds this cluster from another cluster's backups, as of one of its restore
+	// points. Used when the cluster is created; set Workers to the source cluster's count.
+	// +optional
+	Restore *RestoreSpec `json:"restore,omitempty"`
+
 	// DeleteVolumes removes the data volumes when the IsomerCluster is deleted. Off by default:
 	// deleting the resource keeps the data.
 	// +optional
@@ -81,6 +91,55 @@ type HASpec struct {
 	// +kubebuilder:default="4GB"
 	// +optional
 	MaxRetainedWAL string `json:"maxRetainedWAL,omitempty"`
+}
+
+// S3Spec is a location in S3-compatible storage.
+type S3Spec struct {
+	Bucket string `json:"bucket"`
+	// Prefix inside the bucket; defaults to <namespace>/<cluster name>.
+	// +optional
+	Prefix string `json:"prefix,omitempty"`
+	// Endpoint for S3-compatible stores (MinIO, R2, GCS interoperability); empty for AWS.
+	// +optional
+	Endpoint string `json:"endpoint,omitempty"`
+	// +kubebuilder:default="us-east-1"
+	// +optional
+	Region string `json:"region,omitempty"`
+	// ForcePathStyle addresses buckets as <endpoint>/<bucket> (MinIO needs it).
+	// +optional
+	ForcePathStyle bool `json:"forcePathStyle,omitempty"`
+	// CredentialsSecret holds access-key-id and secret-access-key.
+	CredentialsSecret string `json:"credentialsSecret"`
+}
+
+// BackupSpec configures backups.
+type BackupSpec struct {
+	S3 S3Spec `json:"s3"`
+	// FullEvery is how often each node takes a full base backup; WAL is archived continuously.
+	// +kubebuilder:default="24h"
+	// +optional
+	FullEvery metav1.Duration `json:"fullEvery,omitempty"`
+	// Retain is how many full backups each node keeps (and the WAL needed by them).
+	// +kubebuilder:default=7
+	// +kubebuilder:validation:Minimum=1
+	// +optional
+	Retain int32 `json:"retain,omitempty"`
+	// RestorePointEvery is how often a cluster-consistent restore point is created.
+	// +kubebuilder:default="15m"
+	// +optional
+	RestorePointEvery metav1.Duration `json:"restorePointEvery,omitempty"`
+}
+
+// RestoreSpec builds a cluster from backups.
+type RestoreSpec struct {
+	// From is the source cluster's backup store (its spec.backup.s3, with its prefix).
+	From S3Spec `json:"from"`
+	// RestorePoint is the name of one of the source's restore points (isomer.restore_points, or
+	// status.lastRestorePoint on the source).
+	RestorePoint string `json:"restorePoint"`
+	// CredentialsSecret holds the source cluster's passwords (its <name>-credentials Secret,
+	// copied here): the restored data carries them.
+	CredentialsSecret string `json:"credentialsSecret"`
 }
 
 // ComponentSpec turns a stateless component on or off.
@@ -141,6 +200,12 @@ type IsomerClusterStatus struct {
 	Rebalance string `json:"rebalance,omitempty"`
 	// LastRepairedJob is the last rebalance job after which capture triggers were re-checked.
 	LastRepairedJob int64 `json:"lastRepairedJob,omitempty"`
+	// LastRestorePoint is the newest restore point the operator created.
+	LastRestorePoint string `json:"lastRestorePoint,omitempty"`
+	// LastRestorePointAt is when it was created.
+	LastRestorePointAt *metav1.Time `json:"lastRestorePointAt,omitempty"`
+	// Restored is set once a restore has finished and Citus points at this cluster's nodes.
+	Restored bool `json:"restored,omitempty"`
 	// Groups: each node group's primary and standby.
 	Groups []GroupStatus `json:"groups,omitempty"`
 	// LastFailover is the last standby promotion, planned or not.

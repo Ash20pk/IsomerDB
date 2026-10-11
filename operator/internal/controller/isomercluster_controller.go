@@ -6,8 +6,8 @@ import (
 	"crypto/tls"
 	"encoding/hex"
 	"fmt"
+	"regexp"
 	"strconv"
-	"strings"
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -204,6 +204,22 @@ func (r *IsomerClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		if changed {
 			if registered, err = db.workers(ctx); err != nil {
 				return ctrl.Result{}, err
+			}
+		}
+		status.Restored = c.Spec.Restore != nil && !changed
+	}
+	if b := c.Spec.Backup; b != nil {
+		every := b.RestorePointEvery.Duration
+		if every <= 0 {
+			every = 15 * time.Minute
+		}
+		status.LastRestorePoint, status.LastRestorePointAt = c.Status.LastRestorePoint, c.Status.LastRestorePointAt
+		if at := status.LastRestorePointAt; at == nil || time.Since(at.Time) >= every {
+			name, err := db.createRestorePoint(ctx)
+			if err != nil {
+				logger.Error(err, "creating a restore point")
+			} else {
+				status.LastRestorePoint, status.LastRestorePointAt = name, &metav1.Time{Time: time.Now()}
 			}
 		}
 	}
@@ -474,19 +490,18 @@ func orNone(s string) string {
 	return s
 }
 
+// workerHostRE matches a worker's host name: <cluster>-worker[-replica]-<i>.<set>.<namespace>...
+// The cluster name is not checked: after a restore, Citus still names the source's hosts.
+var workerHostRE = regexp.MustCompile(`^[a-z0-9]([-a-z0-9]*[a-z0-9])?-worker(-replica)?-([0-9]+)\.`)
+
 // workerIndex parses i from the host name of either member of worker group i.
-func workerIndex(n names, host string) (int, bool) {
-	for _, set := range []string{n.worker(), n.workerReplica()} {
-		prefix := set + "-"
-		suffix := "." + set + "." + n.c.Namespace + ".svc.cluster.local"
-		if !strings.HasPrefix(host, prefix) || !strings.HasSuffix(host, suffix) {
-			continue
-		}
-		if i, err := strconv.Atoi(strings.TrimSuffix(strings.TrimPrefix(host, prefix), suffix)); err == nil {
-			return i, true
-		}
+func workerIndex(_ names, host string) (int, bool) {
+	m := workerHostRE.FindStringSubmatch(host)
+	if m == nil {
+		return 0, false
 	}
-	return 0, false
+	i, err := strconv.Atoi(m[3])
+	return i, err == nil
 }
 
 func (r *IsomerClusterReconciler) finish(ctx context.Context, c *isomerv1.IsomerCluster, status isomerv1.IsomerClusterStatus, after time.Duration) (ctrl.Result, error) {
@@ -532,13 +547,26 @@ func (r *IsomerClusterReconciler) ensureCredentials(ctx context.Context, c *isom
 	if !apierrors.IsNotFound(err) {
 		return "", err
 	}
+	data := map[string]string{
+		keyPostgresPassword: randomSecret(),
+		keyMongoUser:        "isomer",
+		keyMongoPassword:    randomSecret(),
+	}
+	if rs := c.Spec.Restore; rs != nil {
+		// A restored cluster's data carries the source's passwords.
+		src := &corev1.Secret{}
+		if err := r.Get(ctx, client.ObjectKey{Namespace: c.Namespace, Name: rs.CredentialsSecret}, src); err != nil {
+			return "", fmt.Errorf("restore credentials %s: %w", rs.CredentialsSecret, err)
+		}
+		for _, k := range []string{keyPostgresPassword, keyMongoUser, keyMongoPassword} {
+			if v, ok := src.Data[k]; ok {
+				data[k] = string(v)
+			}
+		}
+	}
 	s = &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{Name: n.credentials(), Namespace: c.Namespace, Labels: labels(c, roleCoordinator)},
-		StringData: map[string]string{
-			keyPostgresPassword: randomSecret(),
-			keyMongoUser:        "isomer",
-			keyMongoPassword:    randomSecret(),
-		},
+		StringData: data,
 	}
 	if err := controllerutil.SetControllerReference(c, s, r.Scheme); err != nil {
 		return "", err
@@ -546,7 +574,7 @@ func (r *IsomerClusterReconciler) ensureCredentials(ctx context.Context, c *isom
 	if err := r.Create(ctx, s); err != nil {
 		return "", err
 	}
-	return s.StringData[keyPostgresPassword], nil
+	return data[keyPostgresPassword], nil
 }
 
 func randomSecret() string {

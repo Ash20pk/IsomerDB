@@ -29,7 +29,50 @@ primary=$(cat "$TOPOLOGY/$group" 2>/dev/null || echo "$ISOMER_CLUSTER-$kind-$ord
 
 log() { echo "isomer-node-init [$me, group $group]: $*"; }
 
+# Nodes reach each other's coordinator with the cluster password (shard moves connect as the
+# table's owner). The image's first boot writes it; pods that start from a clone or a restore
+# never run first boot, so write it here when it is missing.
+if [ -n "${PGPASSWORD:-}" ] && [ ! -s "$HOME/.pgpass" ]; then
+  printf '%s\n' "*:*:*:postgres:$PGPASSWORD" "*:*:*:documentdb_admin_role:$PGPASSWORD" > "$HOME/.pgpass"
+  chmod 600 "$HOME/.pgpass"
+fi
+
+# A finished restore leaves its recovery settings behind; drop them, so this node never fetches
+# WAL from the source cluster's archive again (it may become a standby later).
+if [ -s "$PGDATA/PG_VERSION" ] && [ ! -f "$PGDATA/recovery.signal" ] && [ -f "$PGDATA/postgresql.auto.conf" ]; then
+  sed -i -e '/^restore_command = .isomer-walg --source/d' -e '/^recovery_target_name/d' -e '/^recovery_target_action/d' \
+    "$PGDATA/postgresql.auto.conf"
+fi
+
+# Restore (spec.restore): the group's primary, starting empty, is rebuilt from the source
+# cluster's backups: the newest base backup that finished before the restore point, then the
+# source's WAL replayed up to the point, after which it is promoted. Restore points are made by
+# isomer.create_restore_point() and named isomer-<UTC timestamp>[-label].
+restore() {
+  local point=$ISOMER_RESTORE_POINT ts epoch backup
+  ts=$(echo "$point" | sed -n 's/^isomer-\([0-9]\{8\}\)T\([0-9]\{6\}\)Z.*/\1 \2/p')
+  [ -n "$ts" ] || { log "restore point '$point' is not one IsomerDB made (isomer-<UTC timestamp>...)"; exit 1; }
+  epoch=$(date -u -d "$(echo "$ts" | sed 's/\(....\)\(..\)\(..\) \(..\)\(..\)\(..\)/\1-\2-\3 \4:\5:\6/')" +%s)
+  backup=$(isomer-walg --source backup-list --json --detail | tr '{' '\n' | while read -r obj; do
+      name=$(echo "$obj" | sed -n 's/.*"backup_name":"\([^"]*\)".*/\1/p')
+      finish=$(echo "$obj" | sed -n 's/.*"finish_time":"\([^"]*\)".*/\1/p')
+      [ -n "$name" ] && [ -n "$finish" ] && [ "$(date -u -d "$finish" +%s)" -lt "$epoch" ] && echo "$(date -u -d "$finish" +%s) $name"
+    done | sort -n | tail -1 | cut -d' ' -f2)
+  [ -n "$backup" ] || { log "no base backup of $group finished before restore point $point"; exit 1; }
+  log "restoring $backup, then replaying to restore point $point"
+  mkdir -p "$PGDATA"
+  chmod 700 "$PGDATA"
+  isomer-walg --source backup-fetch "$PGDATA" "$backup"
+  printf "restore_command = 'isomer-walg --source wal-fetch %%f %%p'\nrecovery_target_name = '%s'\nrecovery_target_action = 'promote'\n" "$point" \
+    >> "$PGDATA/postgresql.auto.conf"
+  touch "$PGDATA/recovery.signal"
+}
+
 if [ "$primary" = "$me" ]; then
+  if [ -n "${ISOMER_RESTORE_PREFIX:-}" ] && [ ! -s "$PGDATA/PG_VERSION" ]; then
+    restore
+    exit 0
+  fi
   log "primary; keeping the data directory"
   exit 0
 fi

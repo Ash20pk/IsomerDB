@@ -360,25 +360,13 @@ func (r *IsomerClusterReconciler) tendGroup(ctx context.Context, c *isomerv1.Iso
 	return rep, nil
 }
 
-// reconcileMetadata points Citus at each group's current primary: the coordinator's own entry,
-// and every registered worker whose entry names the other member of its group (after a
-// failover). It returns whether anything changed.
+// reconcileMetadata points Citus at each group's current primary: first every registered worker
+// whose entry names another host (the other member of its group after a failover, or the source
+// cluster's host after a restore), then the coordinator's own entry, syncing metadata after each
+// step so the next one can reach every node. It returns whether anything changed.
 func reconcileMetadata(ctx context.Context, n names, db *citus, gs []group, registered map[string]node) (bool, error) {
+	logger := log.FromContext(ctx)
 	changed := false
-	coordinatorHost, err := db.coordinatorHost(ctx)
-	if err != nil {
-		return false, err
-	}
-	if want := gs[0].primary.host; coordinatorHost != "" && coordinatorHost != want {
-		log.FromContext(ctx).Info("pointing Citus at the new coordinator", "from", coordinatorHost, "to", want)
-		if err := db.syncMetadata(ctx); err != nil {
-			return false, err
-		}
-		if err := db.setCoordinatorHost(ctx, want); err != nil {
-			return false, fmt.Errorf("setting the coordinator host: %w", err)
-		}
-		changed = true
-	}
 	for host := range registered {
 		i, ok := workerIndex(n, host)
 		if !ok || i+1 >= len(gs) {
@@ -388,17 +376,33 @@ func reconcileMetadata(ctx context.Context, n names, db *citus, gs []group, regi
 		if host == want {
 			continue
 		}
-		log.FromContext(ctx).Info("pointing Citus at a worker's new primary", "group", gs[i+1].name, "from", host, "to", want)
+		logger.Info("pointing Citus at a worker's primary", "group", gs[i+1].name, "from", host, "to", want)
 		if err := db.updateNode(ctx, host, want); err != nil {
 			return changed, fmt.Errorf("repointing %s: %w", gs[i+1].name, err)
 		}
 		changed = true
 	}
-	if changed {
-		// citus_update_node leaves metadata nodes out of sync until the next sync.
-		if err := db.syncMetadata(ctx); err != nil {
-			return changed, err
+	coordinatorHost, err := db.coordinatorHost(ctx)
+	if err != nil {
+		return changed, err
+	}
+	want := gs[0].primary.host
+	if coordinatorHost == want && !changed {
+		return false, nil
+	}
+	// citus_update_node and citus_set_coordinator_host need metadata nodes in sync.
+	if err := db.syncMetadata(ctx); err != nil {
+		return changed, err
+	}
+	if coordinatorHost != "" && coordinatorHost != want {
+		logger.Info("pointing Citus at the coordinator", "from", coordinatorHost, "to", want)
+		if err := db.setCoordinatorHost(ctx, want); err != nil {
+			return changed, fmt.Errorf("setting the coordinator host: %w", err)
 		}
+		if err := db.syncMetadata(ctx); err != nil {
+			return true, err
+		}
+		changed = true
 	}
 	return changed, nil
 }

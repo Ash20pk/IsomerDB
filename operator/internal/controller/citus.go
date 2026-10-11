@@ -255,3 +255,10 @@ func (c *citus) syncMetadata(ctx context.Context) error {
 	_, err := c.conn.Exec(ctx, `SELECT start_metadata_sync_to_all_nodes()`)
 	return err
 }
+
+// createRestorePoint makes a cluster-consistent restore point (isomer.create_restore_point).
+func (c *citus) createRestorePoint(ctx context.Context) (string, error) {
+	var name string
+	err := c.conn.QueryRow(ctx, `SELECT isomer.create_restore_point()`).Scan(&name)
+	return name, err
+}

@@ -3,6 +3,7 @@ package controller
 import (
 	"fmt"
 	"strings"
+	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -19,8 +20,8 @@ const (
 	roleWorker             = "worker"
 	roleCoordinatorReplica = "coordinator-replica"
 	roleWorkerReplica      = "worker-replica"
-	roleAPI         = "api"
-	roleEmbedder    = "embedder"
+	roleAPI                = "api"
+	roleEmbedder           = "embedder"
 
 	keyPostgresPassword = "postgres-password"
 	keyMongoUser        = "mongo-user"
@@ -183,10 +184,65 @@ func postgresArgs(c *isomerv1.IsomerCluster, role string) []string {
 		"-c", "ident_file=/etc/isomerdb/auth/pg_ident.conf",
 		"-c", "citus.node_conninfo=" + nodeConninfo,
 	}
+	if c.Spec.Backup != nil {
+		// Primaries archive every WAL segment to the backup store (standbys do not, until promoted).
+		args = append(args,
+			"-c", "archive_mode=on",
+			"-c", "archive_command=isomer-walg wal-push %p",
+			"-c", "archive_timeout=60")
+	}
 	return args
 }
 
 const nodeConninfo = "sslmode=verify-full sslrootcert=" + tlsDir + "/ca.crt sslcert=" + tlsDir + "/client.crt sslkey=" + tlsDir + "/client.key"
+
+// ── backups ─────────────────────────────────────────────────────────────────
+
+// s3URL is the s3:// location of a cluster's backups (prefix defaults to <namespace>/<name>).
+func s3URL(c *isomerv1.IsomerCluster, s isomerv1.S3Spec) string {
+	prefix := s.Prefix
+	if prefix == "" {
+		prefix = c.Namespace + "/" + c.Name
+	}
+	return "s3://" + s.Bucket + "/" + strings.Trim(prefix, "/")
+}
+
+// s3Env is what WAL-G needs to reach a store; envPrefix names the variables (for the restore
+// source: ISOMER_RESTORE_AWS_...).
+func s3Env(s isomerv1.S3Spec, envPrefix string) []corev1.EnvVar {
+	region := s.Region
+	if region == "" {
+		region = "us-east-1"
+	}
+	env := []corev1.EnvVar{
+		secretEnv(envPrefix+"AWS_ACCESS_KEY_ID", s.CredentialsSecret, "access-key-id"),
+		secretEnv(envPrefix+"AWS_SECRET_ACCESS_KEY", s.CredentialsSecret, "secret-access-key"),
+		{Name: envPrefix + "AWS_REGION", Value: region},
+	}
+	if s.Endpoint != "" {
+		env = append(env, corev1.EnvVar{Name: envPrefix + "AWS_ENDPOINT", Value: s.Endpoint})
+	}
+	if s.ForcePathStyle {
+		env = append(env, corev1.EnvVar{Name: envPrefix + "AWS_S3_FORCE_PATH_STYLE", Value: "true"})
+	}
+	return env
+}
+
+// backupEnv: the variables isomer-walg needs, for this cluster's store and a restore's source.
+func backupEnv(c *isomerv1.IsomerCluster) []corev1.EnvVar {
+	env := []corev1.EnvVar{{Name: "ISOMER_CLUSTER", Value: c.Name}}
+	if b := c.Spec.Backup; b != nil {
+		env = append(env, corev1.EnvVar{Name: "ISOMER_BACKUP_PREFIX", Value: s3URL(c, b.S3)})
+		env = append(env, s3Env(b.S3, "")...)
+	}
+	if r := c.Spec.Restore; r != nil {
+		env = append(env,
+			corev1.EnvVar{Name: "ISOMER_RESTORE_PREFIX", Value: s3URL(c, r.From)},
+			corev1.EnvVar{Name: "ISOMER_RESTORE_POINT", Value: r.RestorePoint})
+		env = append(env, s3Env(r.From, "ISOMER_RESTORE_")...)
+	}
+	return env
+}
 
 // ── database nodes ──────────────────────────────────────────────────────────
 
@@ -211,6 +267,7 @@ func databaseStatefulSet(c *isomerv1.IsomerCluster, role string, replicas int32)
 		)
 	}
 
+	env = append(env, backupEnv(c)...)
 	postgres := corev1.Container{
 		Name:            "postgres",
 		Image:           c.Spec.Image,
@@ -296,6 +353,32 @@ func databaseStatefulSet(c *isomerv1.IsomerCluster, role string, replicas int32)
 			{Name: "tls", MountPath: tlsDir, ReadOnly: true},
 			{Name: "topology", MountPath: "/etc/isomerdb/topology", ReadOnly: true},
 		},
+	}
+	initNode.Env = append(initNode.Env, backupEnv(c)[1:]...) // ISOMER_CLUSTER is already set
+	if b := c.Spec.Backup; b != nil {
+		full := b.FullEvery.Duration
+		if full <= 0 {
+			full = 24 * time.Hour
+		}
+		retain := b.Retain
+		if retain <= 0 {
+			retain = 7
+		}
+		agentEnv := append(backupEnv(c),
+			corev1.EnvVar{Name: "ISOMER_BACKUP_FULL_EVERY", Value: fmt.Sprint(int64(full.Seconds()))},
+			corev1.EnvVar{Name: "ISOMER_BACKUP_RETAIN", Value: fmt.Sprint(retain)})
+		containers = append(containers, corev1.Container{
+			Name:            "backup",
+			Image:           c.Spec.Image,
+			ImagePullPolicy: c.Spec.ImagePullPolicy,
+			Command:         []string{"isomer-backup-agent"},
+			SecurityContext: &corev1.SecurityContext{RunAsUser: ptr(int64(postgresUID)), RunAsGroup: ptr(int64(postgresUID))},
+			Env:             agentEnv,
+			VolumeMounts: []corev1.VolumeMount{
+				{Name: "data", MountPath: "/var/lib/postgresql"},
+				{Name: "socket", MountPath: "/var/run/postgresql"},
+			},
+		})
 	}
 	podLabels := labels(c, role)
 	podLabels[labelNode] = kind

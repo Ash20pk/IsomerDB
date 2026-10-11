@@ -84,8 +84,49 @@ whether it is streaming, and its replay lag.
 
 `status.lastFailover` records the last promotion and why.
 
+## Backups and point-in-time recovery
+
+```yaml
+spec:
+  backup:
+    s3:
+      bucket: my-backups
+      prefix: prod/orders          # default <namespace>/<cluster name>
+      endpoint: https://...        # for S3-compatible stores; empty for AWS
+      forcePathStyle: false        # true for MinIO, SeaweedFS and similar
+      credentialsSecret: s3        # keys access-key-id and secret-access-key
+    fullEvery: 24h                 # a full base backup per node
+    retain: 7                      # full backups kept per node
+    restorePointEvery: 15m         # cluster-consistent restore points
+```
+
+Every node's primary archives each WAL segment as it fills (WAL-G, `archive_timeout` 60s), and a
+`backup` sidecar takes a full base backup every `fullEvery` while its pod is the group's primary.
+Each node group keeps its own area of the store (`<prefix>/<group>`), shared by its primary and
+standby across failovers.
+
+A Citus cluster can only be restored consistently to a **restore point**: a named instant created
+on every node at once (`isomer.create_restore_point(label)`, which blocks distributed commits for
+that moment). The operator creates one every `restorePointEvery`; `status.lastRestorePoint` and
+the `isomer.restore_points` table list them.
+
+To restore, create a new cluster from the source's store:
+
+```yaml
+spec:
+  workers: 2                       # the source's worker count
+  restore:
+    from: { bucket: my-backups, prefix: prod/orders, credentialsSecret: s3 }
+    restorePoint: isomer-20261012T031500Z
+    credentialsSecret: orders-credentials   # the source's passwords (its <name>-credentials)
+```
+
+Each node fetches the newest base backup taken before the point, replays the source's WAL up to
+it, and comes up; the operator then points Citus at the new cluster's nodes. `status.restored`
+turns true when it is done. The restored cluster has the source's data, projections, history and
+passwords, and backs itself up to its own `spec.backup` store, if one is set.
+
 ## Not yet
 
-- **Backups and point-in-time recovery.**
 - **Version upgrades** of the image or the isomer extension (`ALTER EXTENSION isomer UPDATE` on
   every node).

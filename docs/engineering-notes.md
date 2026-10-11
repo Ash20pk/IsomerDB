@@ -45,6 +45,42 @@ opt-in setting.
    unmodified as its own import commit on a branch, then re-apply our changes. Update the tables
    above in the same change.
 
+## 2026-10-12 — Operator: backups and point-in-time recovery (FR-CL1)
+
+`tests/operator_backup.sh` passes on kind, against SeaweedFS as the S3 store. A cluster archives
+every node's WAL and takes base backups; a restore point is created; later writes follow; a second
+cluster restored to the point has exactly the data before it (and the projection, equal to
+recomputation, still maintained), with Citus pointed at its own nodes and the source's passwords.
+
+- **WAL-G** (3.0.9, pinned and checksummed in the image) does the archiving and base backups.
+  `isomer-walg` picks the node group's area of the store from the pod's name; `isomer-backup-agent`
+  is a sidecar that takes the base backups while its pod is the primary.
+- **Consistency across nodes comes from restore points**, not timestamps:
+  `isomer.create_restore_point()` (isomer 0.13.0) wraps `citus_create_restore_point`, which blocks
+  distributed commits for the instant it writes the point on every node. Names carry the UTC time,
+  which a restore uses to choose each node's base backup (the newest that finished before it).
+- **Restore is a new cluster**, built by each pod's init container (`isomer-node-init`): fetch,
+  replay to the point, promote. Citus's metadata then still names the source's hosts; the operator
+  repoints the workers first and the coordinator last, syncing metadata between steps (a sync
+  that tries the source's hosts would fail).
+
+Things that bit us:
+
+- **A bug from query routing, found by this test:** a fresh session whose first statement was a
+  multi-shard `INSERT ... SELECT` into a table behind a projection failed with "another command is
+  already in progress". The capture trigger on the coordinator's own shards ran mid-COPY, and its
+  first planned statement made `isomer_router` load its routes in an internal subtransaction,
+  which Citus mirrors as `SAVEPOINT` on every open worker connection, busy with COPY. Routing now
+  ignores statements nested inside another (only top-level application queries are routed);
+  `tests/multinode.sh` covers the case.
+- **`.pgpass` lives outside the data directory,** so pods cloned as standbys or restored never had
+  one, and shard moves to a promoted coordinator would have failed. The init container writes it.
+- **A restore's `restore_command` must not outlive the restore:** a restored node that later
+  becomes a standby would otherwise fetch WAL from the source's archive. The init container
+  removes the recovery settings once recovery has finished.
+- **MinIO no longer publishes images**; the test uses SeaweedFS's S3 gateway, and creates the
+  bucket with `weed shell` (a short-lived `kubectl run -i` loses its output to an attach race).
+
 ## 2026-10-12 — Operator: certificates between nodes, standbys and failover (FR-CL1)
 
 `tests/operator.sh` passes on kind. It now also checks that workers refuse anything but the node

@@ -95,11 +95,25 @@ COPY docker/postgresql.isomer.conf /usr/share/postgresql/isomer.conf
 RUN printf "\ninclude = '/usr/share/postgresql/isomer.conf'\n" >> /usr/share/postgresql/postgresql.conf.sample
 COPY docker/initdb/ /docker-entrypoint-initdb.d/
 COPY docker/isomer-node-init.sh /usr/local/bin/isomer-node-init
+COPY docker/isomer-walg.sh /usr/local/bin/isomer-walg
+COPY docker/isomer-backup-agent.sh /usr/local/bin/isomer-backup-agent
+
+# WAL-G: WAL archiving and base backups to S3-compatible storage (Kubernetes operator, spec.backup).
+ARG WALG_VERSION=3.0.9
+RUN case "$TARGETARCH" in \
+      arm64) a=aarch64; sum=072eb4a4a119f817e1fa888c64a776b01e3453b2e0d967a67d149adb18fde652 ;; \
+      amd64) a=amd64;   sum=d6795c663894d836ba20840bffe8970aed81bbe25d3151bd4951f6f9c362def9 ;; \
+      *) echo "no WAL-G build for $TARGETARCH" >&2; exit 1 ;; \
+    esac \
+    && curl -fsSL -o /usr/local/bin/wal-g "https://github.com/wal-g/wal-g/releases/download/v${WALG_VERSION}/wal-g-pg-22.04-$a" \
+    && echo "$sum  /usr/local/bin/wal-g" | sha256sum -c - \
+    && chmod 755 /usr/local/bin/wal-g
 COPY docker/gateway.json /etc/isomerdb/gateway.json
 COPY NOTICE /usr/share/doc/isomerdb/NOTICE
 COPY extensions/sharding/LICENSE /usr/share/doc/isomerdb/licenses/citus.LICENSE
 COPY extensions/documents/LICENSE /usr/share/doc/isomerdb/licenses/documentdb.LICENSE
 COPY extensions/ivm/LICENSE /usr/share/doc/isomerdb/licenses/pg_trickle.LICENSE
+COPY docker/licenses/wal-g.LICENSE /usr/share/doc/isomerdb/licenses/wal-g.LICENSE
 
 LABEL org.opencontainers.image.title="isomerdb" \
       org.opencontainers.image.description="IsomerDB base: PostgreSQL 18 + Citus + DocumentDB + pg_search + pgvector + pg_trickle"

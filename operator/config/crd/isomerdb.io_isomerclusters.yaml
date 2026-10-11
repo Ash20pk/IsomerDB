@@ -198,6 +198,58 @@ spec:
                 required:
                 - enabled
                 type: object
+              backup:
+                description: |-
+                  Backup archives every node's WAL continuously and takes base backups, to S3-compatible
+                  storage, and creates cluster-consistent restore points.
+                properties:
+                  fullEvery:
+                    default: 24h
+                    description: FullEvery is how often each node takes a full base
+                      backup; WAL is archived continuously.
+                    type: string
+                  restorePointEvery:
+                    default: 15m
+                    description: RestorePointEvery is how often a cluster-consistent
+                      restore point is created.
+                    type: string
+                  retain:
+                    default: 7
+                    description: Retain is how many full backups each node keeps (and
+                      the WAL needed by them).
+                    format: int32
+                    minimum: 1
+                    type: integer
+                  s3:
+                    description: S3Spec is a location in S3-compatible storage.
+                    properties:
+                      bucket:
+                        type: string
+                      credentialsSecret:
+                        description: CredentialsSecret holds access-key-id and secret-access-key.
+                        type: string
+                      endpoint:
+                        description: Endpoint for S3-compatible stores (MinIO, R2,
+                          GCS interoperability); empty for AWS.
+                        type: string
+                      forcePathStyle:
+                        description: ForcePathStyle addresses buckets as <endpoint>/<bucket>
+                          (MinIO needs it).
+                        type: boolean
+                      prefix:
+                        description: Prefix inside the bucket; defaults to <namespace>/<cluster
+                          name>.
+                        type: string
+                      region:
+                        default: us-east-1
+                        type: string
+                    required:
+                    - bucket
+                    - credentialsSecret
+                    type: object
+                required:
+                - s3
+                type: object
               deleteVolumes:
                 description: |-
                   DeleteVolumes removes the data volumes when the IsomerCluster is deleted. Off by default:
@@ -576,6 +628,54 @@ spec:
                       More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/
                     type: object
                 type: object
+              restore:
+                description: |-
+                  Restore builds this cluster from another cluster's backups, as of one of its restore
+                  points. Used when the cluster is created; set Workers to the source cluster's count.
+                properties:
+                  credentialsSecret:
+                    description: |-
+                      CredentialsSecret holds the source cluster's passwords (its <name>-credentials Secret,
+                      copied here): the restored data carries them.
+                    type: string
+                  from:
+                    description: From is the source cluster's backup store (its spec.backup.s3,
+                      with its prefix).
+                    properties:
+                      bucket:
+                        type: string
+                      credentialsSecret:
+                        description: CredentialsSecret holds access-key-id and secret-access-key.
+                        type: string
+                      endpoint:
+                        description: Endpoint for S3-compatible stores (MinIO, R2,
+                          GCS interoperability); empty for AWS.
+                        type: string
+                      forcePathStyle:
+                        description: ForcePathStyle addresses buckets as <endpoint>/<bucket>
+                          (MinIO needs it).
+                        type: boolean
+                      prefix:
+                        description: Prefix inside the bucket; defaults to <namespace>/<cluster
+                          name>.
+                        type: string
+                      region:
+                        default: us-east-1
+                        type: string
+                    required:
+                    - bucket
+                    - credentialsSecret
+                    type: object
+                  restorePoint:
+                    description: |-
+                      RestorePoint is the name of one of the source's restore points (isomer.restore_points, or
+                      status.lastRestorePoint on the source).
+                    type: string
+                required:
+                - credentialsSecret
+                - from
+                - restorePoint
+                type: object
               storage:
                 anyOf:
                 - type: integer
@@ -738,6 +838,14 @@ spec:
                   capture triggers were re-checked.
                 format: int64
                 type: integer
+              lastRestorePoint:
+                description: LastRestorePoint is the newest restore point the operator
+                  created.
+                type: string
+              lastRestorePointAt:
+                description: LastRestorePointAt is when it was created.
+                format: date-time
+                type: string
               observedGeneration:
                 format: int64
                 type: integer
@@ -752,6 +860,10 @@ spec:
                 description: Rebalance is the state of the last Citus rebalance job,
                   if any.
                 type: string
+              restored:
+                description: Restored is set once a restore has finished and Citus
+                  points at this cluster's nodes.
+                type: boolean
               workers:
                 items:
                   description: WorkerStatus is one worker node as the cluster sees
