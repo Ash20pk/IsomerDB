@@ -18,7 +18,7 @@ runs, with no migration.
 | [`docker/`](docker/) | Base image: Postgres 18 + Citus + DocumentDB + gateway + pg_search + pgvector + pg_trickle |
 | [`extensions/isomer/`](extensions/isomer/) | The `isomer` Postgres extension: projections and attach mode |
 | [`services/embedder/`](services/embedder/) | Rust service that computes embeddings for vector projections |
-| [`tests/phase0.sh`](tests/phase0.sh) … [`phase3.sh`](tests/phase3.sh) | Acceptance tests: Phase 0 (attach, document and search projections), 1 (vector projections), 2 (primary mode: cutover, sharding, sync, read-your-writes, auditor), 3 (proposer, shard advisor, certificates, randomized concurrency) |
+| [`tests/phase0.sh`](tests/phase0.sh) … [`phase3.sh`](tests/phase3.sh), [`native.sh`](tests/native.sh) | Acceptance tests: Phase 0 (attach, document and search projections), 1 (vector projections), 2 (primary mode: cutover, sharding, sync, read-your-writes, auditor), 3 (proposer, shard advisor, certificates, randomized concurrency) |
 | [`scripts/smoke.sh`](scripts/smoke.sh) | Checks every base component works in a running stack |
 | [`docs/engineering-notes.md`](docs/engineering-notes.md) | What we learned building the stack (gateway auth, pg_trickle and Citus quirks) |
 
@@ -29,7 +29,7 @@ docker compose up --build -d     # Postgres on :5432, MongoDB wire gateway on :1
 ./scripts/smoke.sh
 
 docker compose --profile attach up -d   # adds a stand-in customer Postgres (:5433) and a mock embeddings API
-./tests/phase0.sh && ./tests/phase1.sh && ./tests/phase2.sh && ./tests/phase3.sh
+./tests/phase0.sh && ./tests/phase1.sh && ./tests/phase2.sh && ./tests/phase3.sh && ./tests/native.sh
 ```
 
 ## Using it
@@ -46,6 +46,11 @@ SELECT isomer.create_projection(
                            FROM orders o WHERE o.customer_id = c.id)) AS doc
               FROM customers c $$,
   sources => '{"customers": "id", "orders": "customer_id"}');
+
+-- Or declare it with ordinary DDL: the access method sets freshness, the unique index the key
+CREATE MATERIALIZED VIEW shop.customer_card USING isomer_bounded AS
+  SELECT c.id, jsonb_build_object('name', c.name) AS doc FROM shop.customers c;
+CREATE UNIQUE INDEX ON shop.customer_card (id);
 
 -- A search projection, BM25-ranked from SQL
 SELECT isomer.create_projection(name => 'order_search', kind => 'search', key => 'id',

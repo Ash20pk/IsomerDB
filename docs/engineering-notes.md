@@ -2,6 +2,39 @@
 
 Things we learned building the stack that are not obvious from the upstream docs. Newest first.
 
+## 2026-10-11 — Native DDL for projections (FR-S1a)
+
+`tests/native.sh` passes (19 checks). A document projection is declared with ordinary DDL:
+
+```sql
+CREATE MATERIALIZED VIEW shop.customer_card USING isomer_bounded AS SELECT c.id, jsonb_build_object(...) AS doc FROM shop.customers c;
+COMMENT ON MATERIALIZED VIEW shop.customer_card IS 'isomer {"lag": "3 seconds", "sources": {"shop.order_items": "customer_id"}}';
+CREATE UNIQUE INDEX ON shop.customer_card (id);
+```
+
+- **`isomer_sync` and `isomer_bounded` are table access methods** that delegate to heap
+  (`heap_tableam_handler`), so this needs no C. They only mark freshness; the view is emptied
+  (`REFRESH … WITH NO DATA`) after registration, and the MongoDB collection is the readable form.
+- **Event triggers do the rest.**
+  - `CREATE UNIQUE INDEX` registers the projection (`ddl_command_end`).
+  - `COMMENT` changes options, and `ALTER MATERIALIZED VIEW … SET ACCESS METHOD` changes freshness.
+  - `DROP MATERIALIZED VIEW` drops the projection (`sql_drop`). It only drops projections the view
+    itself declared (`projections.native_view`).
+- **It all survives `pg_dump`.** The dump sets `default_table_access_method`, and keeps the comment
+  and the index. Replaying the index on a restored catalog re-installs the projection.
+- **Source mappings are inferred conservatively.**
+  - The key's origin is `alias.key` in the top-level select list, or an unqualified key when the
+    top level reads exactly one table. The deparser drops the outer alias, so the top level is
+    found by stripping parenthesised subqueries.
+  - The key is propagated through equalities. Unconnected tables become lookup tables, which is
+    always correct and only slower, with a notice explaining how to map them.
+  - The first version fell back to the first `alias.id` it found, mapped `orders` by `orders.id`,
+    and would have sent writes to the wrong documents. The fallback is gone: an ambiguous key now
+    fails and asks for explicit mappings.
+- **Native syntax declares document projections only.** Search, vector and cache projections are
+  readable objects named after the projection, which would collide with the view; they keep the
+  function API.
+
 ## 2026-10-11 — Phase 3 (single-node parts): advisors, certificates, concurrency
 
 `tests/phase3.sh` passes (26 checks), including three back-to-back runs of its randomized
@@ -162,7 +195,6 @@ Gaps:
   reading. Honouring a GUC needs a planner or executor hook in C.
 - **Projections over multi-node clusters are refused** (Phase 3). Everything above was tested on a
   single node whose coordinator holds the shards.
-- **The `CREATE MATERIALIZED VIEW … USING isomer_*` syntax (FR-S1a) is still not built.**
 
 ## 2026-10-11 — Phase 1: vector projections and the embedder
 
