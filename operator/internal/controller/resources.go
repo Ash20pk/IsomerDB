@@ -194,7 +194,10 @@ func postgresArgs(c *isomerv1.IsomerCluster, role string) []string {
 	return args
 }
 
-const nodeConninfo = "sslmode=verify-full sslrootcert=" + tlsDir + "/ca.crt sslcert=" + tlsDir + "/client.crt sslkey=" + tlsDir + "/client.key"
+// keepalives and tcp_user_timeout: a query waiting on a node that stopped answering (paused, or
+// cut off) fails within seconds instead of waiting until the node returns.
+const nodeConninfo = "sslmode=verify-full sslrootcert=" + tlsDir + "/ca.crt sslcert=" + tlsDir + "/client.crt sslkey=" + tlsDir + "/client.key" +
+	" keepalives=1 keepalives_idle=10 keepalives_interval=5 keepalives_count=3 tcp_user_timeout=20000"
 
 // ── backups ─────────────────────────────────────────────────────────────────
 
