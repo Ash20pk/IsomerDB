@@ -1,53 +1,193 @@
 # IsomerDB
 
-One database. Write once, read in any projection.
+**One database. Write once, read in any projection.**
 
-SQL tables stay the single source of truth. Documents, search, vectors and cache are declared
-*projections* that IsomerDB builds, shards and keeps consistent incrementally, readable over the
-Postgres and MongoDB wire protocols. Adoption starts by attaching to the Postgres a team already
-runs, with no migration.
+Products start on Postgres. As they grow, teams add MongoDB for nested documents, Elasticsearch for
+search, Redis for hot keys and a vector store for embeddings, and a sync pipeline for each. Every
+pipeline is a place where data goes missing or stale, and no transaction spans them.
 
-## Layout
+IsomerDB keeps SQL tables as the single source of truth. Documents, search indexes, vectors and
+caches are declared **projections** of those tables, which the database builds, shards and keeps
+consistent on every write. They can be read over the Postgres and MongoDB wire protocols and HTTP.
+Adoption starts by attaching to the Postgres a team already runs, with no migration.
 
-| Path | What it is |
-|---|---|
-| [`docs/PRD.md`](docs/PRD.md) | Product requirements document |
-| [`docs/research/`](docs/research/) | Research behind the PRD's open questions: naming, DDL and read-your-writes tokens, embeddings and attach-mode providers, pricing / design partners / NFR targets |
-| [`docs/reference/system-design-draft-3.html`](docs/reference/system-design-draft-3.html) | The system design the PRD is based on (written under the earlier working name "Prism") |
-| [`docker/`](docker/) | Base image: Postgres 18 with everything in `extensions/`, plus search and vector indexes |
-| [`extensions/isomer/`](extensions/isomer/) | The `isomer` Postgres extension: projections, attach mode, advisors |
-| [`extensions/isomer_router/`](extensions/isomer_router/) | C planner hook that routes keyed reads onto projections |
-| [`extensions/sharding/`](extensions/sharding/) | Distributed tables, shard placement and online rebalancing |
-| [`extensions/documents/`](extensions/documents/) | BSON document storage and the MongoDB wire protocol gateway |
-| [`extensions/ivm/`](extensions/ivm/) | Incremental view maintenance: change capture and stream tables that keep projections fresh |
-| [`services/embedder/`](services/embedder/) | Rust service that computes embeddings for vector projections: OpenAI-compatible APIs, or bge-small-en-v1.5 on its own CPU |
-| [`operator/`](operator/) | Kubernetes operator (Go): `IsomerCluster` resources, online scale up/down with rebalance and drain, certificate authentication between nodes, standbys and failover, backups and point-in-time recovery, rolling upgrades. See [`operator/README.md`](operator/README.md) |
-| [`services/api/`](services/api/) | Rust HTTP API: projections by key, time travel, change feeds and live streams (SSE), and the admin endpoints the console and CLI use |
-| [`clients/`](clients/) | TypeScript: the API client (`sdk`), the `isomer` command line (`cli`) and the web console (`console`, served by the API at `/console`) |
-| [`tests/phase0.sh`](tests/phase0.sh) … [`phase3.sh`](tests/phase3.sh), [`native.sh`](tests/native.sh), [`multinode.sh`](tests/multinode.sh), [`routing.sh`](tests/routing.sh), [`history.sh`](tests/history.sh), [`freshness.sh`](tests/freshness.sh), [`console.sh`](tests/console.sh), [`metering.sh`](tests/metering.sh), [`local_model.sh`](tests/local_model.sh), [`operator.sh`](tests/operator.sh), [`operator_backup.sh`](tests/operator_backup.sh), [`operator_upgrade.sh`](tests/operator_upgrade.sh) | Acceptance tests: Phase 0 (attach, document and search projections), 1 (vector projections), 2 (primary mode: cutover, sharding, sync, read-your-writes, auditor), 3 (proposer, shard advisor, certificates, randomized concurrency) |
-| [`jepsen/`](jepsen/), [`tests/jepsen.sh`](tests/jepsen.sh) | Jepsen tests against the three-node cluster while workers are paused, killed and partitioned: Elle list-append over distributed transactions, and read-your-writes through projections |
-| [`scripts/smoke.sh`](scripts/smoke.sh) | Checks every base component works in a running stack |
-| [`scripts/test-all.sh`](scripts/test-all.sh) | Every suite on fresh stacks, single-node then the three-node cluster |
-| [`docs/engineering-notes.md`](docs/engineering-notes.md) | What we learned building the stack (gateway auth, change capture and sharding quirks) |
+What sets it apart is the combination:
 
-## Run locally
+- **A relational source of truth:** full SQL, joins and transactions, sharded across nodes.
+- **Projections with a freshness contract:** each one is `sync` (updated in the writing transaction)
+  or `bounded` (within a lag budget), and every write returns a token that makes later reads see it.
+- **Proven, not trusted:** a correctness certificate per projection, a live auditor that recomputes
+  samples and counts drift, and Jepsen tests.
+- **Self-tuning:** the database reads its own query log and proposes the projections and shard keys
+  it should have.
+
+> **Status.** Phases 0 to 2 of the [PRD](docs/PRD.md) are built, and most of phase 3. The diagrams
+> below show the whole system as designed. Each part is marked **built** (implemented and covered by
+> acceptance tests), **partly built** or **planned**. [What's left](#whats-left) lists the gaps.
+
+---
+
+## Architecture
+
+Described with the [C4 model](https://c4model.com): context, then containers, then the components of
+the coordinator, then how it runs on Kubernetes. The diagrams are generated by
+[`docs/diagrams/generate.py`](docs/diagrams/generate.py) and follow your light or dark theme.
+
+### Level 1: system context
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/diagrams/c4-1-context-dark.svg">
+  <img alt="System context: application developers, AI feature builders and platform engineers use IsomerDB. IsomerDB follows an existing Postgres by logical replication, embeds text through embedding providers, archives to object storage, is metered by a billing system, and (planned) pages on-call." src="docs/diagrams/c4-1-context.svg">
+</picture>
+
+People build on IsomerDB through ordinary drivers. IsomerDB follows the team's existing Postgres
+until they cut over, calls an embedding provider only when a hosted model is chosen (a model that
+runs on the cluster's own CPU is built in), archives every node to object storage, and exposes usage
+for billing.
+
+### Level 2: containers
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/diagrams/c4-2-containers-dark.svg">
+  <img alt="Containers: a MongoDB gateway, an HTTP API, the console and CLI, a coordinator and worker nodes (PostgreSQL 18, Citus, the isomer extension), an embedder, and the Kubernetes operator are built. A cross-shard projection engine, a cloud control plane and edge replicas are planned." src="docs/diagrams/c4-2-containers.svg">
+</picture>
+
+| Container | What it does | Status |
+|---|---|---|
+| **Coordinator** | PostgreSQL 18 with Citus and the `isomer` extension. Plans and routes SQL, holds the projection catalog, attaches to existing Postgres, maintains projections, issues write tokens, audits for drift, proposes projections, meters usage. | Built |
+| **Worker nodes** | Hold shards of tables and projections; capture changes where each row is written. | Built |
+| **MongoDB gateway** | MongoDB wire protocol. Projections read as collections; causal reads wait for the writes they depend on. | Built |
+| **HTTP API** | Documents by key, time travel, change feeds and live streams (SSE); the admin and usage endpoints. | Built |
+| **Console and CLI** | Lag against budget, drift, alerts, proposals, routes, usage. | Built |
+| **Embedder** | Computes embeddings for vector projections, from a hosted API or bge-small on its own CPU. | Built |
+| **Kubernetes operator** | Provisions and scales clusters, fails over to standbys, backs up and restores to a point in time, rolls upgrades, issues node certificates. | Built |
+| **Cross-shard engine** | Incremental maintenance (DBSP) for projections that join or aggregate across shards. Today these are refused or kept by key. | Planned |
+| **Cloud control plane** | Managed IsomerDB: sign-up, regions, provisioning, billing. | Planned |
+| **Edge replicas** | Projections served close to users, fed by the change feed. | Planned |
+
+### Level 3: inside the coordinator
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/diagrams/c4-3-coordinator-dark.svg">
+  <img alt="Components of the coordinator: attach, cutover, catalog and compiler, change capture, maintenance, query router, freshness, history and change feed, auditor, certificates, proposer and shard advisor, metering and admin are built; a cutover planner, alert delivery and a strategy chooser are planned." src="docs/diagrams/c4-3-coordinator.svg">
+</picture>
+
+Writes flow down the middle. **Change capture** queues the keys each write touches, on whichever node
+holds the row. **Maintenance** re-derives those documents and cache entries from the tables, refreshes
+search stream tables, and queues embeddings. Reads come in through the **query router**, which can
+answer a keyed query from a projection instead of the tables. **Freshness** makes a read wait for the
+writes it depends on. The **auditor** and **certificates** check the result; the **proposer** and
+**shard advisor** suggest what to build next.
+
+### Deployment: Kubernetes
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/diagrams/c4-deployment-dark.svg">
+  <img alt="Deployment: the operator in its own namespace; in the cluster's namespace a client Service that follows the primary coordinator, the HTTP API and embedder deployments, and for the coordinator and each worker a primary pod and a streaming standby pod, each archiving to object storage." src="docs/diagrams/c4-deployment.svg">
+</picture>
+
+Every node is a group of two pods: a primary and a hot standby that streams its WAL. Nodes talk to
+each other over TLS with a certificate the operator issues. The client Service follows whichever
+coordinator pod is the primary, so a failover doesn't change any address. See
+[`operator/README.md`](operator/README.md).
+
+### How it behaves
+
+**A write, then a read that sees it.** A bounded projection is maintained asynchronously, so a read
+passes the write's token and waits for exactly what it needs:
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant App
+    participant C as Coordinator
+    participant W as Worker node
+    App->>C: UPDATE customers SET name = 'Asha' WHERE id = 42
+    C->>W: UPDATE on the shard holding id 42 (Citus)
+    W->>W: capture trigger queues key 42
+    C-->>App: committed (the session now holds a write token)
+    App->>C: SET isomer.read_after = token<br/>SELECT * FROM customer_card WHERE id = 42
+    Note over C: router: this reads a projection, so wait for the token
+    C->>W: pull queued keys (every second)
+    C->>C: re-derive document 42 from the tables, write it
+    C-->>App: the updated document, read with a snapshot taken after the wait
+```
+
+The MongoDB gateway does the same for `readConcern.afterClusterTime`, so a causally consistent
+driver session reads its own SQL writes with no code changes. A projection declared `sync` is
+updated inside the writing transaction and needs no token at all.
+
+**Adopting an existing Postgres: attach, then cut over.**
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Ops as Platform engineer
+    participant I as IsomerDB
+    participant S as Existing Postgres
+    Ops->>I: isomer.attach('shop', conninfo)
+    I->>S: preflight every table (keys, replica identity, types)
+    I->>S: CREATE PUBLICATION ... FOR TABLE (an explicit list)
+    S-->>I: initial copy, then a continuous change stream
+    Note over I: projections build and stay fresh, and reads move over one endpoint at a time
+    Ops->>I: isomer.cutover('shop', rollback_conninfo => ...)
+    I->>S: freeze: default_transaction_read_only = on
+    I->>I: catch up to the source's last position, check for conflicts
+    I->>I: copy sequences and column defaults
+    I->>S: stop following, and optionally replicate back for rollback
+    Note over I: IsomerDB is now the primary, and projections can move from bounded to sync
+```
+
+**A worker stops answering.** With `spec.ha.standbys: 1`, the Kubernetes operator fails over on
+its own; nobody is paged to do it:
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Op as Operator
+    participant P as worker-0 (primary)
+    participant R as worker-replica-0 (standby)
+    participant C as Coordinator
+    P->>R: WAL stream
+    Note over P: stops answering
+    Op->>Op: primary unready for longer than failoverAfter
+    Op->>Op: record worker-replica-0 as the group's primary
+    Op->>P: delete the pod (fenced)
+    Op->>R: pg_promote()
+    Op->>C: citus_update_node: worker-0's shards now live on worker-replica-0
+    Note over P: restarts, rewinds onto the new primary (pg_rewind), streams from it
+```
+
+**The database proposes a projection.**
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant App
+    participant C as Coordinator
+    participant Ops as Platform engineer
+    App->>C: the same join, many times
+    C->>C: isomer.propose(): group repeated join-and-nest queries,<br/>estimate read savings and write cost
+    Ops->>C: isomer.accept_proposal(3) (console or CLI)
+    C->>C: create the projection, certify it
+    Ops->>C: isomer.route_proposal(3)
+    C->>C: run both on sample keys: same rows? measurably faster?
+    App->>C: the same join again
+    C-->>App: answered from the projection (the app's SQL is unchanged)
+```
+
+---
+
+## Quick start
 
 ```sh
-docker compose up --build -d     # Postgres on :5432, MongoDB wire gateway on :10260, HTTP API on :8080
+docker compose up --build -d     # Postgres on :5432, MongoDB wire on :10260, HTTP API and console on :8080
 ./scripts/smoke.sh
-
-docker compose --profile attach up -d   # adds a stand-in customer Postgres (:5433) and a mock embeddings API
-./tests/phase0.sh && ./tests/phase1.sh && ./tests/phase2.sh && ./tests/phase3.sh && ./tests/native.sh && ./tests/routing.sh && ./tests/history.sh && ./tests/freshness.sh && ./tests/local_model.sh
-(cd clients && npm ci && npm run build) && ./tests/console.sh && ./tests/metering.sh   # console, CLI, admin API, usage
-
-docker compose --profile cluster up -d  # adds two worker nodes
-./tests/multinode.sh                    # joins them, rebalances online, tests across nodes
-
-./scripts/test-all.sh                   # or all of it, on fresh stacks (destroys this project's volumes)
-
-./tests/operator.sh                     # the operator on a local kind cluster (its own kubeconfig)
-./tests/jepsen.sh                       # Jepsen against the three-node cluster (results in jepsen/store/)
+psql postgres://postgres:isomer@localhost:5432/postgres
 ```
+
+`docker compose --profile cluster up -d` adds two worker nodes; `--profile attach` adds a stand-in
+"existing Postgres" on :5433. These are local development credentials only.
 
 ## Using it
 
@@ -69,106 +209,107 @@ CREATE MATERIALIZED VIEW shop.customer_card USING isomer_bounded AS
   SELECT c.id, jsonb_build_object('name', c.name) AS doc FROM shop.customers c;
 CREATE UNIQUE INDEX ON shop.customer_card (id);
 
--- A search projection, BM25-ranked from SQL
+-- Search, BM25-ranked from SQL
 SELECT isomer.create_projection(name => 'order_search', kind => 'search', key => 'id',
   query => $$ SELECT o.id, c.name, o.status FROM orders o JOIN customers c ON c.id = o.customer_id $$);
 SELECT * FROM order_search WHERE name @@@ 'asha';
 
--- A vector projection: re-embeds a row only when its text changes
-SELECT isomer.create_projection(name => 'product_vectors', kind => 'vector', key => 'sku',
-  model => 'text-embedding-3-small', lag => '30 seconds',
-  query => $$ SELECT sku, title || ' ' || description AS input FROM products $$,
-  sources => '{"products": "sku"}');
-SELECT sku FROM product_vectors
-ORDER BY embedding <=> isomer.embed_for('product_vectors', 'quiet mechanical keyboard') LIMIT 10;
--- ...or embed on the cluster's own CPU: no API key, no network, no per-token cost
+-- Vectors: only rows whose text changed are re-embedded; the model can run on the cluster's own CPU
 SELECT isomer.create_projection(name => 'listing_vectors', kind => 'vector', key => 'id',
   model => 'bge-small-en-v1.5', query => $$ SELECT id, title AS input FROM listings $$,
   sources => '{"listings": "id"}');
+SELECT id FROM listing_vectors
+ORDER BY embedding <=> isomer.embed_for('listing_vectors', 'a quiet keyboard for night typing') LIMIT 10;
 
--- Move from attach to primary (copies sequences and defaults; optional rollback replication)
+-- Shard by entity, then cut over and make projections synchronous
+SELECT isomer.distribute(ARRAY['customers', 'orders']::regclass[], 'customer_id');
 SELECT * FROM isomer.cutover('shop', rollback_conninfo => 'host=... user=... password=...');
 SELECT isomer.alter_projection('customer_profile', freshness => 'sync');
 
--- Shard by entity and keep sync projections on one shard
-SELECT isomer.distribute(ARRAY['customers', 'orders']::regclass[], 'customer_id');
-
--- Read your writes: pass a committed write's token, and reads of projections wait for it
-SELECT isomer.last_write_token();                 -- after the write commits
-SET isomer.read_after = '<token>';                -- or SET LOCAL, under transaction-mode PgBouncer
+-- Read your writes
+SET isomer.read_after = '<isomer.last_write_token() after the write>';
 SELECT * FROM shop.customer_card WHERE id = 42;   -- waits until the projection has the write
-SELECT isomer.wait_for(isomer.last_write_token(), 'customer_profile');   -- or wait explicitly
--- ...or from any MongoDB driver: advance a causally consistent session to the write's time
-SELECT * FROM isomer.token_to_mongo_timestamp(isomer.last_write_token());   -- then
---   session.advanceOperationTime(Timestamp({t, i}))
--- MongoDB writes return operationTime and $clusterTime; projection reads return their freshness
--- as operationTime. With ISOMER_IMPLICIT_CAUSAL=1 on the gateway, a client's own gossiped
--- $clusterTime makes its reads of projections wait too, with no session changes.
 
-SELECT * FROM isomer.projection_status;
-SELECT * FROM isomer.drift_report;      -- "drift 0 rows · N checks · since ..."
-SELECT isomer.certificate('customer_profile');   -- rule, assumptions, live checks
-SELECT * FROM isomer.alerts;
+-- Trust, but verify
+SELECT * FROM isomer.drift_report;                -- "drift 0 rows · N checks · since ..."
+SELECT isomer.certificate('customer_profile');    -- the rules it relies on, checked live
 
--- Let the database suggest projections and shard keys from real traffic
+-- Let the database suggest projections and shard keys, then route a slow query onto one
 SELECT isomer.propose();  SELECT * FROM isomer.proposals;  SELECT isomer.accept_proposal(1);
+SELECT isomer.route_proposal(1);
 SELECT * FROM isomer.shard_advice();
 
--- Route a slow keyed read onto a projection: the application's SQL doesn't change
-SELECT isomer.route_proposal(1);   -- verified on sample keys, enabled only if measurably faster
-SELECT * FROM isomer.attachment_status();
-
--- History: time travel and a change feed (document and cache projections)
+-- Time travel and a change feed
 SELECT isomer.set_history('customer_profile', '7 days');
-SELECT isomer.as_of('customer_profile', '42', now() - interval '1 hour');   -- one document, then
-SELECT * FROM isomer.as_of('customer_profile', '2026-10-01 09:00+00');       -- the whole projection, then
-SELECT * FROM isomer.history('customer_profile', '42');                      -- every version kept
-SELECT * FROM isomer.changes_since('customer_profile', 0);                   -- the feed, in commit order
-
--- Serve projections over HTTP: an API key acts as a Postgres role, and reads only what it could
--- read from the tables behind the projection
-SELECT isomer.create_api_key('storefront', 'storefront_reader');   -- shown once
+SELECT isomer.as_of('customer_profile', '42', now() - interval '1 hour');
+SELECT * FROM isomer.changes_since('customer_profile', 0);
 ```
+
+Over HTTP, an API key acts as a Postgres role and reads only what that role could read from the
+tables behind a projection:
 
 ```sh
 curl -H "Authorization: Bearer $KEY" localhost:8080/v1/projections/customer_profile/docs/42
 curl -H "Authorization: Bearer $KEY" -H "X-Isomer-After: $TOKEN" localhost:8080/v1/projections/customer_profile/docs/42
-curl -H "Authorization: Bearer $KEY" "localhost:8080/v1/projections/customer_profile/docs/42?as_of=2026-10-01T09:00:00Z"
-curl -H "Authorization: Bearer $KEY" "localhost:8080/v1/projections/customer_profile/changes?after=0&limit=100"
-curl -N -H "Authorization: Bearer $KEY" localhost:8080/v1/projections/customer_profile/live   # snapshot, then changes (SSE)
+curl -N -H "Authorization: Bearer $KEY" localhost:8080/v1/projections/customer_profile/live   # snapshot, then changes
 ```
 
 ## Console and CLI
 
-Operators sign in with an API key for a role in `isomer_admin`:
-
-```sql
-CREATE ROLE ops; GRANT isomer_admin TO ops;
-SELECT isomer.create_api_key('ops', 'ops');   -- shown once
-```
-
-- Console: http://localhost:8080/console/: every projection's lag against its budget, drift
-  counters, alerts, proposals, the shard advisor, routes, attachments and events.
-- CLI (`clients/cli`, Node 20+):
+Operators sign in with an API key for a role in `isomer_admin`
+(`GRANT isomer_admin TO ops; SELECT isomer.create_api_key('ops', 'ops');`). The console is at
+http://localhost:8080/console/. The CLI is in `clients/cli` (Node 20+):
 
 ```sh
-(cd clients && npm ci && npm run build)
-alias isomer="node $PWD/clients/cli/dist/isomer.mjs"
+(cd clients && npm ci && npm run build) && alias isomer="node $PWD/clients/cli/dist/isomer.mjs"
 isomer login --url http://localhost:8080 --key "$KEY"
-isomer status          # exits 1 while there are alerts, so it works in scripts and health checks
-isomer watch
-isomer projection customer_profile
+isomer status                  # exits 1 while there are alerts
 isomer proposals && isomer accept 3 --sync && isomer route 3
-isomer audit --json
-isomer usage --by day          # metered usage: storage, node-hours, documents written, embeddings, requests
-isomer usage --csv > usage.csv # for a billing system (also GET /v1/admin/usage?format=csv)
+isomer usage --csv > usage.csv # metered usage, for billing
 ```
 
-- Postgres: `psql postgres://postgres:isomer@localhost:5432/postgres`
-- MongoDB: `mongosh "mongodb://isomer:isomer@localhost:10260/?tls=true&tlsAllowInvalidCertificates=true"`
+## Repository layout
 
-These are local development credentials only.
+| Path | What it is |
+|---|---|
+| [`extensions/isomer/`](extensions/isomer/) | The `isomer` extension: projections, attach and cutover, freshness, auditor, proposer, metering |
+| [`extensions/isomer_router/`](extensions/isomer_router/) | Planner and executor hooks: query routing, `read_after`, write tokens |
+| [`extensions/sharding/`](extensions/sharding/), [`documents/`](extensions/documents/), [`ivm/`](extensions/ivm/) | Built from source with our changes: sharding, document storage and the MongoDB gateway, incremental view maintenance |
+| [`services/api/`](services/api/), [`services/embedder/`](services/embedder/) | The HTTP API and the embedder (Rust) |
+| [`clients/`](clients/) | TypeScript: the API client, the `isomer` CLI and the console |
+| [`operator/`](operator/) | The Kubernetes operator (Go) |
+| [`docker/`](docker/) | The database image and its node scripts |
+| [`tests/`](tests/), [`scripts/`](scripts/), [`jepsen/`](jepsen/) | Acceptance tests, the runner, and Jepsen |
+| [`docs/`](docs/) | The [PRD](docs/PRD.md), [engineering notes](docs/engineering-notes.md), research, and these diagrams |
+
+## Tests
+
+```sh
+./scripts/test-all.sh     # every acceptance suite on fresh stacks, one node then three (destroys this project's volumes)
+./tests/operator.sh       # the operator on a local kind cluster: TLS, scaling, failover
+./tests/operator_backup.sh && ./tests/operator_upgrade.sh
+./tests/jepsen.sh         # Jepsen while workers are paused, killed and partitioned
+```
+
+The Jepsen workloads check isolation across shards (Elle) and read-your-writes through projections,
+and have found and fixed two bugs so far; see the [engineering notes](docs/engineering-notes.md).
+
+## What's left
+
+| Area | Not built yet | PRD |
+|---|---|---|
+| Projections | A cross-shard engine (DBSP) for projections that join or aggregate across shards; today those are kept by key or refused with a reason | FR-P6 |
+| Projections | A cost model that picks each projection's maintenance strategy | FR-S7 |
+| Projections | Analytics (columnar), event and edge projections | Later |
+| Adoption | A generated per-team cutover plan (cutover itself is built) | FR-A6 |
+| Adoption | Tested support for each managed Postgres (RDS, Cloud SQL, Neon, Supabase...) | FR-A11 |
+| Embeddings | Provider batch APIs for large backfills; bundled models billed at list price plus a markup | FR-V1a, V1b |
+| Operations | Alert delivery to on-call (alerts are raised and shown, not sent) | FR-K3 |
+| Cloud | The managed service: sign-up, regions, provisioning and billing on top of the operator | FR-CL1, CL2 |
+| Correctness | Jepsen faults on the coordinator itself, clock skew, and the MongoDB path; a published report per release | FR-K4 |
+| Product | Trademark clearance, ParadeDB HA licensing, the license for IsomerDB's own code, design partners | PRD §15 |
 
 ## License
 
-Third-party components and their licenses are listed in [`NOTICE`](NOTICE).
+IsomerDB's own license is still to be decided. Third-party components, their licenses and where each
+license text is in this repository are listed in [`NOTICE`](NOTICE).

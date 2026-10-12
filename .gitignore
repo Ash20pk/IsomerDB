@@ -5,3 +5,4 @@ node_modules/
 clients/*/dist/
 jepsen/store/
 jepsen/target/
+__pycache__/
