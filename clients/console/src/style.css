@@ -10,6 +10,7 @@
   --track: #e3e8ee;
   --focus: #2f5bd3;
   --on-cobalt: #ffffff;
+  --bar: #2f5bd3;
   color-scheme: light;
 }
 @media (prefers-color-scheme: dark) {
@@ -25,6 +26,7 @@
     --track: #27313c;
     --focus: #7e9df0;
     --on-cobalt: #0f1620;
+    --bar: #6b8de8;
     color-scheme: dark;
   }
 }
@@ -121,6 +123,25 @@ td .q { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-s
 .spark { display: block; width: 100%; height: 64px; }
 .spark .budget { stroke: var(--muted); stroke-dasharray: 3 3; stroke-width: 1; }
 .spark .line { stroke: var(--cobalt); fill: none; stroke-width: 1.5; }
+
+/* usage: one small column chart per metric */
+.usage { margin: 0 0 30px; }
+.usage header { display: flex; align-items: baseline; gap: 14px; flex-wrap: wrap; }
+.usage h2 { margin: 0 0 8px; }
+.usage .total { font-weight: 600; }
+.usage header .link { margin-left: auto; font-size: 13px; }
+.chartwrap { position: relative; }
+.bars { display: block; width: 100%; max-width: 960px; height: auto; }
+.chartwrap { max-width: 960px; }
+.bars .baseline { stroke: var(--line); stroke-width: 1; }
+.bars .bar { fill: var(--bar); }
+.bars .bar.on { fill: var(--ink); }
+.bars .hit { fill: transparent; }
+.bars g:focus { outline: none; }
+.bars g:focus-visible .bar { fill: var(--ink); }
+.bars .tick { fill: var(--muted); font-size: 11px; }
+.tip { position: absolute; top: 0; transform: translateX(-50%); background: var(--ink); color: var(--paper);
+       padding: 3px 8px; border-radius: 4px; font-size: 12px; white-space: nowrap; pointer-events: none; }
 
 .kv { display: grid; grid-template-columns: max-content 1fr; gap: 6px 22px; margin: 0; }
 .kv dt { color: var(--muted); }

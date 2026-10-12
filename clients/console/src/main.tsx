@@ -6,7 +6,7 @@ import { useEffect, useRef, useState } from "preact/hooks";
 
 import { IsomerClient, IsomerError, currentLagMs, formatMs, lagRatio, type Overview } from "@isomerdb/sdk";
 
-import { Advisor, Attachments, Events, Proposals, Routes } from "./pages.tsx";
+import { Advisor, Attachments, Events, Proposals, Routes, Usage } from "./pages.tsx";
 import { ProjectionPage } from "./projection.tsx";
 import { Track, describe, type History } from "./ui.tsx";
 
@@ -156,6 +156,7 @@ const SECTIONS: [string, string][] = [
   ["#/routes", "Routes"],
   ["#/attachments", "Attachments"],
   ["#/events", "Events"],
+  ["#/usage", "Usage"],
 ];
 
 function App() {
@@ -221,6 +222,7 @@ function App() {
   else if (hash === "#/routes") page = <Routes client={client} />;
   else if (hash === "#/attachments") page = <Attachments client={client} />;
   else if (hash === "#/events") page = <Events client={client} />;
+  else if (hash === "#/usage") page = <Usage client={client} />;
   else page = overview ? <Board o={overview} /> : <p class="quiet">{error ?? "Loading…"}</p>;
 
   return (

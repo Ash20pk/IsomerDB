@@ -2,7 +2,7 @@
 
 import { useEffect, useState } from "preact/hooks";
 
-import { formatMs, type IsomerClient } from "@isomerdb/sdk";
+import { formatMs, type IsomerClient, type UsageRow } from "@isomerdb/sdk";
 
 import { describe, useToast } from "./ui.tsx";
 
@@ -295,6 +295,167 @@ export function Events({ client }: { client: IsomerClient }) {
           </tbody>
         </table>
       )}
+    </>
+  );
+}
+
+// ── usage ───────────────────────────────────────────────────────────────────
+
+const METRICS: { metric: string; title: string; unit: string }[] = [
+  { metric: "storage_bytes", title: "Storage (peak)", unit: "bytes" },
+  { metric: "node_hours", title: "Node-hours", unit: "node-hours" },
+  { metric: "documents_written", title: "Documents written by projections", unit: "documents" },
+  { metric: "embedding_tokens", title: "Embedding tokens", unit: "tokens" },
+  { metric: "api_requests", title: "HTTP API requests", unit: "requests" },
+  { metric: "sql_statements", title: "SQL statements", unit: "statements" },
+];
+
+export function formatUsage(v: number, unit: string): string {
+  if (unit === "bytes") return v >= 1e9 ? `${(v / 1e9).toFixed(2)} GB` : `${(v / 1e6).toFixed(1)} MB`;
+  if (unit === "node-hours") return `${v.toFixed(2)} node-h`;
+  if (v >= 1e6) return `${(v / 1e6).toFixed(1)}M`;
+  if (v >= 1e3) return `${(v / 1e3).toFixed(1)}K`;
+  return String(Math.round(v));
+}
+
+type Period = "month" | "7d" | "30d";
+
+function range(period: Period): { from: string; by: "day" | "hour" } {
+  const now = new Date();
+  if (period === "month") return { from: new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1)).toISOString(), by: "day" };
+  const days = period === "7d" ? 7 : 30;
+  return { from: new Date(now.getTime() - days * 86_400_000).toISOString(), by: "day" };
+}
+
+/** One metric's periods: a column per period, its value at the tip on hover, a table on request. */
+function UsageChart({ title, unit, points }: { title: string; unit: string; points: { period: string; value: number }[] }) {
+  const [hover, setHover] = useState<number | null>(null);
+  const [asTable, setAsTable] = useState(false);
+  const total = unit === "bytes" ? Math.max(0, ...points.map((p) => p.value)) : points.reduce((n, p) => n + p.value, 0);
+  const w = 960;
+  const h = 110;
+  const max = Math.max(1, ...points.map((p) => p.value));
+  const slot = points.length ? w / points.length : w;
+  const barW = Math.min(24, Math.max(4, slot - 2));
+  const label = (p: { period: string }) => p.period.slice(0, 10);
+  return (
+    <section class="usage">
+      <header>
+        <h2>{title}</h2>
+        <span class="total">
+          {formatUsage(total, unit)}
+          <span class="quiet"> {unit === "bytes" ? "peak" : "in the period"}</span>
+        </span>
+        <button class="link" onClick={() => setAsTable(!asTable)}>
+          {asTable ? "Show chart" : "Show table"}
+        </button>
+      </header>
+      {points.length === 0 ? (
+        <p class="quiet">Nothing recorded in this period.</p>
+      ) : asTable ? (
+        <table>
+          <thead>
+            <tr>
+              <th>Day</th>
+              <th class="num">{unit}</th>
+            </tr>
+          </thead>
+          <tbody>
+            {points.map((p) => (
+              <tr key={p.period}>
+                <td>{label(p)}</td>
+                <td class="num">{formatUsage(p.value, unit)}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      ) : (
+        <div class="chartwrap" onMouseLeave={() => setHover(null)}>
+          <svg viewBox={`0 0 ${w} ${h + 18}`} class="bars" role="img" aria-label={`${title}, ${points.length} days`}>
+            <line class="baseline" x1="0" x2={w} y1={h} y2={h} />
+            {points.map((p, i) => {
+              const bh = Math.max(p.value > 0 ? 2 : 0, (p.value / max) * (h - 6));
+              const x = i * slot + (slot - barW) / 2;
+              const r = Math.min(4, bh / 2, barW / 2);
+              // Rounded data-end, square at the baseline.
+              const d = `M${x},${h} V${h - bh + r} Q${x},${h - bh} ${x + r},${h - bh} H${x + barW - r} Q${x + barW},${h - bh} ${x + barW},${h - bh + r} V${h} Z`;
+              return (
+                <g key={p.period} onMouseEnter={() => setHover(i)} onFocus={() => setHover(i)} tabIndex={0}>
+                  <rect class="hit" x={i * slot} y="0" width={slot} height={h} />
+                  <path class={`bar ${hover === i ? "on" : ""}`} d={d} />
+                </g>
+              );
+            })}
+            <text class="tick" x="0" y={h + 14}>{label(points[0]!)}</text>
+            <text class="tick" x={w} y={h + 14} text-anchor="end">{label(points[points.length - 1]!)}</text>
+          </svg>
+          {hover !== null && points[hover] && (
+            <div class="tip" style={{ left: `${Math.min(90, Math.max(10, ((hover + 0.5) / points.length) * 100))}%` }}>
+              <b>{formatUsage(points[hover].value, unit)}</b> {label(points[hover])}
+            </div>
+          )}
+        </div>
+      )}
+    </section>
+  );
+}
+
+export function Usage({ client }: { client: IsomerClient }) {
+  const [period, setPeriod] = useState<Period>("month");
+  const [rows, setRows] = useState<UsageRow[] | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  useEffect(() => {
+    setRows(null);
+    const { from, by } = range(period);
+    client.usage({ from, by }).then(
+      (r) => (setRows(r.usage), setError(null)),
+      (e) => setError(describe(e)),
+    );
+  }, [period]);
+  const download = async () => {
+    const { from, by } = range(period);
+    const csv = await client.usageCsv({ from, by });
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(new Blob([csv], { type: "text/csv" }));
+    a.download = `isomer-usage-${period}.csv`;
+    a.click();
+    URL.revokeObjectURL(a.href);
+  };
+  // Every day of the period, so the time axis is honest: days with nothing recorded show as 0.
+  const days: string[] = [];
+  for (let d = new Date(range(period).from.slice(0, 10) + "T00:00:00Z"); d.getTime() <= Date.now(); d = new Date(d.getTime() + 86_400_000)) {
+    days.push(d.toISOString().slice(0, 10));
+  }
+  // Each metric summed over its dimensions per day (storage: the day's peak).
+  const series = (metric: string, unit: string) => {
+    const byDay = new Map<string, number>();
+    for (const r of rows ?? []) {
+      if (r.metric !== metric) continue;
+      const day = r.period.slice(0, 10);
+      const v = byDay.get(day) ?? 0;
+      byDay.set(day, unit === "bytes" ? Math.max(v, r.value) : v + r.value);
+    }
+    if (byDay.size === 0) return [];
+    return days.map((day) => ({ period: day, value: byDay.get(day) ?? 0 }));
+  };
+  return (
+    <>
+      <h1>Usage</h1>
+      <p class="sub">What this cluster used, metered every minute: the figures a bill is made from.</p>
+      <div class="actions" style={{ marginBottom: "18px" }}>
+        <label class="quiet" for="period">
+          Period
+        </label>
+        <select id="period" value={period} onChange={(e) => setPeriod((e.target as HTMLSelectElement).value as Period)}>
+          <option value="month">This month</option>
+          <option value="7d">Last 7 days</option>
+          <option value="30d">Last 30 days</option>
+        </select>
+        <button onClick={() => void download()}>Download CSV</button>
+      </div>
+      {error && <p class="err">{error}</p>}
+      {!rows && !error && <p class="quiet">Loading…</p>}
+      {rows && METRICS.map((m) => <UsageChart key={m.metric} title={m.title} unit={m.unit} points={series(m.metric, m.unit)} />)}
     </>
   );
 }

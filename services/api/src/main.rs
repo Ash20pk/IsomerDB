@@ -53,6 +53,8 @@ struct App {
     /// Projection names from NOTIFY isomer_changes.
     changes: broadcast::Sender<String>,
     wait_ms: u64,
+    /// Data requests per role since the last flush to isomer.usage (metering, FR-CL2).
+    requests: std::sync::Mutex<std::collections::HashMap<String, i64>>,
 }
 
 type Shared = Arc<App>;
@@ -72,7 +74,13 @@ async fn main() -> Result<()> {
     let (changes, _) = broadcast::channel(1024);
     tokio::spawn(listen_for_changes(url.clone(), changes.clone()));
 
-    let app = Arc::new(App { pool, changes, wait_ms: env_or("ISOMER_API_WAIT_MS", 5000) });
+    let app = Arc::new(App {
+        pool,
+        changes,
+        wait_ms: env_or("ISOMER_API_WAIT_MS", 5000),
+        requests: Default::default(),
+    });
+    tokio::spawn(flush_usage(app.clone()));
     let router = Router::new()
         .route("/healthz", get(healthz))
         .route("/v1/projections", get(list_projections))
@@ -100,6 +108,40 @@ async fn main() -> Result<()> {
 
 fn env_or<T: std::str::FromStr>(name: &str, default: T) -> T {
     std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+}
+
+/// Count a data request (projection reads, not the admin API) for metering.
+fn count_request(app: &App, role: &str) {
+    if let Ok(mut m) = app.requests.lock() {
+        *m.entry(role.to_string()).or_insert(0) += 1;
+    }
+}
+
+/// Every 15 seconds, add the counted requests to isomer.usage. Counts that fail to write are kept
+/// for the next attempt.
+async fn flush_usage(app: Shared) {
+    loop {
+        tokio::time::sleep(Duration::from_secs(15)).await;
+        let batch: Vec<(String, i64)> = match app.requests.lock() {
+            Ok(mut m) => m.drain().collect(),
+            Err(_) => continue,
+        };
+        for (role, n) in batch {
+            let ok = match app.pool.get().await {
+                Ok(db) => db
+                    .execute("SELECT isomer.record_usage('api_requests', $1, $2::bigint)", &[&role, &n])
+                    .await
+                    .is_ok(),
+                Err(_) => false,
+            };
+            if !ok {
+                warn!(%role, n, "could not record API usage yet; keeping it");
+                if let Ok(mut m) = app.requests.lock() {
+                    *m.entry(role).or_insert(0) += n;
+                }
+            }
+        }
+    }
 }
 
 /// One connection LISTENs for isomer_changes and fans the projection names out to live streams.
@@ -216,7 +258,11 @@ async fn authorize(app: &App, headers: &HeaderMap, projection: &str) -> ApiResul
         .query_one("SELECT isomer.can_read($1::text::name, $2)", &[&role, &projection])
         .await?
         .get(0);
-    if ok { Ok(role) } else { Err(ApiError::not_found(projection)) }
+    if !ok {
+        return Err(ApiError::not_found(projection));
+    }
+    count_request(app, &role);
+    Ok(role)
 }
 
 /// Honour X-Isomer-After: wait until the projection reflects that write.
@@ -253,6 +299,7 @@ async fn healthz(State(app): State<Shared>) -> ApiResult<&'static str> {
 
 async fn list_projections(State(app): State<Shared>, headers: HeaderMap) -> ApiResult<Json<Value>> {
     let role = role_of(&app, &headers).await?;
+    count_request(&app, &role);
     let db = app.pool.get().await?;
     let row = db
         .query_one(

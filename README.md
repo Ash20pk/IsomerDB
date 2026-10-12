@@ -24,7 +24,7 @@ runs, with no migration.
 | [`operator/`](operator/) | Kubernetes operator (Go): `IsomerCluster` resources, online scale up/down with rebalance and drain, certificate authentication between nodes, standbys and failover, backups and point-in-time recovery, rolling upgrades. See [`operator/README.md`](operator/README.md) |
 | [`services/api/`](services/api/) | Rust HTTP API: projections by key, time travel, change feeds and live streams (SSE), and the admin endpoints the console and CLI use |
 | [`clients/`](clients/) | TypeScript: the API client (`sdk`), the `isomer` command line (`cli`) and the web console (`console`, served by the API at `/console`) |
-| [`tests/phase0.sh`](tests/phase0.sh) … [`phase3.sh`](tests/phase3.sh), [`native.sh`](tests/native.sh), [`multinode.sh`](tests/multinode.sh), [`routing.sh`](tests/routing.sh), [`history.sh`](tests/history.sh), [`freshness.sh`](tests/freshness.sh), [`console.sh`](tests/console.sh), [`local_model.sh`](tests/local_model.sh), [`operator.sh`](tests/operator.sh), [`operator_backup.sh`](tests/operator_backup.sh), [`operator_upgrade.sh`](tests/operator_upgrade.sh) | Acceptance tests: Phase 0 (attach, document and search projections), 1 (vector projections), 2 (primary mode: cutover, sharding, sync, read-your-writes, auditor), 3 (proposer, shard advisor, certificates, randomized concurrency) |
+| [`tests/phase0.sh`](tests/phase0.sh) … [`phase3.sh`](tests/phase3.sh), [`native.sh`](tests/native.sh), [`multinode.sh`](tests/multinode.sh), [`routing.sh`](tests/routing.sh), [`history.sh`](tests/history.sh), [`freshness.sh`](tests/freshness.sh), [`console.sh`](tests/console.sh), [`metering.sh`](tests/metering.sh), [`local_model.sh`](tests/local_model.sh), [`operator.sh`](tests/operator.sh), [`operator_backup.sh`](tests/operator_backup.sh), [`operator_upgrade.sh`](tests/operator_upgrade.sh) | Acceptance tests: Phase 0 (attach, document and search projections), 1 (vector projections), 2 (primary mode: cutover, sharding, sync, read-your-writes, auditor), 3 (proposer, shard advisor, certificates, randomized concurrency) |
 | [`scripts/smoke.sh`](scripts/smoke.sh) | Checks every base component works in a running stack |
 | [`scripts/test-all.sh`](scripts/test-all.sh) | Every suite on fresh stacks, single-node then the three-node cluster |
 | [`docs/engineering-notes.md`](docs/engineering-notes.md) | What we learned building the stack (gateway auth, change capture and sharding quirks) |
@@ -37,7 +37,7 @@ docker compose up --build -d     # Postgres on :5432, MongoDB wire gateway on :1
 
 docker compose --profile attach up -d   # adds a stand-in customer Postgres (:5433) and a mock embeddings API
 ./tests/phase0.sh && ./tests/phase1.sh && ./tests/phase2.sh && ./tests/phase3.sh && ./tests/native.sh && ./tests/routing.sh && ./tests/history.sh && ./tests/freshness.sh && ./tests/local_model.sh
-(cd clients && npm ci && npm run build) && ./tests/console.sh   # console, CLI and admin API
+(cd clients && npm ci && npm run build) && ./tests/console.sh && ./tests/metering.sh   # console, CLI, admin API, usage
 
 docker compose --profile cluster up -d  # adds two worker nodes
 ./tests/multinode.sh                    # joins them, rebalances online, tests across nodes
@@ -158,6 +158,8 @@ isomer watch
 isomer projection customer_profile
 isomer proposals && isomer accept 3 --sync && isomer route 3
 isomer audit --json
+isomer usage --by day          # metered usage: storage, node-hours, documents written, embeddings, requests
+isomer usage --csv > usage.csv # for a billing system (also GET /v1/admin/usage?format=csv)
 ```
 
 - Postgres: `psql postgres://postgres:isomer@localhost:5432/postgres`

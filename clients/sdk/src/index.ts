@@ -140,6 +140,20 @@ export interface DriftRow {
   summary: string;
 }
 
+export interface UsageRow {
+  period: string;
+  metric: string;
+  dimension: string;
+  unit: string;
+  value: number;
+}
+
+export interface UsageOptions {
+  from?: string;
+  to?: string;
+  by?: "hour" | "day" | "month";
+}
+
 /** An error the API answered with, carrying its HTTP status and IsomerDB SQLSTATE (e.g. IS001). */
 export class IsomerError extends Error {
   readonly status: number;
@@ -263,6 +277,29 @@ export class IsomerClient {
     return this.request("GET", "/v1/admin/attachments");
   }
 
+  /** Metered usage (storage, node-hours, documents written, embeddings, statements, API requests). */
+  usage(opts: UsageOptions = {}): Promise<{ by: string; usage: UsageRow[] }> {
+    return this.request("GET", `/v1/admin/usage${usageQuery(opts)}`);
+  }
+
+  /** The same, as CSV for a billing system. */
+  async usageCsv(opts: UsageOptions = {}): Promise<string> {
+    const res = await this.doFetch(`${this.url}/v1/admin/usage${usageQuery({ ...opts }, "csv")}`, {
+      headers: { authorization: `Bearer ${this.key}` },
+    });
+    const text = await res.text();
+    if (!res.ok) {
+      let err: { error?: string; code?: string | null } = {};
+      try {
+        err = JSON.parse(text) as typeof err;
+      } catch {
+        // not JSON
+      }
+      throw new IsomerError(err.error ?? (text || res.statusText), res.status, err.code ?? null);
+    }
+    return text;
+  }
+
   events(opts: { after?: number; limit?: number; subject?: string } = {}): Promise<{ events: IsomerEvent[] }> {
     const q = new URLSearchParams();
     if (opts.after !== undefined) q.set("after", String(opts.after));
@@ -271,6 +308,16 @@ export class IsomerClient {
     const qs = q.toString();
     return this.request("GET", `/v1/admin/events${qs ? `?${qs}` : ""}`);
   }
+}
+
+function usageQuery(opts: UsageOptions, format?: string): string {
+  const q = new URLSearchParams();
+  if (opts.from) q.set("from", opts.from);
+  if (opts.to) q.set("to", opts.to);
+  if (opts.by) q.set("by", opts.by);
+  if (format) q.set("format", format);
+  const qs = q.toString();
+  return qs ? `?${qs}` : "";
 }
 
 function enc(s: string): string {

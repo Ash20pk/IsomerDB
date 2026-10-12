@@ -9,6 +9,7 @@
 //   isomer audit [--sample n] | repair <projection>   (repair: re-derive the keys the auditor found drifted)
 //   isomer proposals | propose | accept <id> [--name n] [--sync] [--database db] | reject <id> | route <id>
 //   isomer enable-route <queryid> | disable-route <queryid>
+//   isomer usage [--from <time>] [--to <time>] [--by hour|day|month] [--csv]
 //
 // Every command takes --json for machine-readable output, and --url / --key, which override
 // ISOMER_URL / ISOMER_KEY and the file `isomer login` writes (~/.config/isomer/credentials.json).
@@ -39,6 +40,8 @@ const USAGE = `usage: isomer <command> [options]
   routes                            routed queries
   enable-route <queryid> | disable-route <queryid>
   events [--subject s] [--limit n]  the event log
+  usage [--from t] [--to t] [--by hour|day|month] [--csv]
+                                    metered usage, for billing
 
 options: --url, --key (or ISOMER_URL, ISOMER_KEY), --json`;
 
@@ -71,6 +74,14 @@ function int(arg: string | undefined, what: string): number {
 }
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+/** Usage values: whole numbers grouped, bytes in GB/MB, money to the cent. */
+export function formatUsage(v: number, unit: string): string {
+  if (unit === "bytes") return v >= 1e9 ? `${(v / 1e9).toFixed(2)} GB` : `${(v / 1e6).toFixed(1)} MB`;
+  if (unit === "USD") return v.toFixed(v < 1 ? 4 : 2);
+  if (unit === "node-hours") return v.toFixed(2);
+  return Math.round(v).toLocaleString("en-US");
+}
 
 export function renderStatus(o: Overview, s: Style): string {
   const out: string[] = [];
@@ -140,6 +151,10 @@ export async function main(argv: string[], write: (s: string) => void = (s) => p
       "as-of": { type: "string" },
       subject: { type: "string" },
       limit: { type: "string" },
+      from: { type: "string" },
+      to: { type: "string" },
+      by: { type: "string" },
+      csv: { type: "boolean", default: false },
       help: { type: "boolean", short: "h", default: false },
     },
   });
@@ -328,6 +343,23 @@ export async function main(argv: string[], write: (s: string) => void = (s) => p
       write(events.length ? table(["AT", "LEVEL", "SUBJECT", "MESSAGE"], events.map((e) => [
         e.at.slice(0, 19).replace("T", " "), e.level === "error" ? s.red(e.level) : e.level === "warning" ? s.yellow(e.level) : e.level,
         e.subject, e.message]), { s, max: 100 }) : s.dim("no events"));
+      return 0;
+    }
+    case "usage": {
+      const by = values.by ?? "day";
+      if (by !== "hour" && by !== "day" && by !== "month") throw new UsageError("--by must be hour, day or month");
+      const opts = { from: values.from, to: values.to, by: by as "hour" | "day" | "month" };
+      if (values.csv) {
+        process.stdout.write(await client.usageCsv(opts));
+        return 0;
+      }
+      const { usage } = await client.usage(opts);
+      if (values.json) return json(usage), 0;
+      write(usage.length
+        ? table(["PERIOD", "METRIC", "FOR", "VALUE", "UNIT"], usage.map((u) => [
+            u.period.slice(0, by === "hour" ? 16 : by === "day" ? 10 : 7).replace("T", " "), u.metric, u.dimension || s.dim("all"),
+            formatUsage(u.value, u.unit), u.unit]), { right: [3], s })
+        : s.dim("no usage recorded in that period (isomer.meter() samples every minute)"));
       return 0;
     }
     default:

@@ -45,6 +45,37 @@ opt-in setting.
    unmodified as its own import commit on a branch, then re-apply our changes. Update the tables
    above in the same change.
 
+## 2026-10-12 — Usage metering (FR-CL2)
+
+`tests/metering.sh` passes. Every minute `isomer.meter()` (isomer 0.14.0) samples into
+`isomer.usage`, one row per hour, metric and dimension:
+
+| Metric | Kind | By |
+|---|---|---|
+| `storage_bytes` | gauge (peak) | (total of every node) |
+| `node_hours` | counter | coordinator / worker |
+| `documents_written` | counter | projection |
+| `embedding_tokens`, `embedding_cost_usd` | counter | model |
+| `sql_statements` | counter | (coordinator) |
+| `api_requests` | counter | API key's role |
+
+`isomer.usage_report(from, to, 'hour'|'day'|'month')` rolls it up; the admin API serves it as JSON
+or CSV (`/v1/admin/usage`), `isomer usage` prints or exports it, and the console has a Usage page.
+
+- **Counters are differences from the last sample** (`isomer.usage_cursor`), so a restart, a second
+  sampler (they serialise on an advisory lock) or a statistics reset never counts anything twice.
+  The meter's very first sample takes a baseline; a source that appears later (a new projection,
+  model or month) counts in full. The first version treated every new source as a baseline, which
+  would have dropped each month's first minute of embedding tokens; the test caught it.
+- **The HTTP API counts its own requests** in memory and adds them every 15 seconds through
+  `isomer.record_usage`, keeping counts it could not write. Only data requests count: the admin
+  API (the console polls it) does not.
+- **Node-hours accrue between samples, capped at two minutes**: a gap means the sampler was not
+  running, and is not billed.
+
+Not metered: standbys (the database does not see them; the operator does), MongoDB gateway
+requests, and network transfer.
+
 ## 2026-10-12 — Operator: version upgrades (FR-CL1)
 
 `tests/operator_upgrade.sh` passes on kind. A cluster with standbys moves to an image carrying a

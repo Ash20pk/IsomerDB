@@ -15,11 +15,13 @@
 //!   GET  /v1/admin/advice                       the shard advisor
 //!   GET  /v1/admin/attachments                  attach-mode sources, slots and lag
 //!   GET  /v1/admin/events?after=&limit=         the event log, newest first
+//!   GET  /v1/admin/usage?from=&to=&by=&format=   metered usage by hour, day or month (JSON or CSV)
 //!
 //! A key may use these only if its role is a member of `isomer_admin` (keys never act as superusers).
 
 use axum::extract::{Path, Query, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{header, HeaderMap, StatusCode};
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
@@ -43,6 +45,7 @@ pub fn routes() -> Router<Shared> {
         .route("/v1/admin/advice", get(advice))
         .route("/v1/admin/attachments", get(attachments))
         .route("/v1/admin/events", get(events))
+        .route("/v1/admin/usage", get(usage))
 }
 
 /// The request's role, if it may use the admin API.
@@ -228,4 +231,60 @@ async fn events(State(app): State<Shared>, headers: HeaderMap, Query(q): Query<E
     )
     .await?;
     Ok(Json(json!({ "events": rows })))
+}
+
+#[derive(Deserialize)]
+struct UsageQuery {
+    /// Start, inclusive (default: the start of the current month, UTC).
+    from: Option<String>,
+    /// End, exclusive (default: now).
+    to: Option<String>,
+    /// hour, day (default) or month.
+    by: Option<String>,
+    /// json (default) or csv.
+    format: Option<String>,
+}
+
+async fn usage(State(app): State<Shared>, headers: HeaderMap, Query(q): Query<UsageQuery>) -> ApiResult<Response> {
+    admin(&app, &headers).await?;
+    let by = q.by.unwrap_or_else(|| "day".into());
+    let db = app.pool.get().await?;
+    let rows = db
+        .query(
+            "SELECT to_char(period AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"'), metric, dimension, unit, value::text
+             FROM isomer.usage_report(coalesce($1::text::timestamptz, date_trunc('month', now() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'),
+                                      coalesce($2::text::timestamptz, now()), $3)",
+            &[&q.from, &q.to, &by],
+        )
+        .await?;
+    if q.format.as_deref() == Some("csv") {
+        let mut out = String::from("period,metric,dimension,unit,value\n");
+        for r in &rows {
+            let field = |i: usize| csv_field(r.get::<_, String>(i));
+            out.push_str(&format!("{},{},{},{},{}\n", field(0), field(1), field(2), field(3), field(4)));
+        }
+        return Ok(([(header::CONTENT_TYPE, "text/csv; charset=utf-8")], out).into_response());
+    }
+    let items: Vec<Value> = rows
+        .iter()
+        .map(|r| {
+            json!({
+                "period": r.get::<_, String>(0),
+                "metric": r.get::<_, String>(1),
+                "dimension": r.get::<_, String>(2),
+                "unit": r.get::<_, String>(3),
+                "value": r.get::<_, String>(4).parse::<f64>().unwrap_or(0.0),
+            })
+        })
+        .collect();
+    Ok(Json(json!({ "by": by, "usage": items })).into_response())
+}
+
+/// A CSV field, quoted when it holds a comma, quote or newline.
+fn csv_field(s: String) -> String {
+    if s.contains([',', '"', '\n']) {
+        format!("\"{}\"", s.replace('"', "\"\""))
+    } else {
+        s
+    }
 }
