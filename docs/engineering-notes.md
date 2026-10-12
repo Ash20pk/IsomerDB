@@ -45,6 +45,39 @@ opt-in setting.
    unmodified as its own import commit on a branch, then re-apply our changes. Update the tables
    above in the same change.
 
+## 2026-10-12 — The cloud control plane (FR-CL1, FR-CL2)
+
+`tests/controlplane.sh` passes on kind. `controlplane/` is the managed service on top of the
+operator, in Go: a team signs up, creates a cluster in a region on a plan, reads its credentials,
+scales it within the plan, sees its usage and its invoice, and deletes it.
+
+- **Clusters are IsomerCluster resources** in a namespace per organisation
+  (`isomer-org-<id>`), in the Kubernetes cluster that serves the region. The operator does the
+  rest: provisioning, failover, backups, upgrades. A region is a kubeconfig (empty: the cluster the
+  control plane runs in); a plan is a size (workers, standbys, storage, CPU, memory, the most
+  workers it may scale to) and two prices.
+- **Pricing follows the PRD:** compute by the node-hour and storage by the GB-month, the same
+  units as the database (decision 6). Standbys, which the database can't see, are billed one per
+  node on plans that have them. Embeddings on bundled models pass through at what the cluster's
+  own metering bills; embeddings on the customer's own keys bill nothing here.
+- **Usage comes from each cluster's own metering:** every five minutes the collector reads
+  `isomer.usage_report` for the last two days, hour by hour, and replaces those hours, so
+  collecting twice never counts twice. A deleted cluster is read one last time first, and the time
+  it ran stays on the invoice.
+- **Accounts:** passwords under bcrypt, API tokens stored only as SHA-256 hashes. Every query is
+  scoped to the caller's organisation: another team's cluster is a 404, as one that doesn't exist.
+  `/v1/admin/collect` takes a separate admin token.
+- **Its own Postgres** holds organisations, users, tokens, clusters and collected usage
+  (`controlplane/config`, with development secrets to replace).
+
+What bit us: **macOS's `/bin/bash` 3.2 mangles escaped quotes nested inside `"$( )"`.** The test's
+second sign-up arrived as a JSON string instead of an object. Request bodies are now built with
+`printf` first.
+
+Not built: a sign-up page (the API is the interface), payment collection (invoices are computed;
+charging a card needs a payment provider account), and regions in other clouds (any kubeconfig
+works, none has been run).
+
 ## 2026-10-12 — Incremental maintenance across shards (FR-P6, FR-S5) and the strategy chooser (FR-S7)
 
 `tests/incremental.sh` passes on one node and on the three-node cluster. A projection that

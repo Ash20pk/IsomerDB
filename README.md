@@ -50,7 +50,7 @@ for billing, and pages on-call when a projection drifts or falls behind its lag 
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/diagrams/c4-2-containers-dark.svg">
-  <img alt="Containers: a MongoDB gateway, an HTTP API, the console and CLI, a coordinator and worker nodes (PostgreSQL 18, Citus, the isomer extension), an embedder, and the Kubernetes operator are built. A cloud control plane and edge replicas are planned." src="docs/diagrams/c4-2-containers.svg">
+  <img alt="Containers: a MongoDB gateway, an HTTP API, the console and CLI, a coordinator and worker nodes (PostgreSQL 18, Citus, the isomer extension), an embedder, and the Kubernetes operator and the cloud control plane are built. Edge replicas are planned." src="docs/diagrams/c4-2-containers.svg">
 </picture>
 
 | Container | What it does | Status |
@@ -62,7 +62,7 @@ for billing, and pages on-call when a projection drifts or falls behind its lag 
 | **Console and CLI** | Lag against budget, drift, alerts, proposals, routes, usage. | Built |
 | **Embedder** | Computes embeddings for vector projections, from a hosted API or bge-small on its own CPU. | Built |
 | **Kubernetes operator** | Provisions and scales clusters, fails over to standbys, backs up and restores to a point in time, rolls upgrades, issues node certificates. | Built |
-| **Cloud control plane** | Managed IsomerDB: sign-up, regions, provisioning, billing. | Planned |
+| **Cloud control plane** | Managed IsomerDB: sign-up, regions, plans, provisioning through the operator, usage collected from each cluster and priced on invoices. | Built |
 | **Edge replicas** | Projections served close to users, fed by the change feed. | Planned |
 
 ### Level 3: inside the coordinator
@@ -307,6 +307,7 @@ SELECT * FROM isomer.alert_deliveries ORDER BY id DESC LIMIT 20;   -- what was s
 | [`services/api/`](services/api/), [`services/embedder/`](services/embedder/) | The HTTP API and the embedder (Rust) |
 | [`clients/`](clients/) | TypeScript: the API client, the `isomer` CLI and the console |
 | [`operator/`](operator/) | The Kubernetes operator (Go) |
+| [`controlplane/`](controlplane/) | The cloud control plane: accounts, regions, plans, clusters, usage, invoices (Go) |
 | [`docker/`](docker/) | The database image and its node scripts |
 | [`tests/`](tests/), [`scripts/`](scripts/), [`jepsen/`](jepsen/) | Acceptance tests, the runner, and Jepsen |
 | [`docs/`](docs/) | The [PRD](docs/PRD.md), [engineering notes](docs/engineering-notes.md), research, and these diagrams |
@@ -316,6 +317,7 @@ SELECT * FROM isomer.alert_deliveries ORDER BY id DESC LIMIT 20;   -- what was s
 ```sh
 ./scripts/test-all.sh     # every acceptance suite on fresh stacks, one node then three (destroys this project's volumes)
 ./tests/operator.sh       # the operator on a local kind cluster: TLS, scaling, failover
+./tests/controlplane.sh   # the cloud control plane on kind: sign-up, clusters, usage, invoices
 ./tests/operator_backup.sh && ./tests/operator_upgrade.sh
 ./tests/jepsen.sh         # Jepsen while workers are paused, killed and partitioned
 ```
@@ -331,7 +333,7 @@ and have found and fixed two bugs so far; see the [engineering notes](docs/engin
 | Projections | Analytics (columnar), event and edge projections | Later |
 | Adoption | Tested support for each managed Postgres (RDS, Cloud SQL, Neon, Supabase...) | FR-A11 |
 | Embeddings | Provider batch APIs for large backfills; bundled models billed at list price plus a markup | FR-V1a, V1b |
-| Cloud | The managed service: sign-up, regions, provisioning and billing on top of the operator | FR-CL1, CL2 |
+| Cloud | A sign-up page; charging cards (invoices are computed, collecting payment needs a payment provider account); regions in other clouds run for real | FR-CL1, CL2 |
 | Correctness | Jepsen faults on the coordinator itself, clock skew, and the MongoDB path; a published report per release | FR-K4 |
 | Product | Trademark clearance, ParadeDB HA licensing, design partners | PRD §15 |
 

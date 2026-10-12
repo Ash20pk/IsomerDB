@@ -86,8 +86,8 @@ def containers() -> Diagram:
     d.add(E("operator", "container", "Kubernetes operator", 70, 870, 430, "Go",
             desc="Provisions and scales clusters, fails over to standbys, backs up and restores to a point in "
                  "time, rolls upgrades, issues node certificates."))
-    d.add(E("cloud", "container", "Cloud control plane", 600, 870, 280, "Go", status="planned",
-            desc="Managed IsomerDB: sign-up, regions, provisioning, billing."))
+    d.add(E("cloud", "container", "Cloud control plane", 600, 870, 280, "Go",
+            desc="Managed IsomerDB: sign-up, regions, plans, provisioning, usage and invoices."))
 
     # Outside.
     d.add(E("pg", "external", "Existing Postgres", 70, 1140, 260, desc="Followed in attach mode until cutover."))
@@ -116,7 +116,7 @@ def containers() -> Diagram:
     d.rel(("embedder", "bottom", x("embedder", 1430)), ("llm", "top", x("llm", 1430)), "Embeds", "HTTPS", label_at=0.5)
     d.rel(("operator", "top", x("operator", 200)), ("coord", "bottom", x("coord", 200)),
           "Manages every node", "Kubernetes API", label_at=0.5)
-    d.rel(("cloud", "left", 0.5), ("operator", "right", 0.5), "Creates clusters", status="planned",
+    d.rel(("cloud", "left", 0.5), ("operator", "right", 0.5), "Creates clusters", "IsomerCluster",
           label_at=0.5, label_dy=-20, label_w=90)
     coord_y = d.elements["coord"].anchor("left", 0.85)[1]
     pg_y = d.elements["pg"].anchor("left", 0.5)[1]

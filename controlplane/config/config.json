@@ -1,0 +1,13 @@
+{
+  "image": "isomerdb:dev",
+  "apiImage": "isomer-api:dev",
+  "regions": [
+    {"name": "local-1", "display": "This Kubernetes cluster"}
+  ],
+  "plans": [
+    {"name": "dev", "workers": 0, "maxWorkers": 2, "standbys": 0, "storage": "2Gi", "cpu": "200m", "memory": "512Mi",
+     "nodeHourUSD": 0.05, "storageGBMonthUSD": 0.15},
+    {"name": "standard", "workers": 2, "maxWorkers": 16, "standbys": 1, "storage": "20Gi", "cpu": "1", "memory": "4Gi",
+     "nodeHourUSD": 0.20, "storageGBMonthUSD": 0.15}
+  ]
+}

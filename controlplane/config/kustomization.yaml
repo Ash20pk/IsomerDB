@@ -1,0 +1,17 @@
+# The cloud control plane and its own Postgres, in namespace isomerdb-cloud:
+#   kubectl apply -k controlplane/config
+# It needs the operator (kubectl apply -k operator/config) in every region it provisions into.
+# The Secret holds development values: replace them before running it anywhere real.
+namespace: isomerdb-cloud
+resources:
+  - namespace.yaml
+  - secret.yaml
+  - postgres.yaml
+  - rbac.yaml
+  - controlplane.yaml
+configMapGenerator:
+  - name: controlplane-config
+    files:
+      - config.json
+generatorOptions:
+  disableNameSuffixHash: true

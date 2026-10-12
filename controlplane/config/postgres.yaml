@@ -1,0 +1,38 @@
+# The control plane's own state: organisations, users, tokens, clusters and collected usage.
+apiVersion: v1
+kind: Service
+metadata:
+  name: controlplane-postgres
+spec:
+  selector: {app: controlplane-postgres}
+  ports: [{port: 5432}]
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: controlplane-postgres
+spec:
+  serviceName: controlplane-postgres
+  replicas: 1
+  selector:
+    matchLabels: {app: controlplane-postgres}
+  template:
+    metadata:
+      labels: {app: controlplane-postgres}
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:18.6-bookworm
+          env:
+            - name: POSTGRES_PASSWORD
+              valueFrom: {secretKeyRef: {name: controlplane, key: postgres-password}}
+          ports: [{containerPort: 5432}]
+          readinessProbe:
+            exec: {command: [pg_isready, -U, postgres]}
+            periodSeconds: 5
+          volumeMounts: [{name: data, mountPath: /var/lib/postgresql}]
+  volumeClaimTemplates:
+    - metadata: {name: data}
+      spec:
+        accessModes: [ReadWriteOnce]
+        resources: {requests: {storage: 1Gi}}

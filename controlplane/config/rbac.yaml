@@ -1,0 +1,29 @@
+# The control plane creates a namespace per organisation and IsomerClusters in it, and reads the
+# credentials the operator generates for each cluster.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: controlplane
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: isomerdb-controlplane
+rules:
+  - apiGroups: [""]
+    resources: [namespaces]
+    verbs: [get, create]
+  - apiGroups: [""]
+    resources: [secrets]
+    verbs: [get]
+  - apiGroups: [isomerdb.io]
+    resources: [isomerclusters]
+    verbs: [get, list, create, patch, delete]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: isomerdb-controlplane
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: isomerdb-controlplane}
+subjects:
+  - {kind: ServiceAccount, name: controlplane, namespace: isomerdb-cloud}
