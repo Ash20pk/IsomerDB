@@ -1713,14 +1713,17 @@ DECLARE
     v_lag_ms double precision;
     v_until  timestamptz;
 BEGIN
-    FOR p IN SELECT name, kind, lag_budget, strategy FROM isomer.projections
-             WHERE kind IN ('document', 'vector', 'cache') AND freshness = 'bounded' AND status = 'active'
-    LOOP
+    -- Queued keys reach pending for every projection, paused ones too: their work waits there.
+    FOR p IN SELECT DISTINCT projection AS name FROM isomer.key_log LOOP
         BEGIN
             PERFORM isomer._merge_key_log(p.name);
         EXCEPTION WHEN OTHERS THEN
             PERFORM isomer._log('error', p.name, format('merging queued keys failed: %s', SQLERRM));
         END;
+    END LOOP;
+    FOR p IN SELECT name, kind, lag_budget, strategy FROM isomer.projections
+             WHERE kind IN ('document', 'vector', 'cache') AND freshness = 'bounded' AND status = 'active'
+    LOOP
         IF p.strategy = 'incremental' THEN
             v_until := clock_timestamp() + greatest(p.lag_budget / 2, interval '200 milliseconds');
             BEGIN
@@ -1830,7 +1833,7 @@ RETURNS bigint LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path = pg_c
 DECLARE
     v_until   timestamptz := clock_timestamp() + p_timeout;
     v_multi   boolean := EXISTS (SELECT 1 FROM isomer._workers());
-    v_barrier timestamptz;
+    v_barrier bigint;
     v_gids    text[];
     s         record;
 BEGIN
@@ -1858,11 +1861,11 @@ BEGIN
         PERFORM pgtrickle.refresh_stream_table(format('%I.%I', s.target_schema, s.name));
     END LOOP;
     IF v_multi THEN
-        v_barrier := isomer._barrier();
+        v_barrier := isomer._barrier_token(p_projection);
     END IF;
     LOOP
         IF v_multi THEN
-            EXIT WHEN NOT isomer._queued_before(v_barrier, p_projection);
+            EXIT WHEN NOT isomer._queued_through(v_barrier, p_projection);
         ELSE
             EXIT WHEN NOT EXISTS (SELECT 1 FROM isomer.pending
                                   WHERE token > 0 AND token <= p_token AND (p_projection IS NULL OR projection = p_projection))
@@ -2613,6 +2616,62 @@ BEGIN
 END $$;
 REVOKE EXECUTE ON FUNCTION isomer._merge_key_log(text) FROM PUBLIC;
 
+-- ── Read your writes across nodes: a barrier on the cluster clock ──────────
+
+-- wait_for on a cluster used to compare wall-clock times: every node's clock_timestamp() at the
+-- call against each queued change's enqueued_at. That assumes no node's clock ever steps back.
+-- The Jepsen clock-skew test found the gap: a worker whose clock was ahead when a write queued,
+-- then stepped back, left the write stamped later than the barrier, and the read did not wait for
+-- it. Queued changes already carry the Citus cluster clock of the node that queued them (their
+-- token), which never goes back: it is the larger of a ticking logical clock and the wall clock,
+-- persisted across restarts. So the barrier is now a token: the largest of every node's cluster
+-- clock and of every token already queued, and wait_for waits until nothing at or below it is
+-- queued anywhere.
+CREATE FUNCTION isomer._barrier_token(p_projection text DEFAULT NULL)
+RETURNS bigint LANGUAGE plpgsql VOLATILE SET search_path = pg_catalog AS $$
+DECLARE
+    v_filter text := CASE WHEN p_projection IS NULL THEN '' ELSE format('WHERE projection = %L', p_projection) END;
+BEGIN
+    RETURN greatest(
+        isomer.current_token(),
+        (SELECT max(result::bigint) FROM run_command_on_workers('SELECT isomer.current_token()') WHERE success),
+        (SELECT max(result::bigint) FROM run_command_on_workers(format(
+             'SELECT greatest((SELECT max(token) FROM isomer.node_queue %1$s), (SELECT max(token) FROM isomer.node_deltas %1$s))', v_filter))
+         WHERE success AND result <> ''),
+        (SELECT max(token) FROM isomer.pending WHERE p_projection IS NULL OR projection = p_projection),
+        (SELECT max(token) FROM isomer.key_log WHERE p_projection IS NULL OR projection = p_projection),
+        (SELECT max(token) FROM isomer.deltas WHERE p_projection IS NULL OR projection = p_projection),
+        (SELECT max(token) FROM isomer.embed_jobs WHERE p_projection IS NULL OR projection = p_projection));
+END $$;
+
+-- Is anything stamped at or before the barrier still queued, on any node? Workers are asked
+-- first, then the coordinator in a separate statement, so a change moving from a worker to the
+-- coordinator meanwhile is seen in one place or the other. Fails closed: a worker that doesn't
+-- answer counts as still having work queued.
+CREATE FUNCTION isomer._queued_through(p_barrier bigint, p_projection text)
+RETURNS boolean LANGUAGE plpgsql VOLATILE SET search_path = pg_catalog AS $$
+DECLARE
+    v_remote boolean;
+    v_filter text := CASE WHEN p_projection IS NULL THEN '' ELSE format('AND projection = %L', p_projection) END;
+BEGIN
+    SELECT coalesce(bool_or(NOT success OR result = 't'), false) INTO v_remote
+    FROM run_command_on_workers(format(
+        'SELECT EXISTS (SELECT 1 FROM isomer.node_queue WHERE token > 0 AND token <= %1$s %2$s) '
+        '    OR EXISTS (SELECT 1 FROM isomer.node_deltas WHERE token > 0 AND token <= %1$s %2$s)',
+        p_barrier, v_filter));
+    IF v_remote THEN
+        RETURN true;
+    END IF;
+    RETURN EXISTS (SELECT 1 FROM isomer.pending
+                   WHERE token > 0 AND token <= p_barrier AND (p_projection IS NULL OR projection = p_projection))
+        OR EXISTS (SELECT 1 FROM isomer.key_log
+                   WHERE token > 0 AND token <= p_barrier AND (p_projection IS NULL OR projection = p_projection))
+        OR EXISTS (SELECT 1 FROM isomer.deltas
+                   WHERE token > 0 AND token <= p_barrier AND (p_projection IS NULL OR projection = p_projection))
+        OR EXISTS (SELECT 1 FROM isomer.embed_jobs
+                   WHERE token > 0 AND token <= p_barrier AND (p_projection IS NULL OR projection = p_projection));
+END $$;
+
 -- Everything this version adds is for the extension and administrators, not for applications.
 DO $$
 DECLARE
@@ -2623,7 +2682,7 @@ BEGIN
                AND (p.proname LIKE '\_engine%' OR p.proname IN (
                     '_has_equality', '_is_unique', '_primary_key', '_aligned', '_coltype', '_first_placement', '_pick',
                     '_on_source_delta', 'pull_node_deltas', 'choose_strategy', 'strategy_advice', 'create_projection',
-                    'alter_projection', '_truth', '_shard_groups', '_runnable', '_key_cost'))
+                    'alter_projection', '_truth', '_shard_groups', '_runnable', '_key_cost', '_barrier_token', '_queued_through'))
     LOOP
         EXECUTE format('REVOKE EXECUTE ON %s %s FROM PUBLIC',
                        CASE WHEN (SELECT prokind FROM pg_proc WHERE oid = f) = 'p' THEN 'PROCEDURE' ELSE 'FUNCTION' END, f);

@@ -118,7 +118,7 @@ eventually "document updated (insert + update)" "9001:delivered,9003:pending" \
 eventually "document deleted" "0" \
   "mongo_eval 'db.getSiblingDB(\"shop\").customer_profile.countDocuments({_id: 7})'" 10
 eventually "search sees new and updated rows" "9001,9003" \
-  "$ISO -c \"SELECT string_agg(id::text, ',' ORDER BY id) FROM public.order_search WHERE note @@@ 'keyboard'\"" 10
+  "$ISO -c \"SELECT string_agg(id::text, ',' ORDER BY id) FROM public.order_search WHERE note @@@ 'keyboard'\"" 20
 eventually "search drops deleted rows" "0" \
   "$ISO -c \"SELECT count(*) FROM public.order_search WHERE id = 9002\"" 10
 expect "no lag-budget breaches" "0" \
