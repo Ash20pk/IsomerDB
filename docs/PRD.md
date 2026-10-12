@@ -354,7 +354,7 @@ joins), along with ParadeDB index maintenance under write load.
 | **Compatibility** | Stock Postgres 18; any Postgres driver/ORM; MongoDB drivers for Node, Python, Go, Java. Published MongoDB compatibility matrix. |
 | **Security** | Attach replication is read-only against the customer's database. Standard encryption in transit/at rest and role-based access for the managed cloud *(details TBD)*. |
 | **Testing** | Jepsen + Rust property tests + deterministic simulation. The test suite must not consist only of tests written alongside the code they check. |
-| **Licensing** | New IsomerDB code stays separate from AGPL components (Citus, pg_search) to fit open core; confirmed by legal. |
+| **Licensing** | IsomerDB's own code is AGPL-3.0-only; the client SDK, CLI and console are Apache-2.0 (§15, decision 9). The managed control plane is not distributed and stays closed. |
 
 ---
 
@@ -475,6 +475,7 @@ confirming.
 | 6 | Pricing and open-core line | Price attach in the **same units as the database** (compute-hours plus GB-month), never per event. Free attach tier; attach and primary as two modes of one SKU; optional 20–30% attach discount; $0–30 entry. **Open:** projection engine, SQL and Mongo reads, single-node attach. **Commercial:** managed control plane, HA for search and vector, multi-node, cutover tooling, PITR, SSO, BYOC. | Recommended; licensing needs counsel |
 | 7 | Design partners | Profile: Series A–C SaaS or marketplace, 30–300 engineers, Postgres plus Elastic/Mongo/vector DB kept in sync by Debezium, PeerDB or dual writes. 8-point qualification checklist and sourcing channels in `research/04` (next: PGConf EU, Valencia, 20–23 Oct 2026). | Profile done; **naming actual partners is yours** |
 | 8 | NFR targets | Set in §8: sync overhead p99 ≤ 5 ms, bounded lag p99 ≤ 2 s, attach p99 ≤ 5 s, 99.95% → 99.99%, plus a freshness SLA. | Proposed; needs our own benchmarks |
+| 9 | License for IsomerDB's own code | **AGPL-3.0-only** for the database (extensions, services, operator); **Apache-2.0** for `clients/`. Reasons: the shipped image is already an AGPL combined work (modified Citus and pg_search share the backend process), so a permissive license on our code would buy users no real freedom while letting a host resell the service without contributing; AGPL is what Citus and ParadeDB chose for the same reason. The SDK is Apache so applications that import it carry no obligations. As sole copyright holder we can still sell a commercial license to companies that ban AGPL; to keep that option, outside contributions need a CLA (inbound license grant) before any are accepted. This moves the open-core line in decision 6: everything in this repository is open, and the commercial offer is the managed cloud plus commercial licenses. | **Decided**; counsel to review the CLA |
 
 Questions 5–8 are accepted as recommended.
 
@@ -541,8 +542,7 @@ the route above needs no change to Postgres.
 
 1. Commission the trademark clearance search on IsomerDB, and secure the domain and package names.
 2. ParadeDB HA: buy the commercial license, build our own, or rebuild search projections at failover.
-3. License for Isomer-original code (AGPL vs Apache plus a closed control plane), with counsel.
-4. Name the Phase 0 design partners against the checklist.
+3. Name the Phase 0 design partners against the checklist.
 
 ---
 

@@ -27,4 +27,5 @@ FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/*
 COPY --from=build /isomer-embedder /usr/local/bin/isomer-embedder
 COPY --from=model /model /usr/share/isomer/models/bge-small-en-v1.5
+COPY LICENSE NOTICE /usr/share/doc/isomerdb/
 ENTRYPOINT ["isomer-embedder"]

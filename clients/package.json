@@ -1,5 +1,6 @@
 {
   "name": "isomerdb-clients",
+  "license": "Apache-2.0",
   "private": true,
   "workspaces": [
     "sdk",

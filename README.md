@@ -324,9 +324,17 @@ and have found and fixed two bugs so far; see the [engineering notes](docs/engin
 | Embeddings | Provider batch APIs for large backfills; bundled models billed at list price plus a markup | FR-V1a, V1b |
 | Cloud | The managed service: sign-up, regions, provisioning and billing on top of the operator | FR-CL1, CL2 |
 | Correctness | Jepsen faults on the coordinator itself, clock skew, and the MongoDB path; a published report per release | FR-K4 |
-| Product | Trademark clearance, ParadeDB HA licensing, the license for IsomerDB's own code, design partners | PRD §15 |
+| Product | Trademark clearance, ParadeDB HA licensing, design partners | PRD §15 |
 
 ## License
 
-IsomerDB's own license is still to be decided. Third-party components, their licenses and where each
-license text is in this repository are listed in [`NOTICE`](NOTICE).
+IsomerDB's own code is licensed under the [GNU Affero General Public License v3.0](LICENSE)
+(`AGPL-3.0-only`): the extensions, the services, the operator and everything else in this
+repository, with two exceptions. The client libraries and tools under [`clients/`](clients) (the
+SDK, the CLI and the console) are licensed under the [Apache License 2.0](clients/LICENSE), so an
+application that imports the SDK takes on no copyleft obligations. The Jepsen tests under
+[`jepsen/`](jepsen) are also Apache-2.0, because Jepsen itself is EPL-1.0, which cannot be combined
+with the AGPL.
+
+Third-party components, their licenses and where each license text is in this repository are
+listed in [`NOTICE`](NOTICE).

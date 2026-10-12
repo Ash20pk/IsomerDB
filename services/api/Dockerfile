@@ -20,5 +20,7 @@ FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/*
 COPY --from=build /isomer-api /usr/local/bin/isomer-api
 COPY --from=console /src/clients/console/dist /usr/share/isomer/console
+COPY LICENSE NOTICE /usr/share/doc/isomerdb/
+COPY clients/LICENSE /usr/share/isomer/console/LICENSE
 ENTRYPOINT ["isomer-api"]
 EXPOSE 8080

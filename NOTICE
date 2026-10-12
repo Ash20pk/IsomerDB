@@ -1,6 +1,10 @@
 IsomerDB
 Copyright (c) 2026 Aswin Kumar <ash20pk@gmail.com>
 
+IsomerDB's own code is licensed under the GNU Affero General Public License v3.0 (LICENSE),
+except clients/ and jepsen/, which are licensed under the Apache License 2.0 (clients/LICENSE,
+jepsen/LICENSE).
+
 This product includes software developed by third parties. Each entry gives the component, what
 it is used for, its copyright holder and license, and where the full license text is in this
 repository. Paths are relative to the repository root.

@@ -113,7 +113,7 @@ COPY extensions/sharding/LICENSE /usr/share/doc/isomerdb/licenses/citus.LICENSE
 COPY extensions/documents/LICENSE /usr/share/doc/isomerdb/licenses/documentdb.LICENSE
 COPY extensions/ivm/LICENSE /usr/share/doc/isomerdb/licenses/pg_trickle.LICENSE
 COPY licenses/ /usr/share/doc/isomerdb/licenses/
-COPY NOTICE /usr/share/doc/isomerdb/NOTICE
+COPY LICENSE NOTICE /usr/share/doc/isomerdb/
 
 LABEL org.opencontainers.image.title="isomerdb" \
       org.opencontainers.image.description="IsomerDB base: PostgreSQL 18 + Citus + DocumentDB + pg_search + pgvector + pg_trickle"

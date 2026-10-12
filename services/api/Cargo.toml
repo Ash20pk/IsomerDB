@@ -2,6 +2,7 @@
 name = "isomer-api"
 version = "0.1.0"
 edition = "2021"
+license = "AGPL-3.0-only"
 description = "Serves IsomerDB projections over HTTP: key lookup, time travel, change feeds and live streams"
 publish = false
 

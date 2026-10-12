@@ -2,6 +2,7 @@
 name = "isomer-embedder"
 version = "0.2.0"
 edition = "2021"
+license = "AGPL-3.0-only"
 description = "Computes embeddings for IsomerDB vector projections, outside Postgres"
 publish = false
 
