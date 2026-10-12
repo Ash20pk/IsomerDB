@@ -109,11 +109,11 @@ RUN case "$TARGETARCH" in \
     && echo "$sum  /usr/local/bin/wal-g" | sha256sum -c - \
     && chmod 755 /usr/local/bin/wal-g
 COPY docker/gateway.json /etc/isomerdb/gateway.json
-COPY NOTICE /usr/share/doc/isomerdb/NOTICE
 COPY extensions/sharding/LICENSE /usr/share/doc/isomerdb/licenses/citus.LICENSE
 COPY extensions/documents/LICENSE /usr/share/doc/isomerdb/licenses/documentdb.LICENSE
 COPY extensions/ivm/LICENSE /usr/share/doc/isomerdb/licenses/pg_trickle.LICENSE
-COPY docker/licenses/wal-g.LICENSE /usr/share/doc/isomerdb/licenses/wal-g.LICENSE
+COPY licenses/ /usr/share/doc/isomerdb/licenses/
+COPY NOTICE /usr/share/doc/isomerdb/NOTICE
 
 LABEL org.opencontainers.image.title="isomerdb" \
       org.opencontainers.image.description="IsomerDB base: PostgreSQL 18 + Citus + DocumentDB + pg_search + pgvector + pg_trickle"

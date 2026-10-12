@@ -1,19 +1,69 @@
 IsomerDB
 Copyright (c) 2026 Aswin Kumar <ash20pk@gmail.com>
 
-This product includes software developed by third parties:
+This product includes software developed by third parties. Each entry gives the component, what
+it is used for, its copyright holder and license, and where the full license text is in this
+repository. Paths are relative to the repository root.
 
-  extensions/sharding/    Citus 14.2.0          Copyright (c) Citus Data, Inc.              AGPL-3.0
-  extensions/documents/   DocumentDB 0.117-0    Copyright (c) Microsoft Corporation         MIT
-  extensions/ivm/         pg_trickle 0.108.3    Copyright (c) the pg_trickle authors        Apache-2.0
-  (image)                 pg_search 0.26.1      Copyright (c) ParadeDB, Inc.                AGPL-3.0
-  (image)                 PostgreSQL 18.6, pgvector, pg_cron    PostgreSQL License
-  (image)                 PostGIS                               GPL-2.0
-  (image)                 WAL-G 3.0.9           Copyright (c) 2017 Citus Data, Inc.         Apache-2.0
-  (console)               Preact 10.29.8        Copyright (c) Jason Miller                  MIT
-  (embedder)              bge-small-en-v1.5     Copyright (c) 2022 staoxiao (BAAI)          MIT
-  (embedder)              candle, tokenizers    Copyright (c) Hugging Face                  MIT / Apache-2.0
+Built from source in this repository (modified; each change is marked "IsomerDB:" in the code):
 
-The directories above contain modifications by IsomerDB, marked "IsomerDB:" at each change.
-Full license texts and upstream notices are in each directory's LICENSE and NOTICE files, and in
-the image under /usr/share/doc/isomerdb/licenses/.
+  Citus 14.2.0                      sharding (extensions/sharding/)
+    Copyright (c) Citus Data, Inc.                  AGPL-3.0
+    extensions/sharding/LICENSE, extensions/sharding/NOTICE
+
+  DocumentDB 0.117-0                document storage and the MongoDB gateway (extensions/documents/)
+    Copyright (c) Microsoft Corporation             MIT
+    extensions/documents/LICENSE, extensions/documents/NOTICE
+
+  pg_trickle 0.108.3                incremental view maintenance (extensions/ivm/)
+    Copyright (c) the pg_trickle authors            Apache-2.0
+    extensions/ivm/LICENSE
+
+Included unmodified in the Docker image:
+
+  PostgreSQL 18.6
+    Copyright (c) PostgreSQL Global Development Group; The Regents of the University of California
+    PostgreSQL License                              licenses/postgresql.COPYRIGHT
+
+  pg_search 0.26.1 (ParadeDB)       full-text search
+    Copyright (c) ParadeDB, Inc.                    AGPL-3.0
+    licenses/pg_search.LICENSE
+
+  pgvector 0.8.7                    vector indexes
+    Copyright (c) PostgreSQL Global Development Group
+    PostgreSQL License                              licenses/pgvector.LICENSE
+
+  pg_cron 1.6.8                     scheduled jobs
+    Copyright (c) 2015, Citus Data                  PostgreSQL License
+    licenses/pg_cron.LICENSE
+
+  PostGIS 3.6.4                     a dependency of DocumentDB
+    Copyright (c) the PostGIS project               GPL-2.0
+    licenses/postgis.COPYING
+
+  WAL-G 3.0.9                       backups (Kubernetes operator)
+    Copyright (c) 2017 Citus Data, Inc.             Apache-2.0
+    licenses/wal-g.LICENSE
+
+Included in the embedder service:
+
+  bge-small-en-v1.5 (BAAI)          the in-cluster embedding model
+    Copyright (c) 2022 staoxiao                     MIT
+    licenses/bge-small-en-v1.5.LICENSE
+
+  candle 0.11.0 (Hugging Face)      runs the model
+    Copyright (c) the candle authors                MIT or Apache-2.0
+    licenses/candle.LICENSE-MIT, licenses/candle.LICENSE-APACHE
+
+  tokenizers 0.23.2 (Hugging Face)  tokenises its input
+    Copyright (c) the tokenizers authors            Apache-2.0
+    licenses/tokenizers.LICENSE
+
+Included in the web console:
+
+  Preact 10.29.8                    the console's user interface
+    Copyright (c) 2015-present Jason Miller         MIT
+    licenses/preact.LICENSE
+
+Inside the Docker images, the same license texts are under /usr/share/doc/isomerdb/licenses/ (the
+database image) and next to the model in the embedder image.

@@ -21,7 +21,7 @@ RUN for f in config.json tokenizer.json model.safetensors; do \
       'd241a60d5e8f04cc1b2b3e9ef7a4921b27bf526d9f6050ab90f9267a1f9e5c66  tokenizer.json' \
       '3c9f31665447c8911517620762200d2245a2518d6e7208acc78cd9db317e21ad  model.safetensors' \
     | sha256sum -c -
-COPY services/embedder/models/bge-small-en-v1.5.LICENSE /model/LICENSE
+COPY licenses/bge-small-en-v1.5.LICENSE /model/LICENSE
 
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/*
