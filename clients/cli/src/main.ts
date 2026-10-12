@@ -10,6 +10,7 @@
 //   isomer proposals | propose | accept <id> [--name n] [--sync] [--database db] | reject <id> | route <id>
 //   isomer enable-route <queryid> | disable-route <queryid>
 //   isomer usage [--from <time>] [--to <time>] [--by hour|day|month] [--csv]
+//   isomer plan <attachment> [--markdown]   the cutover plan for an attached database
 //
 // Every command takes --json for machine-readable output, and --url / --key, which override
 // ISOMER_URL / ISOMER_KEY and the file `isomer login` writes (~/.config/isomer/credentials.json).
@@ -19,7 +20,7 @@ import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { parseArgs } from "node:util";
 
-import { IsomerClient, IsomerError, currentLagMs, formatMs, lagRatio, type Overview } from "@isomerdb/sdk";
+import { IsomerClient, IsomerError, currentLagMs, formatMs, lagRatio, type Overview, type PlanStep } from "@isomerdb/sdk";
 
 import { bar, plural, style, table, type Style } from "./format.ts";
 
@@ -42,6 +43,7 @@ const USAGE = `usage: isomer <command> [options]
   events [--subject s] [--limit n]  the event log
   usage [--from t] [--to t] [--by hour|day|month] [--csv]
                                     metered usage, for billing
+  plan <attachment> [--markdown]    the cutover plan for an attached database (exits 1 while blocked)
 
 options: --url, --key (or ISOMER_URL, ISOMER_KEY), --json`;
 
@@ -134,6 +136,34 @@ export function renderStatus(o: Overview, s: Style): string {
   return out.join("\n");
 }
 
+const PHASES: Record<PlanStep["phase"], string> = {
+  before: "Before cutover",
+  schema: "What the copy does not carry yet",
+  cutover: "Cutover",
+  after: "After cutover",
+};
+
+/** A cutover plan as a checklist: done, blocked, to do, or for information; each step's SQL beneath it. */
+export function renderPlan(name: string, steps: PlanStep[], s: Style): string {
+  const blocked = steps.filter((p) => p.status === "blocked" && p.item !== "Cut over").length;
+  const todo = steps.filter((p) => p.status === "todo").length;
+  const out = [
+    s.bold(`Cutover plan: ${name}`),
+    blocked ? s.red(`${plural(blocked, "item")} ${blocked === 1 ? "blocks" : "block"} cutover; ${todo} to do`) : `nothing blocks cutover; ${todo} to do`,
+  ];
+  let phase = "";
+  for (const p of steps) {
+    if (p.phase !== phase) {
+      phase = p.phase;
+      out.push("", s.bold(PHASES[p.phase] ?? p.phase));
+    }
+    const mark = { ok: s.green("✓"), blocked: s.red("✗"), todo: s.yellow("○"), info: s.dim("·") }[p.status] ?? " ";
+    out.push(`  ${mark} ${p.status === "blocked" ? s.red(p.item) : p.item}: ${p.detail}`);
+    if (p.sql && p.status !== "ok") out.push(...p.sql.split("\n").map((l) => s.dim(`      ${l}`)));
+  }
+  return out.join("\n");
+}
+
 export async function main(argv: string[], write: (s: string) => void = (s) => process.stdout.write(`${s}\n`)): Promise<number> {
   const { values, positionals } = parseArgs({
     args: argv,
@@ -155,6 +185,7 @@ export async function main(argv: string[], write: (s: string) => void = (s) => p
       to: { type: "string" },
       by: { type: "string" },
       csv: { type: "boolean", default: false },
+      markdown: { type: "boolean", default: false },
       help: { type: "boolean", short: "h", default: false },
     },
   });
@@ -361,6 +392,19 @@ export async function main(argv: string[], write: (s: string) => void = (s) => p
             formatUsage(u.value, u.unit), u.unit]), { right: [3], s })
         : s.dim("no usage recorded in that period (isomer.meter() samples every minute)"));
       return 0;
+    }
+    case "plan": {
+      const name = args[0];
+      if (!name) throw new UsageError("plan needs an attachment name");
+      if (values.markdown) {
+        process.stdout.write(await client.cutoverPlanMarkdown(name));
+        return 0;
+      }
+      const { steps } = await client.cutoverPlan(name);
+      const blocked = steps.some((p) => p.status === "blocked") ? 1 : 0;
+      if (values.json) return json(steps), blocked;
+      write(renderPlan(name, steps, s));
+      return blocked;
     }
     default:
       throw new UsageError(`unknown command ${command}`);

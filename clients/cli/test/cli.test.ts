@@ -5,7 +5,7 @@ import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 
 // @ts-expect-error: the bundle has no type declarations
-const { main, renderStatus } = await import("../dist/isomer.mjs");
+const { main, renderStatus, renderPlan } = await import("../dist/isomer.mjs");
 
 const overview = {
   version: "0.10.0",
@@ -36,6 +36,20 @@ test("status shows lag against budget, drift and alerts", () => {
   assert.match(out, /1 proposal waiting/);
 });
 
+const plan = [
+  { ord: 1, phase: "before", item: "Initial copy", status: "ok", detail: "all 2 table(s) copied", sql: null },
+  { ord: 2, phase: "before", item: "Tables not copied", status: "blocked", detail: "shop.log (no primary key)", sql: null },
+  { ord: 3, phase: "schema", item: "Indexes", status: "todo", detail: "1 missing: shop.i", sql: "CREATE INDEX IF NOT EXISTS i ON shop.t (a);" },
+  { ord: 4, phase: "cutover", item: "Cut over", status: "blocked", detail: "1 item(s) above must be fixed first", sql: "SELECT * FROM isomer.cutover('shop');" },
+];
+
+test("a cutover plan reads as a checklist, with each step's SQL", () => {
+  const out: string = renderPlan("shop", plan, plain);
+  assert.match(out, /^Cutover plan: shop\n1 item blocks cutover; 1 to do/);
+  assert.match(out, /Before cutover\n  ✓ Initial copy: all 2 table\(s\) copied\n  ✗ Tables not copied: shop.log/);
+  assert.match(out, /What the copy does not carry yet\n  ○ Indexes: 1 missing: shop.i\n      CREATE INDEX IF NOT EXISTS i ON shop.t \(a\);/);
+});
+
 test("commands talk to the API with the key, and exit codes follow the outcome", async () => {
   const seen: string[] = [];
   const server = createServer((req, res) => {
@@ -47,6 +61,7 @@ test("commands talk to the API with the key, and exit codes follow the outcome",
       req.on("data", (c) => (body += c));
       return req.on("end", () => res.end(JSON.stringify({ id: 4, result: `accepted with ${body}` })));
     }
+    if (req.url === "/v1/admin/attachments/shop/plan") return res.end(JSON.stringify({ attachment: "shop", steps: plan }));
     if (req.url === "/v1/admin/routes/99") {
       res.statusCode = 404;
       return res.end(JSON.stringify({ error: "no route for query 99", code: null }));
@@ -66,6 +81,7 @@ test("commands talk to the API with the key, and exit codes follow the outcome",
     assert.equal(lines.at(-1), 'accepted with {"name":"o","freshness":"sync"}');
     await assert.rejects(main(["disable-route", "99", "--url", url, "--key", "k1"], write), /no route for query 99/);
     await assert.rejects(main(["accept", "x", "--url", url, "--key", "k1"], write), /proposal id must be an integer/);
+    assert.equal(await main(["plan", "shop", "--url", url, "--key", "k1"], write), 1, "a blocked plan exits 1");
     assert.ok(seen.every((l) => l.endsWith("Bearer k1")));
   } finally {
     server.close();

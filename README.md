@@ -69,7 +69,7 @@ for billing, and pages on-call when a projection drifts or falls behind its lag 
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/diagrams/c4-3-coordinator-dark.svg">
-  <img alt="Components of the coordinator: attach, cutover, catalog and compiler, change capture, maintenance, query router, freshness, history and change feed, auditor, certificates, proposer and shard advisor, metering and admin, and alert delivery are built; a cutover planner and a strategy chooser are planned." src="docs/diagrams/c4-3-coordinator.svg">
+  <img alt="Components of the coordinator: attach, cutover, catalog and compiler, change capture, maintenance, query router, freshness, history and change feed, auditor, certificates, proposer and shard advisor, metering and admin, alert delivery and the cutover planner are built; a strategy chooser is planned." src="docs/diagrams/c4-3-coordinator.svg">
 </picture>
 
 Writes flow down the middle. **Change capture** queues the keys each write touches, on whichever node
@@ -266,7 +266,15 @@ isomer login --url http://localhost:8080 --key "$KEY"
 isomer status                  # exits 1 while there are alerts
 isomer proposals && isomer accept 3 --sync && isomer route 3
 isomer usage --csv > usage.csv # metered usage, for billing
+isomer plan crm                # the cutover plan for an attached database; --markdown to share it
 ```
+
+The cutover plan reads the team's database and IsomerDB's copy of it. Attach copies columns and
+primary keys; the plan lists every index, constraint, foreign key, trigger, function, view,
+extension, role and grant the copy does not have yet, with the SQL that recreates each, and what
+blocks cutover (tables that could not be copied, drift, replication errors). It also names the
+applications connected to the source, the quietest hour seen so far, and what to do once IsomerDB is
+the primary: move projections to `sync`, shard the large tables, retire the source.
 
 Alerts go to on-call once a channel is configured. Each channel takes alerts at or above a severity
 (drift is critical, a lag-budget breach an error); secrets are named by an environment variable on
@@ -312,7 +320,6 @@ and have found and fixed two bugs so far; see the [engineering notes](docs/engin
 | Projections | A cross-shard engine (DBSP) for projections that join or aggregate across shards; today those are kept by key or refused with a reason | FR-P6 |
 | Projections | A cost model that picks each projection's maintenance strategy | FR-S7 |
 | Projections | Analytics (columnar), event and edge projections | Later |
-| Adoption | A generated per-team cutover plan (cutover itself is built) | FR-A6 |
 | Adoption | Tested support for each managed Postgres (RDS, Cloud SQL, Neon, Supabase...) | FR-A11 |
 | Embeddings | Provider batch APIs for large backfills; bundled models billed at list price plus a markup | FR-V1a, V1b |
 | Cloud | The managed service: sign-up, regions, provisioning and billing on top of the operator | FR-CL1, CL2 |

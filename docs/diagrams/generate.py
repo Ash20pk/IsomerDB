@@ -148,8 +148,8 @@ def components() -> Diagram:
             desc="Preflights tables, follows an existing Postgres, applies schema changes, watches slots."))
     d.add(E("cutover", "component", "Cutover", cols["adopt"], rows[1], W, "SQL",
             desc="Makes IsomerDB the primary: sequences, defaults, checks; optional rollback replication."))
-    d.add(E("plan", "component", "Cutover planner", cols["adopt"], rows[2], W, status="planned",
-            desc="A per-team plan from attach to primary, from what the tables and traffic look like."))
+    d.add(E("plan", "component", "Cutover planner", cols["adopt"], rows[2], W, "SQL",
+            desc="A per-team plan to primary: what the copy lacks, with SQL; who to repoint; the quietest hour."))
     # Projections.
     d.add(E("catalog", "component", "Catalog and compiler", cols["proj"], rows[0], W, "SQL",
             desc="create_projection and native DDL; checks freshness against co-location; certifies or rejects."))

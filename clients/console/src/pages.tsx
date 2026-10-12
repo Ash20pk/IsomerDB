@@ -2,7 +2,7 @@
 
 import { useEffect, useState } from "preact/hooks";
 
-import { formatMs, type IsomerClient, type UsageRow } from "@isomerdb/sdk";
+import { formatMs, type IsomerClient, type PlanStep, type UsageRow } from "@isomerdb/sdk";
 
 import { describe, useToast } from "./ui.tsx";
 
@@ -232,6 +232,7 @@ export function Routes({ client }: { client: IsomerClient }) {
 
 export function Attachments({ client }: { client: IsomerClient }) {
   const { data, error } = useLoad(() => client.attachments());
+  const [planFor, setPlanFor] = useState<string | null>(null);
   return (
     <>
       <h1>Attachments</h1>
@@ -248,6 +249,7 @@ export function Attachments({ client }: { client: IsomerClient }) {
               <th class="num">Apply lag</th>
               <th class="num">Tables ready</th>
               <th class="num">Errors</th>
+              <th />
             </tr>
           </thead>
           <tbody>
@@ -264,12 +266,120 @@ export function Attachments({ client }: { client: IsomerClient }) {
                   {a.tables_ready ?? 0} of {a.tables_total ?? 0}
                 </td>
                 <td class="num">{(a.apply_errors ?? 0) + (a.sync_errors ?? 0)}</td>
+                <td>
+                  <button type="button" aria-pressed={planFor === a.attachment} onClick={() => setPlanFor(a.attachment)}>
+                    Cutover plan
+                  </button>
+                </td>
               </tr>
             ))}
           </tbody>
         </table>
       )}
+      {planFor && <CutoverPlan key={planFor} client={client} name={planFor} />}
     </>
+  );
+}
+
+const PHASES: Record<PlanStep["phase"], string> = {
+  before: "Before cutover",
+  schema: "What the copy does not carry yet",
+  cutover: "Cutover",
+  after: "After cutover",
+};
+const MARKS: Record<PlanStep["status"], [string, string]> = {
+  ok: ["✓", "Done"],
+  blocked: ["✗", "Blocked"],
+  todo: ["○", "To do"],
+  info: ["·", "Note"],
+};
+
+/** The plan reads from the team's database each time, so it is generated on request, not polled. */
+function CutoverPlan({ client, name }: { client: IsomerClient; name: string }) {
+  const { data, error, reload } = useLoad(() => client.cutoverPlan(name));
+  const [toast, show] = useToast();
+  const [busy, setBusy] = useState(false);
+  const copy = async (text: string, what: string) => {
+    try {
+      await navigator.clipboard.writeText(text);
+      show(`Copied ${what}`);
+    } catch (e) {
+      show(`Could not copy: ${describe(e)}`);
+    }
+  };
+  // The cutover step itself is blocked by the others; it is not counted as one of them.
+  const blocked = data?.steps.filter((p) => p.status === "blocked" && p.item !== "Cut over").length ?? 0;
+  const todo = data?.steps.filter((p) => p.status === "todo").length ?? 0;
+  const phases = data ? [...new Set(data.steps.map((p) => p.phase))] : [];
+  return (
+    <section class="plan" aria-labelledby="plan-title">
+      <header>
+        <h2 id="plan-title">Cutover plan for {name}</h2>
+        <div class="actions">
+          <button
+            type="button"
+            disabled={busy}
+            onClick={async () => {
+              setBusy(true);
+              await reload();
+              setBusy(false);
+            }}
+          >
+            Check again
+          </button>
+          <button
+            type="button"
+            onClick={async () => {
+              try {
+                await copy(await client.cutoverPlanMarkdown(name), "the plan as Markdown");
+              } catch (e) {
+                show(describe(e));
+              }
+            }}
+          >
+            Copy as Markdown
+          </button>
+        </div>
+      </header>
+      {error && <p class="err">{error}</p>}
+      {!data && !error && <p class="quiet">Reading the source database…</p>}
+      {data && (
+        <p class={blocked ? "err" : "sub"}>
+          {blocked
+            ? `${blocked} ${blocked === 1 ? "item blocks" : "items block"} cutover, and ${todo} ${todo === 1 ? "step is" : "steps are"} to do.`
+            : `Nothing blocks cutover. ${todo} ${todo === 1 ? "step is" : "steps are"} to do, in this order.`}
+        </p>
+      )}
+      {phases.map((phase) => (
+        <div key={phase}>
+          <h3>{PHASES[phase] ?? phase}</h3>
+          <ul class="steps">
+            {data!.steps
+              .filter((p) => p.phase === phase)
+              .map((p) => (
+                <li key={p.ord} class={`step-${p.status}`}>
+                  <span class="stepmark" title={MARKS[p.status][1]}>
+                    <span aria-hidden="true">{MARKS[p.status][0]}</span>
+                    <span class="label">{MARKS[p.status][1]}</span>
+                  </span>
+                  <div>
+                    <b>{p.item}.</b> {p.detail.charAt(0).toUpperCase() + p.detail.slice(1)}.
+                    {p.sql && p.status !== "ok" && (
+                      <div class="sql">
+                        <pre>{p.sql}</pre>
+                        <button type="button" class="link" onClick={() => copy(p.sql!, `the SQL for ${p.item.toLowerCase()}`)}>
+                          Copy SQL
+                        </button>
+                      </div>
+                    )}
+                  </div>
+                </li>
+              ))}
+          </ul>
+        </div>
+      ))}
+      <Toast msg={toast} />
+    </section>
   );
 }
 

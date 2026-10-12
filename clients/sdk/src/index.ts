@@ -114,6 +114,16 @@ export interface Advice {
   detail: string;
 }
 
+/** One step of a cutover plan: ok (nothing to do), blocked (fix before cutover), todo, or info. */
+export interface PlanStep {
+  ord: number;
+  phase: "before" | "schema" | "cutover" | "after";
+  item: string;
+  status: "ok" | "blocked" | "todo" | "info";
+  detail: string;
+  sql: string | null;
+}
+
 export interface AttachmentStatus {
   attachment: string;
   status: string;
@@ -277,14 +287,28 @@ export class IsomerClient {
     return this.request("GET", "/v1/admin/attachments");
   }
 
+  /** The cutover plan for an attached database: readiness, what the copy lacks (with SQL), the cutover, what follows. */
+  cutoverPlan(attachment: string): Promise<{ attachment: string; steps: PlanStep[] }> {
+    return this.request("GET", `/v1/admin/attachments/${encodeURIComponent(attachment)}/plan`);
+  }
+
+  /** The same plan as a Markdown document, to share with the team. */
+  cutoverPlanMarkdown(attachment: string): Promise<string> {
+    return this.text(`/v1/admin/attachments/${encodeURIComponent(attachment)}/plan?format=markdown`);
+  }
+
   /** Metered usage (storage, node-hours, documents written, embeddings, statements, API requests). */
   usage(opts: UsageOptions = {}): Promise<{ by: string; usage: UsageRow[] }> {
     return this.request("GET", `/v1/admin/usage${usageQuery(opts)}`);
   }
 
   /** The same, as CSV for a billing system. */
-  async usageCsv(opts: UsageOptions = {}): Promise<string> {
-    const res = await this.doFetch(`${this.url}/v1/admin/usage${usageQuery({ ...opts }, "csv")}`, {
+  usageCsv(opts: UsageOptions = {}): Promise<string> {
+    return this.text(`/v1/admin/usage${usageQuery({ ...opts }, "csv")}`);
+  }
+
+  private async text(path: string): Promise<string> {
+    const res = await this.doFetch(this.url + path, {
       headers: { authorization: `Bearer ${this.key}` },
     });
     const text = await res.text();

@@ -143,6 +143,19 @@ td .q { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-s
 .tip { position: absolute; top: 0; transform: translateX(-50%); background: var(--ink); color: var(--paper);
        padding: 3px 8px; border-radius: 4px; font-size: 12px; white-space: nowrap; pointer-events: none; }
 
+.plan { margin-top: 34px; border-top: 1px solid var(--line); padding-top: 4px; }
+.plan header { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+.plan h3 { font-size: 15px; font-weight: 600; margin: 24px 0 6px; }
+.steps { list-style: none; margin: 0; padding: 0; }
+.steps li { display: grid; grid-template-columns: 82px 1fr; gap: 12px; padding: 9px 0; border-bottom: 1px solid var(--line); }
+.steps .stepmark { font-size: 13px; color: var(--muted); white-space: nowrap; }
+.steps .stepmark .label { margin-left: 6px; }
+.steps li.step-ok .stepmark { color: var(--cobalt); }
+.steps li.step-todo .stepmark { color: var(--amber); }
+.steps li.step-blocked .stepmark { color: var(--carmine); font-weight: 600; }
+.steps .sql { margin-top: 8px; }
+.steps .sql pre { margin: 0 0 4px; max-height: 220px; }
+
 .kv { display: grid; grid-template-columns: max-content 1fr; gap: 6px 22px; margin: 0; }
 .kv dt { color: var(--muted); }
 .kv dd { margin: 0; }
@@ -162,6 +175,7 @@ td .q { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-s
   .prow { grid-template-columns: 1fr 90px; }
   .prow .track { grid-column: 1 / -1; grid-row: 2; }
   .prow .drift { display: none; }
+  .steps li { grid-template-columns: 1fr; gap: 4px; }
   table { display: block; overflow-x: auto; }
 }
 @media (prefers-reduced-motion: reduce) {

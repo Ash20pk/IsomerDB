@@ -14,6 +14,7 @@
 //!   POST /v1/admin/routes/{queryid}             body {"enabled": bool}
 //!   GET  /v1/admin/advice                       the shard advisor
 //!   GET  /v1/admin/attachments                  attach-mode sources, slots and lag
+//!   GET  /v1/admin/attachments/{name}/plan      the cutover plan (format=markdown for the document)
 //!   GET  /v1/admin/events?after=&limit=         the event log, newest first
 //!   GET  /v1/admin/usage?from=&to=&by=&format=   metered usage by hour, day or month (JSON or CSV)
 //!
@@ -44,6 +45,7 @@ pub fn routes() -> Router<Shared> {
         .route("/v1/admin/routes/:queryid", post(set_route))
         .route("/v1/admin/advice", get(advice))
         .route("/v1/admin/attachments", get(attachments))
+        .route("/v1/admin/attachments/:name/plan", get(cutover_plan))
         .route("/v1/admin/events", get(events))
         .route("/v1/admin/usage", get(usage))
 }
@@ -209,6 +211,36 @@ async fn attachments(State(app): State<Shared>, headers: HeaderMap) -> ApiResult
     )
     .await?;
     Ok(Json(json!({ "attachments": rows })))
+}
+
+#[derive(Deserialize)]
+struct PlanQuery {
+    format: Option<String>,
+}
+
+async fn cutover_plan(
+    State(app): State<Shared>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+    Query(q): Query<PlanQuery>,
+) -> ApiResult<Response> {
+    admin(&app, &headers).await?;
+    let db = app.pool.get().await?;
+    if !db.query("SELECT 1 FROM isomer.attachments WHERE name = $1", &[&name]).await?.is_empty() {
+        if q.format.as_deref() == Some("markdown") {
+            let md: String = db.query_one("SELECT isomer.cutover_plan_markdown($1)", &[&name]).await?.get(0);
+            return Ok(([(header::CONTENT_TYPE, "text/markdown; charset=utf-8")], md).into_response());
+        }
+        let steps: Value = db
+            .query_one(
+                "SELECT coalesce(jsonb_agg(to_jsonb(p) ORDER BY p.ord), '[]') FROM isomer.cutover_plan($1) p",
+                &[&name],
+            )
+            .await?
+            .get(0);
+        return Ok(Json(json!({ "attachment": name, "steps": steps })).into_response());
+    }
+    Err(ApiError::new(StatusCode::NOT_FOUND, format!("no attachment named {name}")))
 }
 
 #[derive(Deserialize)]

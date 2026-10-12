@@ -45,6 +45,40 @@ opt-in setting.
    unmodified as its own import commit on a branch, then re-apply our changes. Update the tables
    above in the same change.
 
+## 2026-10-12 — Cutover plan (FR-A6)
+
+`tests/cutover_plan.sh` passes. `isomer.cutover_plan('crm')` (isomer 0.16.0) reads the team's
+database and IsomerDB's copy of it and returns the plan in order. Each step is ok, blocked, to do or
+for information, and comes with its SQL. `isomer.cutover_plan_markdown` renders the same plan as a
+document. The admin API (`/v1/admin/attachments/{name}/plan`), `isomer plan` and the console's
+Attachments page all show it.
+
+- **Before cutover:** the copy has finished, replication is healthy (slot, WAL, errors,
+  conflicts), the auditor has checked the projections over these tables and found no drift,
+  every table in the attached schemas is copied, and nothing outside them is written to. Cutover
+  makes the whole source database read-only, so writes to other schemas would start failing.
+- **What the copy does not carry yet.** Attach copies columns and primary keys. The plan
+  compares the source with the copy and returns the SQL for whatever is missing: extensions,
+  functions, indexes, unique, check and exclusion constraints, foreign keys, triggers, views and
+  materialized views, and roles and grants. The source prints every name schema-qualified
+  (`search_path` is `pg_catalog` on that connection), so the SQL runs as it is. Foreign keys are
+  added `NOT VALID`, then validated. Stored generated columns are flagged, since they arrive as
+  plain values.
+- **Cutover:** the applications connected to the source (role, address, application name), and
+  the write rate and quietest hour seen so far. `isomer.sample_attachments()` records writes to the
+  attached tables per hour, every minute. Then the cutover command.
+- **After cutover:** the bounded projections that can now be `sync`, tables over a size threshold
+  with a shard key, and how to stop rollback replication.
+
+The test builds a source with each of these gaps, applies the plan's own SQL, cuts over, and
+checks that the copy enforces the foreign key, unique and check constraints, fires the trigger, and
+gives the application's role exactly its privileges.
+
+- **Cutover failed on stored generated columns.** It copied every column default, and a
+  generated column's expression is stored as one; Postgres refuses it as a default because it
+  refers to other columns. Cutover now skips them. The column keeps its replicated values, and the
+  plan says what to do. The test found this.
+
 ## 2026-10-12 — Alert delivery (FR-K3)
 
 `tests/alerts.sh` passes. Alerts were raised and shown before; now they reach on-call (isomer
