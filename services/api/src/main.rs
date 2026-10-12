@@ -25,8 +25,10 @@
 //!   ISOMER_API_POOL      database connections (default 16)
 //!   ISOMER_API_WAIT_MS   longest wait for X-Isomer-After (default 5000)
 //!   ISOMER_CONSOLE_DIR   the built console (default /usr/share/isomer/console)
+//!   ISOMER_ALERT_INTERVAL_SECS, ISOMER_CLUSTER_NAME   alert delivery (alerts.rs)
 
 mod admin;
+mod alerts;
 
 use std::convert::Infallible;
 use std::sync::Arc;
@@ -81,6 +83,7 @@ async fn main() -> Result<()> {
         requests: Default::default(),
     });
     tokio::spawn(flush_usage(app.clone()));
+    tokio::spawn(alerts::deliver_loop(app.clone()));
     let router = Router::new()
         .route("/healthz", get(healthz))
         .route("/v1/projections", get(list_projections))

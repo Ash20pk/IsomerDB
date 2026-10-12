@@ -34,8 +34,8 @@ def context() -> Diagram:
             desc="S3-compatible storage for continuous WAL archives and base backups."))
     d.add(E("billing", "external", "Billing system", 520, 690, 280,
             desc="Pulls metered usage: storage, node-hours, projection writes, embedding tokens, requests."))
-    d.add(E("oncall", "external", "On-call alerting", 980, 690, 280, status="planned",
-            desc="Pages people when a projection drifts or breaks its lag budget."))
+    d.add(E("oncall", "external", "On-call alerting", 980, 690, 280,
+            desc="PagerDuty, Slack or a webhook. Paged when a projection drifts or breaks its lag budget."))
 
     d.rel(("dev", "bottom", 0.5), ("isomer", "top", 0.15), "Reads and writes data, declares projections",
           "SQL, MongoDB wire, HTTP", label_at=0.42)
@@ -49,7 +49,7 @@ def context() -> Diagram:
           label_at=0.5, label_dy=-30, label_w=120)
     d.rel(("isomer", "bottom", 0.15), ("s3", "top", 0.6), "Archives WAL, base backups", "S3 API", label_at=0.5)
     d.rel(("billing", "top", 0.5), ("isomer", "bottom", 0.5), "Pulls usage", "HTTPS, CSV", label_at=0.5)
-    d.rel(("isomer", "bottom", 0.85), ("oncall", "top", 0.4), "Pages on drift and lag", status="planned", label_at=0.5)
+    d.rel(("isomer", "bottom", 0.85), ("oncall", "top", 0.4), "Pages on drift and lag", "HTTPS", label_at=0.5)
     return d
 
 
@@ -169,8 +169,8 @@ def components() -> Diagram:
             desc="Samples projections, recomputes them from the tables, counts drift, pins what differed."))
     d.add(E("cert", "component", "Certificates", cols["trust"], rows[1], W, "SQL",
             desc="Names the rules a projection relies on and checks them live."))
-    d.add(E("alerting", "component", "Alert delivery", cols["trust"], rows[2], W, status="planned",
-            desc="Sends lag-budget breaches and drift to on-call."))
+    d.add(E("alerting", "component", "Alert delivery", cols["trust"], rows[2], W, "SQL, Rust",
+            desc="Tracks each alert from firing to resolved; sends both to PagerDuty, Slack or a webhook."))
     # Automation and operations.
     d.add(E("propose", "component", "Proposer and shard advisor", cols["auto"], rows[0], W, "SQL",
             desc="Mines the query log for repeated joins to project, and for keys that keep queries on one shard."))
@@ -185,7 +185,7 @@ def components() -> Diagram:
     d.add(E("workers", "container", "Worker nodes", cols["proj"], 960, W, "PostgreSQL 18, Citus",
             desc="Shards of tables and projections."))
     d.add(E("embedder", "container", "Embedder", cols["read"], 960, W, "Rust", desc="Computes embeddings."))
-    d.add(E("oncall", "external", "On-call alerting", cols["trust"], 960, W, status="planned", desc="Pages people."))
+    d.add(E("oncall", "external", "On-call alerting", cols["trust"], 960, W, desc="Pages people."))
 
     x = lambda el, px: (px - d.elements[el].x) / d.elements[el].w
     mid = lambda el: d.elements[el].x + d.elements[el].w / 2
@@ -208,7 +208,7 @@ def components() -> Diagram:
           via=[(350, ml_y), (350, 925), (mid("dbsp"), 925)], label_at=0.35, label_w=80)
     d.rel(("propose", "top", 0.5), ("catalog", "top", 0.5), "Accepted proposals become projections",
           via=[(mid("propose"), 335), (mid("catalog"), 335)], label_at=0.6, label_w=260)
-    d.rel(("alerting", "bottom", 0.5), ("oncall", "top", 0.5), "Pages", status="planned", label_at=0.5)
+    d.rel(("alerting", "bottom", 0.5), ("oncall", "top", 0.5), "Pages", "HTTPS", label_at=0.5)
     return d
 
 

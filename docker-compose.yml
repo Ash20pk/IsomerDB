@@ -67,6 +67,11 @@ services:
         condition: service_healthy
     environment:
       ISOMER_DATABASE_URL: host=/var/run/postgresql user=postgres dbname=postgres
+      ISOMER_CLUSTER_NAME: local
+      ISOMER_ALERT_INTERVAL_SECS: "5"
+      # Secrets alert channels name (isomer.add_alert_channel(..., secret_env => ...)); test values.
+      HOOK_TOKEN: ${HOOK_TOKEN:-test-hook-token}
+      PD_ROUTING_KEY: ${PD_ROUTING_KEY:-test-routing-key}
     volumes:
       - pgsocket:/var/run/postgresql
     ports:
@@ -81,6 +86,16 @@ services:
       RATE_LIMIT_EVERY: "3"
     volumes:
       - ./tests/mockai/server.py:/srv/server.py:ro
+
+  # Records webhook, Slack and PagerDuty deliveries for the alert tests.
+  mockhooks:
+    image: python:3.12-alpine
+    profiles: ["test"]
+    command: ["python", "/srv/server.py"]
+    ports:
+      - "8090:8090"
+    volumes:
+      - ./tests/mockhooks/server.py:/srv/server.py:ro
 
   # Citus worker nodes, for multi-node clusters:
   #   docker compose --profile cluster up -d   then   SELECT isomer.add_node('worker1');

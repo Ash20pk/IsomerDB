@@ -45,6 +45,29 @@ opt-in setting.
    unmodified as its own import commit on a branch, then re-apply our changes. Update the tables
    above in the same change.
 
+## 2026-10-12 — Alert delivery (FR-K3)
+
+`tests/alerts.sh` passes. Alerts were raised and shown before; now they reach on-call (isomer
+0.15.0 and the HTTP API).
+
+- **Each alert is tracked from firing to resolved** in `isomer.alert_state`, keyed by kind and
+  subject. `isomer.pending_notifications()` brings it in line with `isomer.alerts` and returns the
+  transitions not yet delivered; an alert that clears and comes back is a new incident.
+- **Channels:** `webhook` (JSON, optional bearer token), `slack` (incoming webhook) and `pagerduty`
+  (Events API v2: trigger on firing, resolve on resolved, one dedup key per alert and subject).
+  Each has a minimum severity: drift and broken attachments are critical, lag-budget breaches,
+  embedding lag and dead letters are errors, staleness and paused budgets are warnings. "Unused"
+  projections are never paged.
+- **The HTTP API delivers** every `ISOMER_ALERT_INTERVAL_SECS` (15 by default) and records every
+  attempt in `isomer.alert_deliveries`. A failed send is retried on the next pass, to the channels
+  that have not accepted it yet. The first version retried to all of them, so one failing channel
+  made the others hear the same alert three times; the test caught it.
+- **Secrets stay out of the database:** a channel names the environment variable on the API that
+  holds its routing key or token.
+
+The test drives a mock receiver (`tests/mockhooks/`) with a channel that fails twice before
+accepting.
+
 ## 2026-10-12 — Jepsen (FR-K4)
 
 `tests/jepsen.sh` runs Jepsen (0.3.14) against the three-node compose cluster from a control
