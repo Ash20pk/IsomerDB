@@ -45,6 +45,125 @@ opt-in setting.
    unmodified as its own import commit on a branch, then re-apply our changes. Update the tables
    above in the same change.
 
+## 2026-10-12 — Incremental maintenance across shards (FR-P6, FR-S5) and the strategy chooser (FR-S7)
+
+`tests/incremental.sh` passes on one node and on the three-node cluster. A projection that
+aggregates a sharded table through joins (sales per category from order lines, through products
+and a reference table of categories) is kept from row deltas instead of by re-deriving keys from
+the tables, with no key mappings declared (isomer 0.17.0).
+
+Why: re-deriving a key re-reads its whole group, and for a key the table only reaches through a
+join (lines reach a category only through products) every write re-derived every key. On the
+cluster, re-deriving one category's sales is a repartition join across every shard. Folding a
+write costs the same however large its group is.
+
+How it works:
+
+- **Capture.** Each write records row images, -1 for the old row and +1 for the new, in the
+  writing transaction, on the node holding the row (`isomer.deltas` on the coordinator,
+  `isomer.node_deltas` on workers). An update that changes none of the columns the projection
+  reads records nothing. A reference table's change runs on every node holding a copy; only the
+  copy in the lowest node group records it.
+- **Exactly once.** Deltas are counted, not just noted, so a duplicate is wrong where a duplicated
+  key was harmless. `isomer.pull_node_deltas` takes a worker's deltas in a prepared transaction
+  there, commits them on the coordinator together with the pull's id (`isomer.delta_pulls`), then
+  commits the worker's. A pull left prepared is finished the way the ledger says: recorded means
+  commit, absent means roll back. Pulls are serialised; a second puller could otherwise roll back a
+  pull the first has not recorded yet. Worker rows are inserted in the worker's order, so changes
+  to one row keep theirs.
+- **The compiler** works on Postgres's own parse tree (`isomer_router/isomer_engine.c`):
+  `isomer._engine_analyze` reports relations, joins, conjuncts, aggregates and grouping;
+  `isomer._engine_sql` rewrites the analysed query and deparses it back with `pg_get_querydef`.
+  State relations line up with the source tables attribute by attribute (dropped columns
+  included), so the rewrite only swaps a relation's oid and every Var stays valid.
+- **The rule it checks** (`isomer._engine_shape`): one table, the fact, holds every aggregate's
+  input, and every join leading away from it lands on a unique key. Each fact row then joins at
+  most one row of the rest, so its aggregates can be kept per group of the columns it is joined
+  and grouped by, before the join. sum, count, avg, min, max, bool_and and bool_or, with FILTER;
+  inner joins, and a LEFT JOIN with the fact alone on the optional side; HAVING; a global
+  aggregate under a constant key. Anything else is refused with the reason.
+- **State,** in `isomer_state`: the fact's partial aggregates per group (count, and a sum and
+  count per aggregate; min and max as multisets of values with multiplicities), and for each
+  joined table the columns the query reads, keyed like the table. Folding is commutative, so
+  deltas from different nodes can arrive in any order and the state still converges.
+- **Which keys to re-derive.** A key's value can change only if a delta of one input reaches it
+  through the state of the others, before or after the fold. For each relation with deltas, the
+  query with that relation swapped for its staged rows (and everything else for state) gives the
+  keys it reaches; that runs before and after folding, and the union is queued like any other
+  key. The drain then derives those keys from the state (`projections.derive_query`), through
+  the same apply path as before, so history, the change feed, MongoDB and HTTP reads are
+  unchanged.
+- **Proof that it holds.** At creation the derivation from the state must equal the query over
+  the tables row for row, or creation fails. The auditor keeps recomputing samples from the
+  tables. `isomer.certificate` names the rules relied on and re-checks the unique keys, the
+  triggers on every placement and the state.
+- **Strategy (FR-S7).** `create_projection(strategy => 'auto')`, now the default, asks
+  `isomer.choose_strategy`: incremental when the query fits the rule and the cost of re-deriving
+  one key is high, or the query maps sources to nothing, or the cluster can't run it at all;
+  key recompute otherwise (a key on its own shard costs one small read and keeps no state).
+  The cost comes from where Citus keeps each table and how the joins connect them: a key on one
+  shard, every shard, or a repartition. `isomer.strategy_advice()` says what it would pick for
+  each projection now; `alter_projection(name, strategy => ...)` switches, in one transaction.
+- **Queries the cluster can't run as written.** Citus refuses an outer join between tables that
+  are not co-located (customers with their order counts, sharded differently). Neither key
+  recompute nor the auditor could run that query, but the engine reads one table at a time, so it
+  maintains it. The auditor then checks against `truth_query`: the same derivation over partial
+  aggregates computed afresh from the table (forced to be computed first with `OFFSET 0`), joined
+  with the tables themselves.
+
+Measured on the dev stack: folding 2,450 deltas and applying the keys they reach takes about 70
+ms; a write is applied about 0.7 s after it commits (the drain runs every second), within the 2 s
+budget. The checks in the test take longer only because `verify` re-runs the original query, a
+repartition join, each time.
+
+Things that bit us:
+
+- **A functionally dependent column broke the derivation.** `GROUP BY c.id` with `c.name` in the
+  output is valid because `c.id` is the table's primary key; the state relation has none, so the
+  rewritten query failed. The compiler now groups such columns explicitly, which changes nothing.
+- **Planning a repartition join changes the rest of the transaction.** After Citus has planned
+  one (even for EXPLAIN), later statements that mix local tables with distributed subqueries go
+  over its own connections, which can't see the state tables just created in the transaction. So
+  nothing in the create path plans the original query: whether the cluster can run it, and what a
+  key costs, are worked out from metadata (`isomer._shard_groups`, `_runnable`, `_key_cost`).
+- **Explaining over a second connection deadlocks itself.** An early version asked the shards to
+  explain through a separate connection; inside `alter_projection`, which had already locked the
+  sources, that connection waited for our own locks forever.
+- **`count(t.*)` counts rows.** IS NULL on a whole row tests every field, so a row with any null
+  field looked absent. A whole-row argument is counted as a constant.
+- **`CREATE OR REPLACE FUNCTION` resets SECURITY DEFINER.** `freshness` had been made one with
+  ALTER FUNCTION in 0.3.0; redefining it without the clause made the MongoDB gateway's
+  `isomer.freshness` call fail with "permission denied". Everything this version adds is revoked
+  from PUBLIC.
+- **Citus refuses volatile functions inside writes to distributed tables,** so the test's random
+  writers pick their values first.
+- **A lock race in `alter_projection`, older than this work, found by the full suite.** It took
+  `FOR UPDATE` on the projection's row, then needed an exclusive lock on the source table to swap
+  triggers. The auditor runs every projection in one transaction: having read the table, it
+  inserted a suspect row whose foreign key takes KEY SHARE on the same projection row, and waited.
+  `alter_projection` never changes the key, so it now takes `FOR NO KEY UPDATE`, which foreign-key
+  checks don't wait for.
+
+Found, not fixed: **a statement that writes several shards can deadlock key recompute.** Under
+key recompute, each shard's trigger upserts the keys it touches into `isomer.pending`; Citus runs
+the shards over parallel connections of one distributed transaction, and two of them inserting
+the same key wait on each other until Citus's deadlock detector cancels the statement. It only
+bites when one statement touches the same projection key from several shards. Incremental
+capture only appends, so it never waits. The fix is an append-only key queue with deduplication
+at drain time; until then, `tests/incremental.sh` writes one shard per statement in its key
+recompute phase.
+
+Limits:
+
+- The state lives on the coordinator. It is small (one row per group of the fact's join and
+  grouping columns, plus the joined tables' columns), but it is not sharded.
+- Incremental projections are bounded; a sync projection is re-derived by key in the writing
+  transaction.
+- `jsonb_agg` (nested documents), `DISTINCT` aggregates and expressions in GROUP BY stay on key
+  recompute.
+- Floating-point sums can differ from the query's in the last bits (addition order), which the
+  auditor would report.
+
 ## 2026-10-12 — Cutover plan (FR-A6)
 
 `tests/cutover_plan.sh` passes. `isomer.cutover_plan('crm')` (isomer 0.16.0) reads the team's

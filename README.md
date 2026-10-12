@@ -21,7 +21,8 @@ What sets it apart is the combination:
 - **Self-tuning:** the database reads its own query log and proposes the projections and shard keys
   it should have.
 
-> **Status.** Phases 0 to 2 of the [PRD](docs/PRD.md) are built, and most of phase 3. The diagrams
+> **Status.** Phases 0 to 2 of the [PRD](docs/PRD.md) are built, and phase 3 except the managed
+> cloud and a published Jepsen report. The diagrams
 > below show the whole system as designed. Each part is marked **built** (implemented and covered by
 > acceptance tests), **partly built** or **planned**. [What's left](#whats-left) lists the gaps.
 
@@ -49,19 +50,18 @@ for billing, and pages on-call when a projection drifts or falls behind its lag 
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/diagrams/c4-2-containers-dark.svg">
-  <img alt="Containers: a MongoDB gateway, an HTTP API, the console and CLI, a coordinator and worker nodes (PostgreSQL 18, Citus, the isomer extension), an embedder, and the Kubernetes operator are built. A cross-shard projection engine, a cloud control plane and edge replicas are planned." src="docs/diagrams/c4-2-containers.svg">
+  <img alt="Containers: a MongoDB gateway, an HTTP API, the console and CLI, a coordinator and worker nodes (PostgreSQL 18, Citus, the isomer extension), an embedder, and the Kubernetes operator are built. A cloud control plane and edge replicas are planned." src="docs/diagrams/c4-2-containers.svg">
 </picture>
 
 | Container | What it does | Status |
 |---|---|---|
-| **Coordinator** | PostgreSQL 18 with Citus and the `isomer` extension. Plans and routes SQL, holds the projection catalog, attaches to existing Postgres, maintains projections, issues write tokens, audits for drift, proposes projections, meters usage. | Built |
-| **Worker nodes** | Hold shards of tables and projections; capture changes where each row is written. | Built |
+| **Coordinator** | PostgreSQL 18 with Citus and the `isomer` extension. Plans and routes SQL, holds the projection catalog, attaches to existing Postgres, maintains projections (by key, or incrementally from row deltas when they aggregate across shards, with a cost model choosing), issues write tokens, audits for drift, proposes projections, meters usage. | Built |
+| **Worker nodes** | Hold shards of tables and projections; capture changes (keys, or row deltas pulled exactly once) where each row is written. | Built |
 | **MongoDB gateway** | MongoDB wire protocol. Projections read as collections; causal reads wait for the writes they depend on. | Built |
 | **HTTP API** | Documents by key, time travel, change feeds and live streams (SSE); the admin and usage endpoints. | Built |
 | **Console and CLI** | Lag against budget, drift, alerts, proposals, routes, usage. | Built |
 | **Embedder** | Computes embeddings for vector projections, from a hosted API or bge-small on its own CPU. | Built |
 | **Kubernetes operator** | Provisions and scales clusters, fails over to standbys, backs up and restores to a point in time, rolls upgrades, issues node certificates. | Built |
-| **Cross-shard engine** | Incremental maintenance (DBSP) for projections that join or aggregate across shards. Today these are refused or kept by key. | Planned |
 | **Cloud control plane** | Managed IsomerDB: sign-up, regions, provisioning, billing. | Planned |
 | **Edge replicas** | Projections served close to users, fed by the change feed. | Planned |
 
@@ -69,7 +69,7 @@ for billing, and pages on-call when a projection drifts or falls behind its lag 
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/diagrams/c4-3-coordinator-dark.svg">
-  <img alt="Components of the coordinator: attach, cutover, catalog and compiler, change capture, maintenance, query router, freshness, history and change feed, auditor, certificates, proposer and shard advisor, metering and admin, alert delivery and the cutover planner are built; a strategy chooser is planned." src="docs/diagrams/c4-3-coordinator.svg">
+  <img alt="Components of the coordinator: attach, cutover, catalog and compiler, change capture, maintenance, query router, freshness, history and change feed, auditor, certificates, proposer and shard advisor, metering and admin, alert delivery, the cutover planner, the incremental engine and the strategy chooser are built." src="docs/diagrams/c4-3-coordinator.svg">
 </picture>
 
 Writes flow down the middle. **Change capture** queues the keys each write touches, on whichever node
@@ -204,6 +204,16 @@ SELECT isomer.create_projection(
               FROM customers c $$,
   sources => '{"customers": "id", "orders": "customer_id"}');
 
+-- Totals over a sharded table, through joins: no key mappings needed. The cost model picks
+-- incremental maintenance here: each change is folded into per-product partial sums, and only
+-- the categories it reaches are re-derived, however many rows each holds.
+SELECT isomer.create_projection(name => 'category_sales', kind => 'document', key => 'id',
+  query => $$ SELECT c.id, jsonb_build_object('name', c.name, 'units', sum(l.qty), 'revenue', sum(l.qty * l.price)) AS doc
+              FROM order_lines l JOIN products p ON p.id = l.product_id JOIN categories c ON c.id = p.category_id
+              GROUP BY c.id $$);
+SELECT strategy, strategy_reason FROM isomer.projections;   -- what was chosen, and why
+SELECT * FROM isomer.strategy_advice();
+
 -- Or declare it with ordinary DDL: the access method sets freshness, the unique index the key
 CREATE MATERIALIZED VIEW shop.customer_card USING isomer_bounded AS
   SELECT c.id, jsonb_build_object('name', c.name) AS doc FROM shop.customers c;
@@ -292,7 +302,7 @@ SELECT * FROM isomer.alert_deliveries ORDER BY id DESC LIMIT 20;   -- what was s
 | Path | What it is |
 |---|---|
 | [`extensions/isomer/`](extensions/isomer/) | The `isomer` extension: projections, attach and cutover, freshness, auditor, proposer, metering |
-| [`extensions/isomer_router/`](extensions/isomer_router/) | Planner and executor hooks: query routing, `read_after`, write tokens |
+| [`extensions/isomer_router/`](extensions/isomer_router/) | Planner and executor hooks: query routing, `read_after`, write tokens; the incremental engine's compiler |
 | [`extensions/sharding/`](extensions/sharding/), [`documents/`](extensions/documents/), [`ivm/`](extensions/ivm/) | Built from source with our changes: sharding, document storage and the MongoDB gateway, incremental view maintenance |
 | [`services/api/`](services/api/), [`services/embedder/`](services/embedder/) | The HTTP API and the embedder (Rust) |
 | [`clients/`](clients/) | TypeScript: the API client, the `isomer` CLI and the console |
@@ -317,8 +327,7 @@ and have found and fixed two bugs so far; see the [engineering notes](docs/engin
 
 | Area | Not built yet | PRD |
 |---|---|---|
-| Projections | A cross-shard engine (DBSP) for projections that join or aggregate across shards; today those are kept by key or refused with a reason | FR-P6 |
-| Projections | A cost model that picks each projection's maintenance strategy | FR-S7 |
+| Projections | Incremental state sharded across nodes (it is kept on the coordinator); incremental maintenance of nested documents (`jsonb_agg`), `DISTINCT` aggregates and sync freshness | FR-P6 |
 | Projections | Analytics (columnar), event and edge projections | Later |
 | Adoption | Tested support for each managed Postgres (RDS, Cloud SQL, Neon, Supabase...) | FR-A11 |
 | Embeddings | Provider batch APIs for large backfills; bundled models billed at list price plus a markup | FR-V1a, V1b |

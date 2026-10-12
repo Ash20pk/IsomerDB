@@ -73,12 +73,12 @@ def containers() -> Diagram:
 
     # Data plane.
     d.add(E("coord", "container", "Coordinator", 70, 600, 430, "PostgreSQL 18, Citus, isomer extension",
-            desc="Plans and routes SQL, holds the catalog, attaches to existing Postgres, maintains projections, "
-                 "issues write tokens, audits for drift, proposes projections, meters usage."))
+            desc="Plans and routes SQL, holds the catalog, attaches to existing Postgres, maintains projections "
+                 "(by key, or incrementally across shards), issues write tokens, audits for drift, proposes "
+                 "projections, meters usage."))
     d.add(E("workers", "container", "Worker nodes", 600, 600, 280, "PostgreSQL 18, Citus",
-            desc="Hold shards of tables and projections; capture changes as rows are written."))
-    d.add(E("dbsp", "container", "Cross-shard engine", 930, 600, 270, "Rust, DBSP", status="planned",
-            desc="Maintains projections that join or aggregate across shards."))
+            desc="Hold shards of tables and projections; capture each change (its keys, or its row deltas) "
+                 "where the row is written."))
     d.add(E("embedder", "container", "Embedder", 1250, 600, 250, "Rust, candle",
             desc="Embeddings for vector projections: a hosted API, or bge-small on its own CPU."))
 
@@ -109,10 +109,8 @@ def containers() -> Diagram:
           via=[(1140, 545), (610, 545)], label_at=0.3)
     d.rel(("edge", "left", 0.5), ("api", "right", 0.5), "Change feed", status="planned", label_at=0.5,
           label_dy=-24, label_w=50)
-    d.rel(("coord", "right", 0.3), ("workers", "left", 0.3), "Distributed queries", "Citus, TLS",
-          label_at=0.5, label_dy=-28, label_w=90)
-    d.rel(("dbsp", "left", 0.4), ("workers", "right", 0.4), "Deltas", status="planned", label_at=0.5,
-          label_dy=-18, label_w=60)
+    d.rel(("coord", "right", 0.5), ("workers", "left", 0.5), "Queries, change pulls", "Citus, TLS",
+          label_at=0.5, label_dy=-30, label_w=96)
     d.rel(("embedder", "bottom", x("embedder", 1300)), ("coord", "bottom", x("coord", 420)),
           "Claims jobs, writes vectors", "SQL", via=[(1300, 825), (420, 825)], label_at=0.62)
     d.rel(("embedder", "bottom", x("embedder", 1430)), ("llm", "top", x("llm", 1430)), "Embeds", "HTTPS", label_at=0.5)
@@ -133,15 +131,15 @@ def containers() -> Diagram:
 
 def components() -> Diagram:
     d = Diagram("IsomerDB: inside the coordinator (C4 level 3)",
-                "Components of the isomer extension and the router, inside each coordinator.", 1640, 1180)
+                "Components of the isomer extension and the router, inside each coordinator.", 1640, 1355)
     cols = {"adopt": 60, "proj": 370, "read": 680, "trust": 990, "auto": 1300}
     W = 270
-    rows = [370, 545, 720]
+    rows = [370, 545, 720, 895]
 
     d.add(E("pg", "external", "Existing Postgres", cols["adopt"], 96, W, desc="The team's current database."))
     d.add(E("clients", "container", "Applications, gateway, HTTP API", cols["read"], 96, W,
             desc="Everything that reads and writes through SQL."))
-    d.boundary("Coordinator", 30, 300, 1580, 590, subtitle="[PostgreSQL 18, Citus, isomer extension, isomer_router]")
+    d.boundary("Coordinator", 30, 300, 1580, 765, subtitle="[PostgreSQL 18, Citus, isomer extension, isomer_router]")
 
     # Adoption.
     d.add(E("attach", "component", "Attach", cols["adopt"], rows[0], W, "SQL, logical replication",
@@ -154,7 +152,7 @@ def components() -> Diagram:
     d.add(E("catalog", "component", "Catalog and compiler", cols["proj"], rows[0], W, "SQL",
             desc="create_projection and native DDL; checks freshness against co-location; certifies or rejects."))
     d.add(E("capture", "component", "Change capture", cols["proj"], rows[1], W, "Row triggers",
-            desc="Queues the keys every write touches, on whichever node holds the row."))
+            desc="Queues the keys every write touches, or its row deltas, on whichever node holds the row."))
     d.add(E("maint", "component", "Maintenance", cols["proj"], rows[2], W, "SQL, IVM",
             desc="Re-derives documents and cache by key, refreshes search stream tables, queues embeddings."))
     # Reads.
@@ -176,16 +174,17 @@ def components() -> Diagram:
             desc="Mines the query log for repeated joins to project, and for keys that keep queries on one shard."))
     d.add(E("meter", "component", "Metering and admin", cols["auto"], rows[1], W, "SQL",
             desc="Usage per hour for billing; the views the console, CLI and admin API read."))
-    d.add(E("cost", "component", "Strategy chooser", cols["auto"], rows[2], W, status="planned",
-            desc="Picks each projection's maintenance strategy from a cost model."))
+    d.add(E("cost", "component", "Strategy chooser", cols["auto"], rows[2], W, "SQL, EXPLAIN",
+            desc="Picks key recompute or incremental maintenance per projection, from the plan of re-deriving one key."))
+    d.add(E("engine", "component", "Incremental engine", cols["adopt"], rows[3], W, "C on the parse tree, SQL",
+            desc="Folds row deltas into partial aggregates and the joined columns a query reads; re-derives "
+                 "only the keys a change reaches, from that state."))
 
     # Neighbouring containers and systems.
-    d.add(E("dbsp", "container", "Cross-shard engine", cols["adopt"], 960, W, "Rust, DBSP", status="planned",
-            desc="Projections that join or aggregate across shards."))
-    d.add(E("workers", "container", "Worker nodes", cols["proj"], 960, W, "PostgreSQL 18, Citus",
+    d.add(E("workers", "container", "Worker nodes", cols["proj"], 1135, W, "PostgreSQL 18, Citus",
             desc="Shards of tables and projections."))
-    d.add(E("embedder", "container", "Embedder", cols["read"], 960, W, "Rust", desc="Computes embeddings."))
-    d.add(E("oncall", "external", "On-call alerting", cols["trust"], 960, W, desc="Pages people."))
+    d.add(E("embedder", "container", "Embedder", cols["read"], 1135, W, "Rust", desc="Computes embeddings."))
+    d.add(E("oncall", "external", "On-call alerting", cols["trust"], 1135, W, desc="Pages people."))
 
     x = lambda el, px: (px - d.elements[el].x) / d.elements[el].w
     mid = lambda el: d.elements[el].x + d.elements[el].w / 2
@@ -198,14 +197,16 @@ def components() -> Diagram:
     d.rel(("attach", "right", 0.5), ("capture", "left", 0.5), "Replicated rows", via=[(350, y_of("attach", "right", 0.5)),
           (350, y_of("capture", "left", 0.5))], label_at=0.5, label_dx=0, label_w=70)
     d.rel(("router", "bottom", 0.5), ("fresh", "top", 0.5), "Waits for write tokens", label_at=0.5)
-    d.rel(("maint", "bottom", 0.4), ("workers", "top", x("workers", mid("maint") - 0.1 * W)),
-          "Writes projection rows", "Citus", label_at=0.5)
+    d.rel(("maint", "bottom", 0.85), ("workers", "top", 0.85), "Writes projection rows", "Citus", label_at=0.5)
     m_y = y_of("maint", "right", 0.7)
     d.rel(("maint", "right", 0.7), ("embedder", "top", 0.2), "Vector jobs", "queue",
-          via=[(660, m_y), (660, 925), (cols["read"] + 0.2 * W, 925)], label_at=0.66, label_dy=-2, label_w=70)
-    ml_y = y_of("maint", "left", 0.7)
-    d.rel(("maint", "left", 0.7), ("dbsp", "top", 0.5), "Cross-shard queries", status="planned",
-          via=[(350, ml_y), (350, 925), (mid("dbsp"), 925)], label_at=0.35, label_w=80)
+          via=[(660, m_y), (660, 1100), (cols["read"] + 0.2 * W, 1100)], label_at=0.66, label_dy=-2, label_w=70)
+    cl_y = y_of("capture", "left", 0.85)
+    d.rel(("capture", "left", 0.85), ("engine", "top", 0.85), "Row deltas",
+          via=[(345, cl_y), (345, 870), (cols["adopt"] + 0.85 * W, 870)], label_at=0.3, label_w=60)
+    e_y = y_of("engine", "right", 0.5)
+    d.rel(("engine", "right", 0.5), ("maint", "bottom", 0.3), "Keys a change reaches",
+          via=[(cols["proj"] + 0.3 * W, e_y)], label_at=0.3, label_dy=-14, label_w=90)
     d.rel(("propose", "top", 0.5), ("catalog", "top", 0.5), "Accepted proposals become projections",
           via=[(mid("propose"), 335), (mid("catalog"), 335)], label_at=0.6, label_w=260)
     d.rel(("alerting", "bottom", 0.5), ("oncall", "top", 0.5), "Pages", "HTTPS", label_at=0.5)

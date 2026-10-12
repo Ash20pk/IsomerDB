@@ -6,3 +6,7 @@ clients/*/dist/
 jepsen/store/
 jepsen/target/
 __pycache__/
+# C build output (extensions/isomer_router is also built in the image)
+*.o
+*.so
+*.bc
