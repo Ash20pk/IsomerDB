@@ -94,6 +94,14 @@ SQL
   expect "a write to a key on $(node_of "$k") is read back after wait_for" "renamed on $(node_of "$k")" \
     "$(mongo_eval "print(db.getSiblingDB(\"mn\").mn_customer.findOne({_id: $k}).name)")"
 done
+# The write token reaches the session even when the write's trigger ran on a worker (it used to
+# be set only in the worker's backend, so read_after did not wait). Found by Jepsen's ryw workload.
+expect "a write to a worker's shard gives the session a write token" "t" \
+  "$($ISO -c "UPDATE mn.customers SET name = name WHERE customer_id = $k_worker" -c "SELECT isomer.last_write_token() IS NOT NULL")"
+expect "and read_after with it waits for the write" "token on worker1" \
+  "$($ISO -c "UPDATE mn.customers SET name = 'token on worker1' WHERE customer_id = $k_worker" \
+          -c "SELECT set_config('isomer.read_after', isomer.last_write_token()::text, false)" \
+          -c "SELECT isomer.get('mn_customer', '$k_worker') ->> 'name'" | tail -1)"
 # Customers with even ids are gold; pick one whose shard is on the worker.
 k_gold=""; for k in $(seq 2 2 80); do [ "$(node_of "$k")" = "worker1" ] && { k_gold=$k; break; }; done
 $ISO -c "UPDATE mn.tiers SET label = 'GOLD' WHERE tier = 'gold'" -c "SELECT isomer.wait_for(isomer.last_write_token(), 'mn_customer', '15 seconds') IS NOT NULL" >/dev/null

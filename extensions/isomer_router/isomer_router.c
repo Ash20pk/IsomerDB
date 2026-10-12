@@ -53,6 +53,9 @@
 #include "utils/timestamp.h"
 #include "utils/syscache.h"
 #include "utils/catcache.h"
+#include "utils/rel.h"
+#include "utils/relcache.h"
+#include "commands/trigger.h"
 #include "catalog/pg_proc.h"
 #include "catalog/pg_type_d.h"
 #include "funcapi.h"
@@ -769,6 +772,73 @@ isomer_ExecutorRun(QueryDesc *queryDesc, ScanDirection direction, uint64 count)
 	PG_END_TRY();
 }
 
+/* Whether a statement writes to a table carrying IsomerDB's capture triggers (isomer_*). */
+static bool
+writes_projection_source(PlannedStmt *stmt)
+{
+	ListCell   *lc;
+
+	foreach(lc, stmt->permInfos)
+	{
+		RTEPermissionInfo *perm = (RTEPermissionInfo *) lfirst(lc);
+		Relation	rel;
+		bool		found = false;
+
+		if ((perm->requiredPerms & (ACL_INSERT | ACL_UPDATE | ACL_DELETE)) == 0)
+			continue;
+		rel = RelationIdGetRelation(perm->relid);
+		if (!RelationIsValid(rel))
+			continue;
+		if (rel->trigdesc)
+			for (int i = 0; i < rel->trigdesc->numtriggers && !found; i++)
+				found = strncmp(rel->trigdesc->triggers[i].tgname, "isomer_", 7) == 0;
+		RelationClose(rel);
+		if (found)
+			return true;
+	}
+	return false;
+}
+
+/*
+ * After a top-level write to a projection's source table, set the session's write token
+ * (isomer.last_write_token) from this node's cluster clock. The capture trigger sets it too, but
+ * on a multi-node cluster the trigger runs in the worker's backend, so the client's session never
+ * sees it; the coordinator's clock after the write is at or past the write's own token.
+ */
+static void
+record_write_token(QueryDesc *queryDesc)
+{
+	CmdType		op = queryDesc->operation;
+
+	if (exec_nesting != 0 || in_wait || in_router
+		|| !(op == CMD_INSERT || op == CMD_UPDATE || op == CMD_DELETE || op == CMD_MERGE)
+		|| queryDesc->estate == NULL || queryDesc->estate->es_processed == 0
+		|| !writes_projection_source(queryDesc->plannedstmt)
+		|| !OidIsValid(get_func_oid_simple("isomer", "current_token")))
+		return;
+
+	in_wait = true;
+	PG_TRY();
+	{
+		if (SPI_connect() == SPI_OK_CONNECT)
+		{
+			if (SPI_execute("SELECT isomer.current_token()::text", true, 1) == SPI_OK_SELECT && SPI_processed == 1)
+			{
+				char	   *token = SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1);
+
+				if (token)
+					SetConfigOption("isomer.last_write_token", token, PGC_USERSET, PGC_S_SESSION);
+			}
+			SPI_finish();
+		}
+	}
+	PG_FINALLY();
+	{
+		in_wait = false;
+	}
+	PG_END_TRY();
+}
+
 static void
 isomer_ExecutorFinish(QueryDesc *queryDesc)
 {
@@ -785,6 +855,7 @@ isomer_ExecutorFinish(QueryDesc *queryDesc)
 		exec_nesting--;
 	}
 	PG_END_TRY();
+	record_write_token(queryDesc);
 }
 
 /* isomer_router_stats(): what this backend has routed. */
