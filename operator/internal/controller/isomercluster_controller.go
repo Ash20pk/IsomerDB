@@ -266,6 +266,51 @@ func (r *IsomerClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		}
 	}
 
+	// Replication, as each primary sees it now (tendGroup also keeps slots and settings right).
+	reps := map[string]replication{}
+	for _, g := range gs {
+		if !g.primary.ready {
+			continue
+		}
+		rep, err := r.tendGroup(ctx, c, g, password, tlsFor)
+		if err != nil {
+			logger.Error(err, "checking replication", "group", g.name)
+		}
+		reps[g.name] = rep
+	}
+
+	// Upgrades: one pod (or one switchover) at a time to the current template, then extensions.
+	streaming := map[string]bool{}
+	for name, rep := range reps {
+		streaming[name] = rep.streaming
+	}
+	desc, f, err := r.rollOne(ctx, c, gs, pods, streaming, password, tlsFor)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if f != nil {
+		status.LastFailover = f
+	}
+	if desc != "" {
+		status.Phase = "Upgrading"
+		setCondition(&status, "Ready", metav1.ConditionFalse, "Upgrading", desc)
+		return r.finish(ctx, c, status, 3*time.Second)
+	}
+	allReady := true
+	for _, g := range gs {
+		allReady = allReady && g.primary.ready
+	}
+	if allReady {
+		if n, err := updateExtensions(ctx, gs, password, tlsFor); err != nil {
+			logger.Error(err, "updating extensions")
+		} else if n > 0 {
+			logger.Info("updated extensions", "count", n)
+			if status.IsomerVersion, err = db.isomerVersion(ctx); err != nil {
+				return ctrl.Result{}, err
+			}
+		}
+	}
+
 	scaling := false
 	// Scale up: register every ready new worker (its group's primary), then one rebalance.
 	added := 0
@@ -373,18 +418,10 @@ func (r *IsomerClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 					sb.close(ctx)
 				}
 			}
-			rep, err := r.tendGroup(ctx, c, g, password, tlsFor)
-			if err != nil {
-				logger.Error(err, "checking replication", "group", g.name)
-			}
+			rep := reps[g.name]
 			gsStatus.StandbyStreaming, gsStatus.ReplayLagBytes = rep.streaming, rep.lagBytes
 			if ha && !rep.streaming {
 				standbysDown++
-			}
-		} else if g.primary.ready {
-			// No standby: still drop slots left by one that is gone.
-			if _, err := r.tendGroup(ctx, c, g, password, tlsFor); err != nil {
-				logger.Error(err, "checking replication slots", "group", g.name)
 			}
 		}
 		status.Groups = append(status.Groups, gsStatus)

@@ -45,6 +45,26 @@ opt-in setting.
    unmodified as its own import commit on a branch, then re-apply our changes. Update the tables
    above in the same change.
 
+## 2026-10-12 — Operator: version upgrades (FR-CL1)
+
+`tests/operator_upgrade.sh` passes on kind. A cluster with standbys moves to an image carrying a
+newer isomer extension while a writer commits once a second through the client Service: every pod
+reaches the new image (standbys first, then a planned switchover per group), the extension is
+updated on every node, no acknowledged write is lost (137 of 137), and the writer saw 21 failed
+attempts over the run, about seven seconds per group switched.
+
+- **The operator rolls pods itself** (`OnDelete` StatefulSets): it knows which pod is the primary,
+  which the StatefulSet controller does not, and would restart a primary while its standby was
+  still on the old image. Any template change goes through the same path.
+- **A planned switchover loses nothing:** the old primary's fast shutdown sends all WAL to the
+  standby before exiting, and the operator waits for the standby to have replayed it before
+  promoting.
+- **Extensions are updated per primary, in dependency order,** only where the image has a newer
+  version; standbys get the change through WAL.
+
+Limit: write availability during a switchover is a few seconds per node; clients must retry. A
+major Postgres upgrade is not covered.
+
 ## 2026-10-12 — Operator: backups and point-in-time recovery (FR-CL1)
 
 `tests/operator_backup.sh` passes on kind, against SeaweedFS as the S3 store. A cluster archives

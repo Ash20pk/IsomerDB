@@ -262,3 +262,28 @@ func (c *citus) createRestorePoint(ctx context.Context) (string, error) {
 	err := c.conn.QueryRow(ctx, `SELECT isomer.create_restore_point()`).Scan(&name)
 	return name, err
 }
+
+// staleExtensions: installed extensions whose version is older than the one the image provides.
+func (c *citus) staleExtensions(ctx context.Context) (map[string]bool, error) {
+	rows, err := c.conn.Query(ctx, `
+		SELECT e.extname FROM pg_extension e JOIN pg_available_extensions a ON a.name = e.extname
+		WHERE a.default_version IS NOT NULL AND e.extversion <> a.default_version`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]bool{}
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return nil, err
+		}
+		out[name] = true
+	}
+	return out, rows.Err()
+}
+
+func (c *citus) updateExtension(ctx context.Context, name string) error {
+	_, err := c.conn.Exec(ctx, fmt.Sprintf(`ALTER EXTENSION %q UPDATE`, name))
+	return err
+}

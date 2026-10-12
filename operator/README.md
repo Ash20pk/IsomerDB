@@ -126,7 +126,21 @@ it, and comes up; the operator then points Citus at the new cluster's nodes. `st
 turns true when it is done. The restored cluster has the source's data, projections, history and
 passwords, and backs itself up to its own `spec.backup` store, if one is set.
 
-## Not yet
+## Upgrades
 
-- **Version upgrades** of the image or the isomer extension (`ALTER EXTENSION isomer UPDATE` on
-  every node).
+Change `spec.image` (or anything else in the pod template) and the operator moves the cluster to
+it, one node group at a time and only while every group is healthy. The database StatefulSets use
+the `OnDelete` strategy, so the operator, not the StatefulSet controller, decides when each pod is
+replaced:
+
+- **With standbys:** the standby first; once it streams again on the new image, a planned
+  switchover moves the primary onto it. The old primary shuts down cleanly, sending all its WAL
+  first, so no committed write is lost; it comes back on the new image as the standby. Workers go
+  before the coordinator. Clients see a few seconds of failed writes per node while it switches.
+- **Without standbys:** workers one by one, then the coordinator, each briefly unavailable.
+- **Extensions:** once every pod runs the new image, the operator runs `ALTER EXTENSION ... UPDATE`
+  on each primary for every extension the image has a newer version of (Citus first, IsomerDB
+  last); standbys receive it by replication. `status.isomerVersion` follows.
+
+Phase reads `Upgrading` while this is under way, with the step in the Ready condition's message.
+Major Postgres versions (18 to 19) need `pg_upgrade` and are not handled.

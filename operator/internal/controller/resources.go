@@ -388,7 +388,10 @@ func databaseStatefulSet(c *isomerv1.IsomerCluster, role string, replicas int32)
 			Replicas:            &replicas,
 			ServiceName:         name,
 			PodManagementPolicy: appsv1.ParallelPodManagement,
-			Selector:            &metav1.LabelSelector{MatchLabels: selector(c, role)},
+			// The operator replaces pods itself, in an order that keeps the cluster available
+			// (upgrade.go): standbys first, then a clean switchover.
+			UpdateStrategy: appsv1.StatefulSetUpdateStrategy{Type: appsv1.OnDeleteStatefulSetStrategyType},
+			Selector:       &metav1.LabelSelector{MatchLabels: selector(c, role)},
 			// A worker is only scaled away after its shards are drained, so its volume holds no
 			// data the cluster needs; a node added later starts empty.
 			PersistentVolumeClaimRetentionPolicy: &appsv1.StatefulSetPersistentVolumeClaimRetentionPolicy{
