@@ -215,10 +215,10 @@ UPFX=$($ISO -c "SELECT isomer._engine_prefix('ic_units')")
 contains "to key recompute, with the mapping" "strategy recompute" \
   "$($ISO -c "SELECT isomer.alter_projection('ic_units', strategy => 'recompute', sources => '{\"ic.lines\": \"product_id\"}')")"
 expect "its state is gone" "0" "$($ISO -c "SELECT count(*) FROM pg_class WHERE relnamespace = 'isomer_state'::regnamespace AND relname LIKE '${UPFX}%'")"
-# One shard per statement: under key recompute, a statement spanning shards queues the same keys
-# from several shard connections of one transaction, which can wait on each other (see notes).
-for o in 31 62 93 124; do $ISO -c "UPDATE ic.lines SET qty = qty + 1 WHERE order_id = $o" >/dev/null; done
-eventually "maintained by key it still equals the query" "0" "drift ic_units"
+# One statement across every shard, touching the same keys from several shard connections of one
+# distributed transaction: queued keys are only appended, so they never wait on each other.
+$ISO -c "UPDATE ic.lines SET qty = qty + 1 WHERE order_id % 31 = 0" >/dev/null
+eventually "maintained by key it still equals the query, after a statement across every shard" "0" "drift ic_units"
 contains "and back" "strategy incremental" "$($ISO -c "SELECT isomer.alter_projection('ic_units', strategy => 'incremental')")"
 $ISO -c "UPDATE ic.lines SET qty = qty + 1 WHERE order_id % 37 = 0" >/dev/null
 eventually "equal again" "0" "drift ic_units"

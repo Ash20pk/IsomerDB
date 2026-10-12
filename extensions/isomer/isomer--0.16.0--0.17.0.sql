@@ -68,6 +68,27 @@ CREATE TABLE isomer.delta_pulls (
     pulled_at timestamptz NOT NULL DEFAULT clock_timestamp()
 );
 
+-- A statement that writes several shards runs their triggers over parallel connections of one
+-- distributed transaction. When two of them queued the same key with INSERT ... ON CONFLICT, the
+-- second waited for the first's uncommitted row, which could not commit until the statement
+-- finished: Citus's deadlock detector cancelled it. Capture now only appends (here to key_log, on
+-- workers to node_queue, both without a unique key), and the drain, one session, merges what has
+-- committed into pending. A write still uncommitted when the drain merges is simply merged by the
+-- next drain, so nothing is missed.
+CREATE TABLE isomer.key_log (
+    id          bigserial PRIMARY KEY,
+    projection  text NOT NULL REFERENCES isomer.projections (name) ON DELETE CASCADE,
+    key         text NOT NULL,
+    token       bigint NOT NULL DEFAULT 0,
+    enqueued_at timestamptz NOT NULL DEFAULT clock_timestamp()
+);
+CREATE INDEX key_log_projection ON isomer.key_log (projection, id);
+CREATE INDEX key_log_token ON isomer.key_log (projection, token);
+REVOKE ALL ON isomer.key_log FROM PUBLIC;
+
+ALTER TABLE isomer.node_queue DROP CONSTRAINT node_queue_pkey;
+ALTER TABLE isomer.node_queue ADD COLUMN id bigserial PRIMARY KEY;
+
 CREATE SCHEMA isomer_state;
 COMMENT ON SCHEMA isomer_state IS 'IsomerDB: state kept by incrementally maintained projections';
 
@@ -1695,6 +1716,11 @@ BEGIN
     FOR p IN SELECT name, kind, lag_budget, strategy FROM isomer.projections
              WHERE kind IN ('document', 'vector', 'cache') AND freshness = 'bounded' AND status = 'active'
     LOOP
+        BEGIN
+            PERFORM isomer._merge_key_log(p.name);
+        EXCEPTION WHEN OTHERS THEN
+            PERFORM isomer._log('error', p.name, format('merging queued keys failed: %s', SQLERRM));
+        END;
         IF p.strategy = 'incremental' THEN
             v_until := clock_timestamp() + greatest(p.lag_budget / 2, interval '200 milliseconds');
             BEGIN
@@ -1769,7 +1795,8 @@ BEGIN
     END IF;
     SELECT least((SELECT min(token) FROM isomer.pending WHERE projection = p.name AND token > 0),
                  (SELECT min(token) FROM isomer.embed_jobs WHERE projection = p.name AND token > 0),
-                 (SELECT min(token) FROM isomer.deltas WHERE projection = p.name AND token > 0))
+                 (SELECT min(token) FROM isomer.deltas WHERE projection = p.name AND token > 0),
+                 (SELECT min(token) FROM isomer.key_log WHERE projection = p.name AND token > 0))
     INTO v_min;
     RETURN coalesce(v_min - 1, isomer.current_token());
 END $$;
@@ -1793,6 +1820,8 @@ BEGIN
         OR EXISTS (SELECT 1 FROM isomer.embed_jobs
                    WHERE token > 0 AND enqueued_at <= p_barrier AND (p_projection IS NULL OR projection = p_projection))
         OR EXISTS (SELECT 1 FROM isomer.deltas
+                   WHERE token > 0 AND enqueued_at <= p_barrier AND (p_projection IS NULL OR projection = p_projection))
+        OR EXISTS (SELECT 1 FROM isomer.key_log
                    WHERE token > 0 AND enqueued_at <= p_barrier AND (p_projection IS NULL OR projection = p_projection));
 END $$;
 
@@ -1817,6 +1846,9 @@ BEGIN
                  AND token > 0 AND (p_projection IS NULL OR projection = p_projection))
        OR EXISTS (SELECT 1 FROM isomer.deltas
                   WHERE xmin = pg_current_xact_id_if_assigned()::text::xid
+                    AND token > 0 AND (p_projection IS NULL OR projection = p_projection))
+       OR EXISTS (SELECT 1 FROM isomer.key_log
+                  WHERE xmin = pg_current_xact_id_if_assigned()::text::xid
                     AND token > 0 AND (p_projection IS NULL OR projection = p_projection)) THEN
         RAISE EXCEPTION 'isomer.wait_for: the write you are waiting for is not committed yet'
             USING HINT = 'Commit the write first, then call isomer.wait_for(isomer.last_write_token()) in a new transaction.';
@@ -1837,6 +1869,8 @@ BEGIN
                   AND NOT EXISTS (SELECT 1 FROM isomer.embed_jobs
                                   WHERE token > 0 AND token <= p_token AND (p_projection IS NULL OR projection = p_projection))
                   AND NOT EXISTS (SELECT 1 FROM isomer.deltas
+                                  WHERE token > 0 AND token <= p_token AND (p_projection IS NULL OR projection = p_projection))
+                  AND NOT EXISTS (SELECT 1 FROM isomer.key_log
                                   WHERE token > 0 AND token <= p_token AND (p_projection IS NULL OR projection = p_projection));
         END IF;
         IF clock_timestamp() > v_until THEN
@@ -2092,8 +2126,10 @@ END $$;
 
 CREATE OR REPLACE VIEW isomer.projection_status AS
 SELECT p.name, p.kind, p.freshness, p.lag_budget, p.status,
-       (SELECT count(*) FROM isomer.pending q WHERE q.projection = p.name) AS pending_keys,
-       (SELECT clock_timestamp() - min(q.enqueued_at) FROM isomer.pending q WHERE q.projection = p.name) AS oldest_pending,
+       (SELECT count(*) FROM isomer.pending q WHERE q.projection = p.name)
+         + (SELECT count(DISTINCT q.key) FROM isomer.key_log q WHERE q.projection = p.name) AS pending_keys,
+       (SELECT clock_timestamp() - least(min(q.enqueued_at), (SELECT min(l.enqueued_at) FROM isomer.key_log l WHERE l.projection = p.name))
+        FROM isomer.pending q WHERE q.projection = p.name) AS oldest_pending,
        s.last_applied_at, round(s.last_lag_ms::numeric, 1) AS last_lag_ms,
        round(s.max_lag_ms::numeric, 1) AS max_lag_ms, s.budget_breaches,
        s.documents_written, s.documents_deleted,
@@ -2411,6 +2447,7 @@ BEGIN
             FOR r IN SELECT * FROM isomer._audit_pairs(p, v_keys) LOOP
                 -- Work in flight is not drift.
                 CONTINUE WHEN EXISTS (SELECT 1 FROM isomer.pending q WHERE q.projection = p.name AND q.key = r.key)
+                           OR EXISTS (SELECT 1 FROM isomer.key_log q WHERE q.projection = p.name AND q.key = r.key)
                            OR EXISTS (SELECT 1 FROM isomer.embed_jobs j WHERE j.projection = p.name AND j.key = r.key);
                 v_checks := v_checks + 1;
                 IF r.expected IS NOT DISTINCT FROM r.actual THEN
@@ -2491,6 +2528,90 @@ BEGIN
     GET DIAGNOSTICS v_n = ROW_COUNT;
     RETURN format('history for %s is on: %s documents in the baseline, kept for %s', p.name, v_n, retention);
 END $$;
+
+-- ── Queued keys: append only (see key_log above) ───────────────────────────
+
+CREATE OR REPLACE FUNCTION isomer._on_source_change()
+RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog AS $$
+DECLARE
+    v_projection text := TG_ARGV[0];
+    v_column     text := TG_ARGV[1];
+    v_freshness  text := TG_ARGV[2];
+    v_keys       text[];
+    v_token      bigint := isomer.current_token();
+BEGIN
+    PERFORM set_config('isomer.last_write_token', v_token::text, false);
+
+    -- On a worker node (no catalog): queue the keys for the coordinator to pull.
+    IF NOT EXISTS (SELECT 1 FROM isomer.projections WHERE name = v_projection) THEN
+        IF TG_OP = 'TRUNCATE' OR v_column = '' THEN
+            v_keys := ARRAY['*'];
+        ELSE
+            SELECT array_agg(DISTINCT k) INTO v_keys
+            FROM unnest(ARRAY[
+                CASE WHEN TG_OP <> 'INSERT' THEN to_jsonb(OLD) ->> v_column END,
+                CASE WHEN TG_OP <> 'DELETE' THEN to_jsonb(NEW) ->> v_column END]) k
+            WHERE k IS NOT NULL;
+        END IF;
+        INSERT INTO isomer.node_queue (projection, key, token)
+        SELECT v_projection, k, v_token FROM unnest(v_keys) k;
+        RETURN NULL;
+    END IF;
+
+    IF TG_OP = 'TRUNCATE' THEN
+        PERFORM isomer._log('info', v_projection, format('%s truncated: full refresh', TG_TABLE_NAME));
+        PERFORM isomer._full_refresh(v_projection);
+        RETURN NULL;
+    END IF;
+
+    IF v_column = '' THEN
+        IF v_freshness = 'sync' THEN
+            PERFORM pg_advisory_xact_lock(hashtext('isomer'), hashtext(v_projection));
+            PERFORM isomer._rebuild_all(v_projection);
+        ELSE
+            INSERT INTO isomer.key_log (projection, key, token)
+            SELECT v_projection, k, v_token FROM isomer._all_keys(v_projection) k;
+        END IF;
+        RETURN NULL;
+    END IF;
+
+    SELECT array_agg(DISTINCT k ORDER BY k) INTO v_keys
+    FROM unnest(ARRAY[
+        CASE WHEN TG_OP <> 'INSERT' THEN to_jsonb(OLD) ->> v_column END,
+        CASE WHEN TG_OP <> 'DELETE' THEN to_jsonb(NEW) ->> v_column END]) k
+    WHERE k IS NOT NULL;
+
+    IF v_freshness = 'sync' THEN
+        PERFORM pg_advisory_xact_lock(hashtext(v_projection), hashtext(k)) FROM unnest(v_keys) k ORDER BY k;
+        PERFORM isomer._apply(v_projection, v_keys);
+    ELSE
+        INSERT INTO isomer.key_log (projection, key, token)
+        SELECT v_projection, k, v_token FROM unnest(v_keys) k;
+    END IF;
+    RETURN NULL;
+END $$;
+
+-- Move a projection's committed log entries into pending: one row per key, the oldest real token
+-- and the earliest time. Called by the drain, before it takes its batch.
+CREATE FUNCTION isomer._merge_key_log(p_projection text)
+RETURNS integer LANGUAGE plpgsql SET search_path = pg_catalog AS $$
+DECLARE
+    v_n integer;
+BEGIN
+    WITH moved AS (
+        DELETE FROM isomer.key_log WHERE projection = p_projection RETURNING key, token, enqueued_at)
+    INSERT INTO isomer.pending AS q (projection, key, token, enqueued_at)
+    SELECT p_projection, key, coalesce(min(token) FILTER (WHERE token > 0), 0), min(enqueued_at)
+    FROM moved GROUP BY key
+    ON CONFLICT (projection, key) DO UPDATE
+        SET token = CASE WHEN q.token = 0 THEN EXCLUDED.token
+                         WHEN EXCLUDED.token = 0 THEN q.token
+                         ELSE least(q.token, EXCLUDED.token) END,
+            enqueued_at = least(q.enqueued_at, EXCLUDED.enqueued_at);
+    GET DIAGNOSTICS v_n = ROW_COUNT;
+    RETURN v_n;
+END $$;
+REVOKE EXECUTE ON FUNCTION isomer._merge_key_log(text) FROM PUBLIC;
 
 -- Everything this version adds is for the extension and administrators, not for applications.
 DO $$

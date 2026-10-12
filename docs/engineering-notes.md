@@ -143,15 +143,14 @@ Things that bit us:
   inserted a suspect row whose foreign key takes KEY SHARE on the same projection row, and waited.
   `alter_projection` never changes the key, so it now takes `FOR NO KEY UPDATE`, which foreign-key
   checks don't wait for.
-
-Found, not fixed: **a statement that writes several shards can deadlock key recompute.** Under
-key recompute, each shard's trigger upserts the keys it touches into `isomer.pending`; Citus runs
-the shards over parallel connections of one distributed transaction, and two of them inserting
-the same key wait on each other until Citus's deadlock detector cancels the statement. It only
-bites when one statement touches the same projection key from several shards. Incremental
-capture only appends, so it never waits. The fix is an append-only key queue with deduplication
-at drain time; until then, `tests/incremental.sh` writes one shard per statement in its key
-recompute phase.
+- **A statement that wrote several shards could deadlock key recompute** (older than this work,
+  found by this test). Each shard's trigger upserted the keys it touched into `isomer.pending`;
+  Citus runs the shards over parallel connections of one distributed transaction, so two of them
+  inserting the same key waited on each other until Citus's deadlock detector cancelled the
+  statement. Capture now only appends (`isomer.key_log`, and `node_queue` on workers without its
+  unique key), and the drain merges what has committed into `pending` in one session. A write
+  still uncommitted when the drain merges is merged by the next drain, so nothing is missed;
+  `wait_for`, `freshness`, the auditor and the status view count the log too.
 
 Limits:
 
