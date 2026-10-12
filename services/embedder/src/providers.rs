@@ -18,6 +18,10 @@ pub struct Model {
     pub max_batch_items: i64,
     pub requests_per_min: f64,
     pub tokens_per_min: f64,
+    /// Large backfills go through the provider's Batch API.
+    pub batch_api: bool,
+    /// A backfill at least this large is left to a batch.
+    pub batch_min_items: i64,
 }
 
 pub struct EmbedResult {
@@ -158,7 +162,7 @@ async fn openai(http: &reqwest::Client, model: &Model, inputs: &[&str]) -> Resul
     })
 }
 
-fn truncate(s: &str) -> String {
+pub fn truncate(s: &str) -> String {
     s.chars().take(300).collect()
 }
 

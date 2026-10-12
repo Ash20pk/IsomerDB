@@ -6,16 +6,23 @@
 - GET  /stats  -> how many times each input text was embedded, for asserting that unchanged rows
   are never re-embedded.
 - POST /reset  -> clear the counters.
+- The Batch API: POST /v1/files (multipart, purpose=batch), POST /v1/batches, GET
+  /v1/batches/<id>, GET /v1/files/<id>/content. A batch reports "in_progress" on its first check
+  and "completed" on the next, when its output file is written; an input "FAIL" gets a 400 line.
+  Inputs embedded through batches are counted separately (batch_inputs in /stats).
 """
 import hashlib
 import json
 import math
 import os
 from collections import Counter
+from email.parser import BytesParser
+from email.policy import HTTP
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 RATE_LIMIT_EVERY = int(os.environ.get("RATE_LIMIT_EVERY", "5"))
-state = {"requests": 0, "rate_limited": 0, "inputs": Counter()}
+state = {"requests": 0, "rate_limited": 0, "inputs": Counter(), "batch_inputs": Counter(),
+         "files": {}, "batches": {}}
 
 
 def embedding(text: str, dims: int) -> list:
@@ -45,16 +52,73 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/stats":
             self.send(200, {"requests": state["requests"], "rate_limited": state["rate_limited"],
                             "inputs_total": sum(state["inputs"].values()),
-                            "by_input": dict(state["inputs"])})
+                            "by_input": dict(state["inputs"]),
+                            "batches": len(state["batches"]),
+                            "batch_inputs_total": sum(state["batch_inputs"].values()),
+                            "batch_by_input": dict(state["batch_inputs"])})
+        elif self.path.startswith("/v1/batches/"):
+            batch = state["batches"].get(self.path.rsplit("/", 1)[1])
+            if batch is None:
+                return self.send(404, {"error": {"message": "no such batch"}})
+            batch["checks"] += 1
+            if batch["checks"] >= 2 and batch["status"] == "in_progress":
+                self.run_batch(batch)
+            self.send(200, {k: v for k, v in batch.items() if k != "checks"})
+        elif self.path.startswith("/v1/files/") and self.path.endswith("/content"):
+            content = state["files"].get(self.path.split("/")[3])
+            if content is None:
+                return self.send(404, {"error": {"message": "no such file"}})
+            self.send_response(200)
+            self.send_header("Content-Type", "application/jsonl")
+            self.send_header("Content-Length", str(len(content)))
+            self.end_headers()
+            self.wfile.write(content)
         else:
             self.send(404, {"error": "not found"})
 
+    def run_batch(self, batch):
+        out = []
+        for line in state["files"][batch["input_file_id"]].decode().splitlines():
+            req = json.loads(line)
+            text = req["body"]["input"]
+            dims = int(req["body"]["model"].rsplit("-", 1)[1])
+            if text == "FAIL":
+                out.append({"custom_id": req["custom_id"], "error": None,
+                            "response": {"status_code": 400, "body": {"error": {"message": "input rejected"}}}})
+                continue
+            state["batch_inputs"][text] += 1
+            tokens = max(1, len(text) // 4)
+            out.append({"custom_id": req["custom_id"], "error": None,
+                        "response": {"status_code": 200, "body": {
+                            "data": [{"object": "embedding", "index": 0, "embedding": embedding(text, dims)}],
+                            "usage": {"prompt_tokens": tokens, "total_tokens": tokens}}}})
+        file_id = f"file-{len(state['files']) + 1}"
+        state["files"][file_id] = "".join(json.dumps(o) + "\n" for o in out).encode()
+        batch.update(status="completed", output_file_id=file_id)
+
     def do_POST(self):
         length = int(self.headers.get("Content-Length", 0))
-        body = json.loads(self.rfile.read(length) or b"{}")
+        raw = self.rfile.read(length)
+        body = {} if self.path == "/v1/files" else json.loads(raw or b"{}")
         if self.path == "/reset":
-            state.update(requests=0, rate_limited=0, inputs=Counter())
+            state.update(requests=0, rate_limited=0, inputs=Counter(), batch_inputs=Counter(), files={}, batches={})
             return self.send(200, {"ok": True})
+        if self.path in ("/v1/files", "/v1/batches") and self.headers.get("Authorization") != "Bearer test-key":
+            return self.send(401, {"error": {"message": "invalid api key"}})
+        if self.path == "/v1/files":
+            msg = BytesParser(policy=HTTP).parsebytes(
+                b"Content-Type: " + self.headers["Content-Type"].encode() + b"\r\n\r\n" + raw)
+            parts = {part.get_param("name", header="content-disposition"): part.get_payload(decode=True)
+                     for part in msg.iter_parts()}
+            file_id = f"file-{len(state['files']) + 1}"
+            state["files"][file_id] = parts["file"]
+            return self.send(200, {"id": file_id, "object": "file", "purpose": parts.get("purpose", b"").decode()})
+        if self.path == "/v1/batches":
+            batch_id = f"batch-{len(state['batches']) + 1}"
+            state["batches"][batch_id] = {"id": batch_id, "object": "batch", "status": "in_progress",
+                                          "input_file_id": body["input_file_id"], "output_file_id": None,
+                                          "error_file_id": None, "errors": None, "checks": 0}
+            return self.send(200, {k: v for k, v in state["batches"][batch_id].items() if k != "checks"})
         if self.path != "/v1/embeddings":
             return self.send(404, {"error": "not found"})
         if self.headers.get("Authorization") != "Bearer test-key":

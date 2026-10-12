@@ -30,7 +30,7 @@ healthy
 sleep 5
 for t in scripts/smoke.sh tests/phase0.sh tests/phase1.sh tests/phase2.sh tests/phase3.sh tests/native.sh \
          tests/routing.sh tests/history.sh tests/freshness.sh tests/console.sh tests/local_model.sh tests/metering.sh tests/alerts.sh tests/cutover_plan.sh \
-         tests/incremental.sh; do
+         tests/incremental.sh tests/embed_batch.sh; do
   run "$t"
 done
 

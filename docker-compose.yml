@@ -52,6 +52,8 @@ services:
       ISOMER_DATABASE_URL: host=/var/run/postgresql user=postgres dbname=postgres
       MOCKAI_KEY: test-key
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      # Provider batches are checked every 30 seconds by default; tests want answers sooner.
+      ISOMER_BATCH_POLL_SECONDS: ${ISOMER_BATCH_POLL_SECONDS:-2}
     volumes:
       - pgsocket:/var/run/postgresql
 
