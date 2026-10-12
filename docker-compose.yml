@@ -99,6 +99,23 @@ services:
     volumes:
       - ./tests/mockhooks/server.py:/srv/server.py:ro
 
+  # An edge replica: projections served from memory, fed by the API's change feed. Projections it
+  # serves need history on (isomer.set_history), and ISOMER_EDGE_KEY an API key that may read them:
+  #   ISOMER_EDGE_KEY=... ISOMER_EDGE_PROJECTIONS=customer_card docker compose --profile edge up -d edge
+  edge:
+    build:
+      context: .
+      dockerfile: services/edge/Dockerfile
+    image: isomer-edge:dev
+    profiles: ["edge"]
+    depends_on: [api]
+    environment:
+      ISOMER_ORIGIN: http://api:8080
+      ISOMER_ORIGIN_KEY: ${ISOMER_EDGE_KEY:-}
+      ISOMER_EDGE_PROJECTIONS: ${ISOMER_EDGE_PROJECTIONS:-}
+    ports:
+      - "8081:8081"
+
   # Citus worker nodes, for multi-node clusters:
   #   docker compose --profile cluster up -d   then   SELECT isomer.add_node('worker1');
   worker1:

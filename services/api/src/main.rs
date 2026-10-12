@@ -7,6 +7,8 @@
 //!   GET /v1/projections/{name}/snapshot               all documents plus the feed cursor they are as of
 //!   GET /v1/projections/{name}/changes?after=&limit=  the change feed, in commit order, gap-free
 //!   GET /v1/projections/{name}/live?after=            the same feed as server-sent events
+//!   GET /v1/projections/{name}/cursor                 the newest feed cursor (after X-Isomer-After: the
+//!                                                     cursor that reflects that write, for edge replicas)
 //!   /v1/admin/...                                     operator endpoints for the console and CLI (admin.rs)
 //!   GET /console/                                     the console (static files)
 //!
@@ -92,6 +94,7 @@ async fn main() -> Result<()> {
         .route("/v1/projections/:name/snapshot", get(get_snapshot))
         .route("/v1/projections/:name/changes", get(get_changes))
         .route("/v1/projections/:name/live", get(live))
+        .route("/v1/projections/:name/cursor", get(get_cursor))
         .merge(admin::routes())
         .with_state(app);
     let console = std::env::var("ISOMER_CONSOLE_DIR").unwrap_or_else(|_| "/usr/share/isomer/console".into());
@@ -363,6 +366,19 @@ async fn get_snapshot(State(app): State<Shared>, headers: HeaderMap, Path(name):
     let db = app.pool.get().await?;
     let row = db.query_one("SELECT cursor, docs FROM isomer.snapshot($1)", &[&name]).await?;
     Ok(Json(json!({ "cursor": row.get::<_, i64>(0), "docs": row.get::<_, Value>(1) })))
+}
+
+/// The newest change in the projection's feed. With X-Isomer-After it is taken once the projection
+/// reflects that write, so any change up to it, the write's included, is at or before it: an edge
+/// replica that has applied the feed this far can answer a read that must see the write.
+async fn get_cursor(State(app): State<Shared>, headers: HeaderMap, Path(name): Path<String>) -> ApiResult<Json<Value>> {
+    authorize(&app, &headers, &name).await?;
+    wait_after(&app, &headers, &name).await?;
+    let db = app.pool.get().await?;
+    let row = db
+        .query_one("SELECT coalesce(max(id), 0) FROM isomer.changes WHERE projection = $1", &[&name])
+        .await?;
+    Ok(Json(json!({ "cursor": row.get::<_, i64>(0) })))
 }
 
 #[derive(Deserialize)]
