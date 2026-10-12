@@ -21,8 +21,8 @@ What sets it apart is the combination:
 - **Self-tuning:** the database reads its own query log and proposes the projections and shard keys
   it should have.
 
-> **Status.** Phases 0 to 2 of the [PRD](docs/PRD.md) are built, and phase 3 except the managed
-> cloud and a published Jepsen report. The diagrams
+> **Status.** Phases 0 to 3 of the [PRD](docs/PRD.md) are built, and parts of the roadmap after
+> them: event, analytics and edge projections. The diagrams
 > below show the whole system as designed. Each part is marked **built** (implemented and covered by
 > acceptance tests), **partly built** or **planned**. [What's left](#whats-left) lists the gaps.
 
@@ -50,7 +50,7 @@ for billing, and pages on-call when a projection drifts or falls behind its lag 
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/diagrams/c4-2-containers-dark.svg">
-  <img alt="Containers: a MongoDB gateway, an HTTP API, the console and CLI, a coordinator and worker nodes (PostgreSQL 18, Citus, the isomer extension), an embedder, and the Kubernetes operator and the cloud control plane are built. Edge replicas are planned." src="docs/diagrams/c4-2-containers.svg">
+  <img alt="Containers: a MongoDB gateway, an HTTP API, the console and CLI, a coordinator and worker nodes (PostgreSQL 18, Citus, the isomer extension), an embedder, the Kubernetes operator, the cloud control plane and edge replicas are built." src="docs/diagrams/c4-2-containers.svg">
 </picture>
 
 | Container | What it does | Status |
@@ -63,7 +63,7 @@ for billing, and pages on-call when a projection drifts or falls behind its lag 
 | **Embedder** | Computes embeddings for vector projections, from a hosted API or bge-small on its own CPU. | Built |
 | **Kubernetes operator** | Provisions and scales clusters, fails over to standbys, backs up and restores to a point in time, rolls upgrades, issues node certificates. | Built |
 | **Cloud control plane** | Managed IsomerDB: sign-up, regions, plans, provisioning through the operator, usage collected from each cluster and priced on invoices. | Built |
-| **Edge replicas** | Projections served close to users, fed by the change feed. | Planned |
+| **Edge replicas** | Projections served from memory close to users, fed by the change feed; access and read-your-writes as at the origin. | Built |
 
 ### Level 3: inside the coordinator
 
@@ -244,6 +244,20 @@ SELECT * FROM shop.customer_card WHERE id = 42;   -- waits until the projection 
 SELECT * FROM isomer.drift_report;                -- "drift 0 rows · N checks · since ..."
 SELECT isomer.certificate('customer_profile');    -- the rules it relies on, checked live
 
+-- Domain events from row changes, in commit order per row, read from the feed (or /live)
+SELECT isomer.create_event_projection('order_events', 'orders', events => '{
+  "order_paid": {"when": "new.status = ''paid'' AND old.status IS DISTINCT FROM ''paid''",
+                 "payload": "jsonb_build_object(''total'', new.total)"}}');
+SELECT * FROM isomer.changes_since('order_events', 0);
+
+-- A query kept as a columnar table for analytics, rebuilt when its sources change
+SELECT isomer.create_analytics_projection('daily_revenue',
+  $$ SELECT date_trunc('day', o.created_at) AS day, sum(o.total) AS revenue FROM orders o GROUP BY 1 $$,
+  refresh => '5 minutes');
+
+-- Before attaching a managed database: which provider it is, and what to change there
+SELECT * FROM isomer.provider_check('host=... dbname=... user=... password=...');
+
 -- Let the database suggest projections and shard keys, then route a slow query onto one
 SELECT isomer.propose();  SELECT * FROM isomer.proposals;  SELECT isomer.accept_proposal(1);
 SELECT isomer.route_proposal(1);
@@ -304,7 +318,7 @@ SELECT * FROM isomer.alert_deliveries ORDER BY id DESC LIMIT 20;   -- what was s
 | [`extensions/isomer/`](extensions/isomer/) | The `isomer` extension: projections, attach and cutover, freshness, auditor, proposer, metering |
 | [`extensions/isomer_router/`](extensions/isomer_router/) | Planner and executor hooks: query routing, `read_after`, write tokens; the incremental engine's compiler |
 | [`extensions/sharding/`](extensions/sharding/), [`documents/`](extensions/documents/), [`ivm/`](extensions/ivm/) | Built from source with our changes: sharding, document storage and the MongoDB gateway, incremental view maintenance |
-| [`services/api/`](services/api/), [`services/embedder/`](services/embedder/) | The HTTP API and the embedder (Rust) |
+| [`services/api/`](services/api/), [`services/embedder/`](services/embedder/), [`services/edge/`](services/edge/) | The HTTP API, the embedder and the edge replica (Rust) |
 | [`clients/`](clients/) | TypeScript: the API client, the `isomer` CLI and the console |
 | [`operator/`](operator/) | The Kubernetes operator (Go) |
 | [`controlplane/`](controlplane/) | The cloud control plane: accounts, regions, plans, clusters, usage, invoices (Go) |
@@ -319,22 +333,23 @@ SELECT * FROM isomer.alert_deliveries ORDER BY id DESC LIMIT 20;   -- what was s
 ./tests/operator.sh       # the operator on a local kind cluster: TLS, scaling, failover
 ./tests/controlplane.sh   # the cloud control plane on kind: sign-up, clusters, usage, invoices
 ./tests/operator_backup.sh && ./tests/operator_upgrade.sh
-./tests/jepsen.sh         # Jepsen while workers are paused, killed and partitioned
+./tests/jepsen.sh         # Jepsen while nodes are paused, killed, cut off or their clocks skewed
+./tests/jepsen.sh report  # the release matrix, written to docs/jepsen/
 ```
 
-The Jepsen workloads check isolation across shards (Elle) and read-your-writes through projections,
-and have found and fixed two bugs so far; see the [engineering notes](docs/engineering-notes.md).
+The Jepsen workloads check isolation across shards (Elle), read-your-writes through projections over
+SQL and MongoDB, and incrementally maintained projections, with faults on the workers, on the
+coordinator, and on every node's clock. They have found and fixed three bugs so far; see the
+[engineering notes](docs/engineering-notes.md) and each release's report in [`docs/jepsen/`](docs/jepsen/).
 
 ## What's left
 
 | Area | Not built yet | PRD |
 |---|---|---|
 | Projections | Incremental state sharded across nodes (it is kept on the coordinator); incremental maintenance of nested documents (`jsonb_agg`), `DISTINCT` aggregates and sync freshness | FR-P6 |
-| Projections | Analytics (columnar), event and edge projections | Later |
-| Adoption | Tested support for each managed Postgres (RDS, Cloud SQL, Neon, Supabase...) | FR-A11 |
-| Embeddings | Provider batch APIs for large backfills; bundled models billed at list price plus a markup | FR-V1a, V1b |
+| Projections | Analytics projections maintained incrementally (they are rebuilt in full when their sources change); an edge replica that keeps its copy across restarts and speaks MongoDB | Later |
+| Adoption | Attach and cutover run against each real managed provider in CI: the provider check and a run as a non-superuser role are done, real providers need their accounts | FR-A11 |
 | Cloud | A sign-up page; charging cards (invoices are computed, collecting payment needs a payment provider account); regions in other clouds run for real | FR-CL1, CL2 |
-| Correctness | Jepsen faults on the coordinator itself, clock skew, and the MongoDB path; a published report per release | FR-K4 |
 | Product | Trademark clearance, ParadeDB HA licensing, design partners | PRD §15 |
 
 ## License

@@ -45,6 +45,140 @@ opt-in setting.
    unmodified as its own import commit on a branch, then re-apply our changes. Update the tables
    above in the same change.
 
+## 2026-10-12 — Jepsen: coordinator faults, clock skew, MongoDB, incremental projections (FR-K4)
+
+`tests/jepsen.sh` now covers what the first Jepsen entry below left out:
+
+- **Faults on any node.** `--fault-nodes` (or `FAULT_NODES=db,worker1`) picks where the nemesis
+  pauses, kills and cuts off; the coordinator is one of them. Clients reconnect and retry, so a
+  kill of the coordinator shows up as indeterminate operations, not as a crashed run.
+- **Clock skew.** `SKEW=1` runs the cluster on an image with libfaketime preloaded for the
+  `postgres` user. The nemesis writes an offset of 5 to 60 seconds, forwards or backwards, to a
+  file the library rereads every second, and clears it on heal.
+- **MongoDB.** The `mongo` workload is read-your-writes through the gateway with the MongoDB Java
+  driver: a causally consistent session increments, then reads the projection and must see it.
+- **Incremental projections.** The `incremental` workload writes order lines under sales by
+  category, kept by the incremental engine across a reference table, a distributed table and one
+  not co-located with it: inserts, updates, voids, deletes, products moved between categories, and
+  statements across every shard. At the end the projection must equal recomputation, no deltas
+  may be left on the workers, no pull left prepared, and the certificate must hold.
+- **A report per release.** `./tests/jepsen.sh report` runs every workload with faults on the
+  workers, on the coordinator, and with skew on every node, and writes the matrix to
+  `docs/jepsen/isomer-<version>.md`. Elle checks append for G0, G1a, G1b, G1c and internal
+  consistency, with 30 seconds to search for cycles (the default ran out and answered "unknown").
+
+It found a third bug, fixed:
+
+- **Read-your-writes on a cluster assumed no clock steps back.** `wait_for` took every node's
+  `clock_timestamp()` as the barrier and waited for queued changes enqueued before it. A worker
+  whose clock was ahead when a write queued, then stepped back, left that write stamped after the
+  barrier, so the read didn't wait for it: stale reads under skew only. Queued changes already
+  carry the Citus cluster clock of the node that queued them, which never goes back (the larger of
+  a logical clock and the wall clock, persisted across restarts). The barrier is now that token:
+  the largest of every node's cluster clock and every token already queued. `wait_for` waits
+  until nothing at or below it is queued anywhere, asking the workers before the coordinator so a
+  change moving between them is seen in one place or the other, and counting a worker that
+  doesn't answer as still busy.
+
+Things that bit us: libfaketime keeps its state in shared-memory semaphores that only the user who
+created them can open, so the server must run as `postgres` from the start (`user: postgres` in
+`jepsen/compose.skew.yml`). A `FAKETIME` variable overrides the timestamp file, so the image sets
+none. MongoDB counters come back as 32-bit integers.
+
+## 2026-10-12 — Event and analytics projections (roadmap)
+
+`tests/events_analytics.sh` passes on one node and on the cluster (isomer 0.20.0).
+
+- **Event projections** turn row changes into domain events:
+  `isomer.create_event_projection('order_events', 'shop.orders', events => '{"order_paid": {"when":
+  "new.status = ''paid'' AND old.status IS DISTINCT FROM ''paid''", "payload": "..."}}')`. Each
+  rule is a condition and a payload over the old and new row. Capture is the incremental engine's:
+  the old and new images are recorded together in the writing transaction, on the node holding the
+  row, and reach the coordinator exactly once. The drain turns them into events and appends them to
+  the projection's feed under its feed lock, so ids follow commit order and one row's events keep
+  theirs. Consumers read them with `isomer.changes_since`, or over HTTP from `/changes` and
+  `/live`, as `op: event`. Past retention, events go (a document's history keeps each key's version
+  at the cutoff; an event log keeps nothing older). A TRUNCATE makes no events.
+- **Analytics projections** keep a query as a columnar table (Citus columnar),
+  `isomer.create_analytics_projection(name, query, refresh => '5 minutes')`, read through a view.
+  It is rebuilt into a new table and swapped in, in one transaction, when the sources have changed,
+  at most once per refresh. Changes are noticed from the tables' own statistics on every shard
+  (rows inserted, updated, deleted, and the file a TRUNCATE replaces), so it needs no triggers and
+  follows attached tables. `isomer.analytics_differences` compares it with the query while the
+  sources are unchanged; the certificate runs it.
+
+Things that bit us:
+
+- **A missing row is a row of nulls,** not NULL, once it comes from `jsonb_populate_record`, so
+  `coalesce(new, old)` picked an empty `new` for a delete. `CASE WHEN new IS NULL` is right: a row
+  of nulls IS NULL.
+- **`run_command_on_shards` fills in one `%s`.** A command using the shard's name twice needs
+  `%1$s`.
+- **Columnar storage is its own extension** (`citus_columnar`), which `CREATE EXTENSION citus` no
+  longer creates. New nodes create it; `isomer.control` requires it; an older cluster is told to.
+
+## 2026-10-12 — Managed Postgres providers (FR-A11)
+
+`tests/managed_source.sh` passes. Attach and cutover now run, and are tested, as an ordinary role
+holding only what managed providers grant: it owns its database and tables and may replicate, and
+is not a superuser. `isomer.provider_check(conninfo)` (isomer 0.19.0) recognises the provider from
+the roles each one creates (RDS and Aurora, Cloud SQL, Azure Flexible Server, Supabase, Neon,
+AlloyDB, Crunchy Bridge, and Tiger Cloud, which it refuses), and checks what attach needs there:
+logical decoding on, a role that may replicate (on RDS, membership of `rds_replication`), a free
+slot and WAL sender, the right to create the publication, and, for cutover, ownership of the
+database. A failed check says what to change in that provider's terms (the parameter group on RDS,
+the database flag on Cloud SQL, the project setting on Neon). `isomer.attach` runs it first and
+refuses before creating anything.
+
+Not done, because it needs accounts: running attach and cutover against each real provider in CI
+(Tier 1 is "CI-tested" in the PRD). The test recognises providers by creating their roles on plain
+Postgres; their real limits (RDS's parameter groups, Neon's suspended computes dropping slots) are
+only known from running there.
+
+## 2026-10-12 — Edge replicas (README roadmap)
+
+`tests/edge.sh` passes. `services/edge` (Rust) serves projections from memory, close to users,
+fed by the origin's change feed: it follows `/v1/projections/{name}/live` (the snapshot, then each
+change in commit order), resumes with `Last-Event-ID` after a disconnect, and takes a new snapshot
+if the origin has pruned past its cursor.
+
+- **Access is the origin's.** A client's API key is checked against the origin (the projections
+  its role may read) and cached for 30 seconds, so the edge never widens what a key can read.
+- **Read your writes at the edge.** With `X-Isomer-After: <token>` the edge asks the origin for the
+  feed cursor that reflects the write (`/v1/projections/{name}/cursor`, new: it waits for the token,
+  then returns the newest change id, and the write's change is at or before it because changes are
+  logged in the transaction that applies them), and answers once it has applied the feed that far.
+  The test writes and reads back through the edge five times in a row.
+- The projections need history on: the feed is what the edge follows.
+
+Not built: persistence across an edge restart (it takes a new snapshot), and serving MongoDB from
+the edge.
+
+## 2026-10-12 — Embedding backfills through provider batch APIs, and bundled models (FR-V1a, FR-V1b)
+
+`tests/embed_batch.sh` passes, against the mock provider's new Batch API (isomer 0.18.0).
+
+- **Batches.** A model registered with `batch_api => true` sends a backfill of at least
+  `batch_min_items` jobs to the provider's Batch API (`/v1/files`, `/v1/batches`): one JSONL file
+  of embedding requests, processed within 24 hours at half price at OpenAI and outside the rate
+  limits. `isomer.embed_batch_lease` claims the jobs into a batch and numbers them; the embedder
+  uploads, polls, and hands each result back through `embed_batch_result`; items the provider
+  rejects, and items a failed or expired batch never returned, go back to ordinary requests.
+  Steady-state work never waits for a batch, and the ordinary workers leave a backfill big enough
+  for a batch to it.
+- **A row that changes while its old text is in a batch** must not get the old text's embedding.
+  The job records the hash it was batched with; a result for a job whose hash has moved on is
+  dropped, and the new text goes by ordinary request (it was made ready again by the change).
+- **Bundled models** run on IsomerDB's own key: usage is billed at list price times
+  (1 + `markup`), after the cluster's one-time free allowance (`bundled.free_tokens`).
+  `embedding_usage.billed_usd` is what the customer owes, `cost_usd` what the provider charges;
+  monthly caps count what the customer pays. Metered hourly as `embedding_billed_usd`, which the
+  control plane passes onto invoices.
+
+What bit us: **Postgres takes no row locks in a query with window functions** ("FOR UPDATE is not
+allowed with window functions"), which the first lease did to number the items: it locks first
+now, and numbers after.
+
 ## 2026-10-12 — The cloud control plane (FR-CL1, FR-CL2)
 
 `tests/controlplane.sh` passes on kind. `controlplane/` is the managed service on top of the

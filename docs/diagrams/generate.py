@@ -66,8 +66,8 @@ def containers() -> Diagram:
             desc="MongoDB wire protocol: projections read as collections, causal reads wait for writes."))
     d.add(E("api", "container", "HTTP API", 380, 340, 280, "Rust, axum",
             desc="Documents by key, time travel, change feeds, live streams; admin and usage."))
-    d.add(E("edge", "container", "Edge replicas", 740, 340, 220, status="planned",
-            desc="Projections served close to users, fed by the change feed."))
+    d.add(E("edge", "container", "Edge replicas", 740, 340, 220, "Rust",
+            desc="Projections served from memory close to users, fed by the change feed."))
     d.add(E("ui", "container", "Console and CLI", 990, 340, 300, "TypeScript",
             desc="Lag against budget, drift, alerts, proposals, routes, usage."))
 
@@ -107,7 +107,7 @@ def containers() -> Diagram:
     d.rel(("api", "bottom", x("api", 470)), ("coord", "top", x("coord", 470)), "Queries", "SQL", label_at=0.45)
     d.rel(("ui", "bottom", 0.5), ("api", "bottom", x("api", 610)), "Admin API", "HTTPS",
           via=[(1140, 545), (610, 545)], label_at=0.3)
-    d.rel(("edge", "left", 0.5), ("api", "right", 0.5), "Change feed", status="planned", label_at=0.5,
+    d.rel(("edge", "left", 0.5), ("api", "right", 0.5), "Change feed", label_at=0.5,
           label_dy=-24, label_w=50)
     d.rel(("coord", "right", 0.5), ("workers", "left", 0.5), "Queries, change pulls", "Citus, TLS",
           label_at=0.5, label_dy=-30, label_w=96)
