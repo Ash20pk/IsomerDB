@@ -45,6 +45,39 @@ opt-in setting.
    unmodified as its own import commit on a branch, then re-apply our changes. Update the tables
    above in the same change.
 
+## 2026-10-12 — Jepsen (FR-K4)
+
+`tests/jepsen.sh` runs Jepsen (0.3.14) against the three-node compose cluster from a control
+container, with a nemesis that pauses, kills and network-isolates the workers through the Docker
+socket, a randomly chosen fault every 20 seconds, healed 10 seconds later:
+
+- **append**: Elle list-append over a table distributed in 8 shards, 10 clients, 2–4 operations per
+  transaction (most span shards, so commit is two-phase). Checked against READ COMMITTED (G0, G1a,
+  G1b, G1c) and for lost or phantom appends. Valid over 120s with 2 pauses, 2 kills and 2
+  partitions: 3,344 transactions (2,994 ok, 54 failed, 296 indeterminate), no anomalies.
+- **ryw**: read your writes through a document projection. A client increments a counter, takes
+  `isomer.last_write_token()`, and reads the projection with `SET isomer.read_after`. An answer must
+  show its increment or a later one; "not yet" (IS001) is the allowed alternative. At the end every
+  acknowledged increment must be in the table and the projection must equal recomputation.
+  Valid over 120s with a pause, 4 kills and a partition: 550 increments (7 indeterminate), 497
+  reads answered, 0 stale, 44 explicit "not yet", none lost, no drift.
+
+It found two bugs, both fixed:
+
+- **A cluster hung while a worker was paused or cut off.** Citus caches a connection per worker,
+  and without keepalives a query waiting on one to a node that stopped answering waits until the
+  node returns: ten minutes in the first run, the length of the pause. Node connections now carry
+  `keepalives=1 keepalives_idle=10 keepalives_interval=5 keepalives_count=3 tcp_user_timeout=20000`
+  (image config, and the operator's `citus.node_conninfo`), so such a query fails within about 20s.
+- **Read-your-writes did not wait for writes to a worker's shards.** `isomer.last_write_token()` is
+  set by the capture trigger, which on a multi-node cluster runs in the worker's backend, so the
+  client's session never had a token and `read_after` did nothing: 11 stale reads in the first run.
+  `isomer_router` now sets the session's token from the coordinator's clock after every top-level
+  write to a table with capture triggers. `tests/multinode.sh` covers it.
+
+Not covered yet: faults on the coordinator itself (the operator's failover is tested on kind
+instead), clock skew, and the MongoDB wire path.
+
 ## 2026-10-12 — Usage metering (FR-CL2)
 
 `tests/metering.sh` passes. Every minute `isomer.meter()` (isomer 0.14.0) samples into
