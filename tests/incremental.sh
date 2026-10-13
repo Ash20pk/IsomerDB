@@ -63,6 +63,12 @@ INSERT INTO ic.lines SELECT 1 + g / 4, g % 4, 1 + g % 120, 1 + g % 5, (g % 19) +
 FROM generate_series(1, 20000) g;
 INSERT INTO ic.customers SELECT g, 'customer ' || g, CASE WHEN g % 3 = 0 THEN 'gold' ELSE 'std' END FROM generate_series(1, 400) g;
 INSERT INTO ic.orders SELECT g, 1 + g % 350, g % 41, g % 4 <> 0 FROM generate_series(1, 4000) g;
+CREATE TABLE ic.notes (customer_id bigint, body text);   -- no primary key
+-- Plain tables, not sharded: what a sync incremental projection reads.
+CREATE TABLE ic.shelf (id int PRIMARY KEY, aisle int NOT NULL);
+CREATE TABLE ic.stock (shelf_id int NOT NULL, sku int NOT NULL, qty int NOT NULL, PRIMARY KEY (shelf_id, sku));
+INSERT INTO ic.shelf SELECT g, 1 + g % 8 FROM generate_series(1, 200) g;
+INSERT INTO ic.stock SELECT 1 + g % 200, g, 1 + g % 7 FROM generate_series(1, 5000) g;
 ANALYZE ic.categories, ic.products, ic.lines, ic.customers, ic.orders;
 SQL
 
@@ -84,11 +90,15 @@ contains "lines joined to products by product: incremental (a repartition per ke
   "$($ISO -c "SELECT strategy || '|' || reason FROM isomer.choose_strategy('SELECT p.id, sum(l.qty) AS value FROM ic.lines l JOIN ic.products p ON p.id = l.product_id GROUP BY p.id', 'id', 'cache', 'bounded', '{\"ic.lines\": \"product_id\", \"ic.products\": \"id\"}')")"
 contains "per-order totals on the order's own shard: key recompute (cheap)" "recompute|" \
   "$($ISO -c "SELECT strategy || '|' FROM isomer.choose_strategy('SELECT l.order_id, sum(l.qty) AS value FROM ic.lines l GROUP BY l.order_id', 'order_id', 'cache', 'bounded', '{\"ic.lines\": \"order_id\"}')")"
-contains "a nested document (jsonb_agg) is not decomposable" "recompute|incremental maintenance does not apply: it uses the aggregate jsonb_agg" \
-  "$($ISO -c "SELECT strategy || '|' || reason FROM isomer.choose_strategy('SELECT o.customer_id, jsonb_build_object(''ids'', jsonb_agg(o.id)) AS doc FROM ic.orders o GROUP BY o.customer_id', 'customer_id', 'document', 'bounded', '{\"ic.orders\": \"customer_id\"}')")"
+contains "a nested document (jsonb_agg) fits, kept as written" "incremental|no key mappings were given" \
+  "$($ISO -c "SELECT strategy || '|' || reason FROM isomer.choose_strategy('SELECT o.customer_id, jsonb_build_object(''ids'', jsonb_agg(o.id)) AS doc FROM ic.orders o GROUP BY o.customer_id', 'customer_id', 'document')")"
+contains "but not over a table with no primary key to tell its rows apart" "ic.notes has no primary key" \
+  "$($ISO -c "SELECT reason FROM isomer.choose_strategy('SELECT n.customer_id, jsonb_build_object(''notes'', jsonb_agg(n.body)) AS doc FROM ic.notes n GROUP BY n.customer_id', 'customer_id', 'document')")"
+contains "a volatile grouping expression is refused" "groups by a volatile expression" \
+  "$($ISO -c "SELECT reason FROM isomer.choose_strategy('SELECT (random() * 3)::int AS b, count(*) AS value FROM ic.orders o GROUP BY 1', 'b', 'cache')")"
 contains "a join landing on a non-unique column is refused, with the reason" "not a unique key there" \
   "$($ISO_NOFAIL -c "SELECT isomer.create_projection('ic_bad', 'SELECT p.category_id, sum(p.id) AS value FROM ic.products p JOIN ic.lines l ON l.product_id = p.id GROUP BY p.category_id', 'cache', 'category_id', strategy => 'incremental')" 2>&1)"
-contains "sync and incremental don't mix" "cannot be both sync and incremental" \
+contains "sync and incremental: refused over sharded tables, with the reason" "a statement across its shards runs their triggers over parallel connections" \
   "$($ISO_NOFAIL -c "SELECT isomer.create_projection('ic_bad', \$q\$$CAT_SALES\$q\$, 'document', 'id', freshness => 'sync', strategy => 'incremental')" 2>&1)"
 
 echo "== FR-P6 a projection aggregating a sharded table through two joins"
@@ -117,6 +127,47 @@ expect "the new category has the moved products' sales" \
 expect "MongoDB clients read the same document" \
   "$($ISO -c "SELECT (isomer.get('ic_cat_sales', '2') ->> 'revenue')::numeric::float8")" \
   "$("${MONGO[@]}" --eval 'print(db.getSiblingDB("isomer").ic_cat_sales.findOne({_id: 2}).revenue)' 2>&1 | tail -1)"
+
+echo "== nested documents, DISTINCT, grouping expressions"
+# Each customer with their orders, newest first: jsonb_agg kept as written over a copy of orders.
+CUST_DOCS='SELECT c.id, jsonb_build_object('"'"'name'"'"', c.name, '"'"'orders'"'"',
+    coalesce(jsonb_agg(jsonb_build_object('"'"'id'"'"', o.id, '"'"'total'"'"', o.total) ORDER BY o.id DESC) FILTER (WHERE o.id IS NOT NULL), '"'"'[]'"'"'),
+    '"'"'paid_states'"'"', count(DISTINCT o.paid)) AS doc
+  FROM ic.customers c LEFT JOIN ic.orders o ON o.customer_id = c.id GROUP BY c.id'
+contains "customers with their orders nested" "maintained incrementally" \
+  "$($ISO -c "SELECT isomer.create_projection('ic_cust_docs', \$q\$$CUST_DOCS\$q\$, 'document', 'id')")"
+expect "it equals the query" "0" "$(drift ic_cust_docs)"
+# Each order's lines with their product and category (read from the joined tables), DISTINCT over
+# the lines' own column and over a joined one.
+ORDER_DOCS='SELECT l.order_id, jsonb_build_object(
+    '"'"'lines'"'"', jsonb_agg(jsonb_build_object('"'"'line'"'"', l.line, '"'"'product'"'"', p.title, '"'"'category'"'"', c.name, '"'"'qty'"'"', l.qty) ORDER BY l.line),
+    '"'"'products'"'"', count(DISTINCT l.product_id), '"'"'categories'"'"', count(DISTINCT p.category_id), '"'"'units'"'"', sum(l.qty)) AS doc
+  FROM ic.lines l JOIN ic.products p ON p.id = l.product_id JOIN ic.categories c ON c.id = p.category_id GROUP BY l.order_id'
+contains "orders with their lines nested" "maintained incrementally" \
+  "$($ISO -c "SELECT isomer.create_projection('ic_order_docs', \$q\$$ORDER_DOCS\$q\$, 'document', 'order_id', strategy => 'incremental')")"
+expect "it equals the query" "0" "$(drift ic_order_docs)"
+expect "each kind of aggregate is kept as it needs" "keep,distinct,keep,sum" \
+  "$($ISO -c "SELECT string_agg(g ->> 'cls', ',' ORDER BY (g ->> 'i')::int) FROM isomer.engine_plans e, jsonb_array_elements(e.plan -> 'aggs') g WHERE e.projection = 'ic_order_docs'")"
+contains "grouped by an expression, with a median" "maintained incrementally" \
+  "$($ISO -c "SELECT isomer.create_projection('ic_status', 'SELECT upper(l.status) AS status, jsonb_build_object(''lines'', count(*), ''median_price'', percentile_disc(0.5) WITHIN GROUP (ORDER BY l.price), ''products'', count(DISTINCT l.product_id)) AS value FROM ic.lines l GROUP BY upper(l.status)', 'cache', 'status', strategy => 'incremental')")"
+expect "it equals the query" "0" "$(drift ic_status)"
+$ISO -c "UPDATE ic.orders SET total = total + 1 WHERE customer_id = 7" -c "DELETE FROM ic.orders WHERE customer_id = 8 AND id % 2 = 0" \
+     -c "UPDATE ic.products SET title = 'retitled' WHERE id = 3" -c "UPDATE ic.lines SET status = 'held' WHERE order_id = 10" >/dev/null
+eventually "nested orders follow writes" "0" "drift ic_cust_docs"
+eventually "nested lines follow a joined table's change" "0" "drift ic_order_docs"
+eventually "a new group appears under its expression" "1" "$ISO -c \"SELECT count(*) FROM public.ic_status WHERE status = 'HELD'\""
+contains "the certificate names the rule for aggregates kept as written" "kept as written" "$($ISO -c "SELECT isomer.certificate('ic_order_docs') -> 'rules'")"
+echo "== sync incremental"
+STOCK='SELECT s.aisle, jsonb_build_object('"'"'units'"'"', sum(k.qty), '"'"'skus'"'"', count(DISTINCT k.sku), '"'"'fullest'"'"', max(k.qty)) AS doc
+  FROM ic.stock k JOIN ic.shelf s ON s.id = k.shelf_id GROUP BY s.aisle'
+contains "stock per aisle, sync and incremental" "(sync), maintained incrementally" \
+  "$($ISO -c "SELECT isomer.create_projection('ic_sync', \$q\$$STOCK\$q\$, 'document', 'aisle', freshness => 'sync', strategy => 'incremental')")"
+expect "a write is in the document before the transaction ends" "t" \
+  "$($ISO -c "BEGIN" -c "INSERT INTO ic.stock VALUES (1, 900001, 50)" -c "SELECT (isomer.get('ic_sync', '2') ->> 'units')::int = (SELECT sum(k.qty) FROM ic.stock k JOIN ic.shelf s ON s.id = k.shelf_id WHERE s.aisle = 2)" -c "ROLLBACK" | tail -1)"
+$ISO -c "UPDATE ic.shelf SET aisle = 3 WHERE id BETWEEN 1 AND 20" >/dev/null
+expect "a joined table's change, the moment it commits" "0" "$(drift ic_sync)"
+$ISO -c "UPDATE ic.stock SET qty = qty + 1 WHERE sku % 3 = 0" -c "DELETE FROM ic.stock WHERE sku % 11 = 0" >/dev/null
+expect "statements touching every aisle, the moment they commit" "0" "$(drift ic_sync)"
 
 echo "== read your writes"
 CAT=$($ISO -c "SELECT category_id FROM ic.products WHERE id = 5")
@@ -180,11 +231,15 @@ pids=()
 for w in 1 2 3 4; do $ISO -c "CALL public.ic_writer($w, 150)" >/dev/null & pids+=($!); done
 for pid in "${pids[@]}"; do wait "$pid" || fail "a writer failed" "exit 0" "exit $?"; done
 eventually "after 600 concurrent transactions, every key equals the query" "0" "drift ic_cat_sales" 60
+eventually "and every nested order" "0" "drift ic_order_docs" 60
+eventually "and every expression group" "0" "drift ic_status" 60
+
 
 echo "== TRUNCATE rebuilds the state"
 $ISO -c "TRUNCATE ic.orders" -c "INSERT INTO ic.orders VALUES (1, 1, 10, true), (2, 2, 20, false)" >/dev/null
 eventually "the LEFT JOIN cache after a truncate" "0" "drift ic_cust_orders"
 eventually "the global aggregate after a truncate" "0" "drift ic_totals"
+eventually "the nested orders after a truncate" "0" "drift ic_cust_docs"
 expect "two orders remain" "2" "$($ISO -c "SELECT isomer.get('ic_totals', 'all') ->> 'orders'")"
 
 echo "== FR-S5 the certificate names the rules"

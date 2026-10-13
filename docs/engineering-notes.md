@@ -45,6 +45,49 @@ opt-in setting.
    unmodified as its own import commit on a branch, then re-apply our changes. Update the tables
    above in the same change.
 
+## 2026-10-13 — Incremental maintenance for more queries: nested documents, DISTINCT, grouping expressions, sync (FR-P6)
+
+`tests/incremental.sh` passes on one node and on the three-node cluster (isomer 0.21.0).
+
+- **Aggregates kept as written.** jsonb_agg, string_agg, array_agg, ordered aggregates,
+  percentiles: anything that doesn't decompose into sums, counts or a multiset. The aggregated
+  table's primary key and every column the aggregate reads become grouped columns of its partial
+  aggregates, so the state holds one row per row of that table, and the derivation runs the
+  aggregate as written over the same rows the tables would give (`_engine_sql` keeps an aggregate
+  whose template is NULL, and leaves it out of the fact statements). It may read the joined
+  tables: an order's lines with each product's title and category, kept from the joined tables'
+  state. The state is as large as the rows the aggregate reads, which is what the documents hold
+  anyway. A table with no primary key is refused with that reason.
+- **DISTINCT.** count, sum and avg (DISTINCT c) over a column of the aggregated table add c to the
+  grouped columns, so each partial row is one value of c in its group, counting while any row holds
+  it: `count(DISTINCT c) FILTER (WHERE __cN > 0)` over the partial rows. Over a joined table's
+  column they are kept as written (which is decided once the aggregated table is known).
+- **Grouping expressions** (`GROUP BY upper(status)`, `date_trunc(...)`): the columns they read are
+  grouped columns of the partial aggregates, and the derivation groups by the expression. Volatile
+  ones are refused.
+- **Sync** (`freshness => 'sync', strategy => 'incremental'`): a statement-level trigger folds the
+  statement's deltas and applies the keys they reach before the statement returns. Folds of one
+  projection are serialised by a lock held to commit, so writers to its tables take turns. The
+  tables must be plain tables: a statement across a sharded table's shards runs their triggers
+  over parallel connections of one distributed transaction, which can't take turns on one state
+  (each waits for the others to commit; Citus cancelled it as a distributed deadlock, found by the
+  test's statement across every shard), and on a cluster the shards' deltas reach the coordinator
+  only after they commit. Tables Citus manages on the coordinator alone are fine.
+
+Things that bit us:
+
+- **Grouped columns inside a grouping expression were added to GROUP BY.** The compiler adds
+  columns that are functionally dependent on a grouped primary key, since the state relations have
+  none. It looked at the flattened target list, where the column inside `date_trunc('day',
+  placed_at)` looked ungrouped, so the derivation grouped by placed_at too and returned a row per
+  timestamp. On Postgres 18 a grouped expression in the target list is a reference to the grouping
+  step; only bare table columns are read without being grouped.
+
+Not changed: correlated subqueries (`(SELECT jsonb_agg(...) FROM orders o WHERE o.customer_id =
+c.id)`) are re-derived by key. Re-deriving one customer's orders reads only that customer's rows,
+so key recompute is already the cheap strategy for them; the same document written with a join
+and GROUP BY is maintained incrementally.
+
 ## 2026-10-13 — Edge replicas: a copy on disk, and MongoDB (README roadmap)
 
 `tests/edge.sh` passes, with the new checks below.

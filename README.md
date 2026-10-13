@@ -211,6 +211,8 @@ SELECT isomer.create_projection(name => 'category_sales', kind => 'document', ke
   query => $$ SELECT c.id, jsonb_build_object('name', c.name, 'units', sum(l.qty), 'revenue', sum(l.qty * l.price)) AS doc
               FROM order_lines l JOIN products p ON p.id = l.product_id JOIN categories c ON c.id = p.category_id
               GROUP BY c.id $$);
+-- Nested documents written with a join and GROUP BY are maintained incrementally too: jsonb_agg
+-- and other aggregates that don't decompose run as written over a copy of the rows they read.
 SELECT strategy, strategy_reason FROM isomer.projections;   -- what was chosen, and why
 SELECT * FROM isomer.strategy_advice();
 
@@ -346,7 +348,7 @@ coordinator, and on every node's clock. They have found and fixed three bugs so 
 
 | Area | Not built yet | PRD |
 |---|---|---|
-| Projections | Incremental state sharded across nodes (it is kept on the coordinator); incremental maintenance of nested documents (`jsonb_agg`), `DISTINCT` aggregates and sync freshness | FR-P6 |
+| Projections | Incremental state sharded across nodes (it is kept on the coordinator); correlated subqueries are re-derived by key (the same document written with a join and `GROUP BY` is maintained incrementally) | FR-P6 |
 | Projections | Analytics projections maintained incrementally (they are rebuilt in full when their sources change) | Later |
 | Adoption | Attach and cutover run against each real managed provider in CI: the provider check and a run as a non-superuser role are done, real providers need their accounts | FR-A11 |
 | Cloud | Charging cards (invoices are computed, collecting payment needs a payment provider account); regions in other clouds run for real | FR-CL1, CL2 |

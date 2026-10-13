@@ -626,6 +626,32 @@ isomer_engine_analyze(PG_FUNCTION_ARGS)
 			json_str(&b, format_type_be(a->aggtype));
 			appendStringInfoString(&b, ",\"rtis\":");
 			json_rtis(&b, rtis);
+			/* The argument, when it is a plain column (count(DISTINCT c) keeps c's values). */
+			appendStringInfoString(&b, ",\"argcol\":");
+			if (list_length(a->args) == 1)
+				json_colref(&b, q, (Node *) ((TargetEntry *) linitial(a->args))->expr);
+			else
+				appendStringInfoString(&b, "null");
+			/* Every column it reads: arguments, ORDER BY keys, FILTER, direct arguments. */
+			appendStringInfoString(&b, ",\"cols\":[");
+			{
+				ListCell   *lv;
+				bool		f3 = true;
+				List	   *vs = list_concat(list_concat(vars_of((Node *) a->args, false),
+														 vars_of((Node *) a->aggfilter, false)),
+											 vars_of((Node *) a->aggdirectargs, false));
+
+				foreach(lv, vs)
+				{
+					if (colname(q, lfirst(lv)) == NULL)
+						continue;
+					if (!f3)
+						appendStringInfoChar(&b, ',');
+					f3 = false;
+					json_colref(&b, q, lfirst(lv));
+				}
+			}
+			appendStringInfoChar(&b, ']');
 			appendStringInfoChar(&b, '}');
 		}
 	}
@@ -654,6 +680,9 @@ isomer_engine_analyze(PG_FUNCTION_ARGS)
 	appendStringInfoChar(&b, ']');
 	json_key(&b, &first, "group_expr");
 	appendStringInfoString(&b, group_expr ? "true" : "false");
+	json_key(&b, &first, "group_volatile");
+	appendStringInfoString(&b, grp && contain_volatile_functions((Node *) rt_fetch(grp, q->rtable)->groupexprs)
+						   ? "true" : "false");
 
 	/* Columns read outside aggregates (grouping, output, HAVING). */
 	nonagg = list_concat(vars_of(flatten_group(q, (Node *) q->targetList), true),
@@ -696,6 +725,10 @@ isomer_engine_analyze(PG_FUNCTION_ARGS)
 			json_str(&b, format_type_be(exprType((Node *) tle->expr)));
 			appendStringInfoString(&b, ",\"col\":");
 			json_colref(&b, q, flatten_group(q, (Node *) tle->expr));
+			appendStringInfo(&b, ",\"grouped\":%s",
+							 tle->ressortgroupref != 0
+							 && get_sortgroupref_clause_noerr(tle->ressortgroupref, q->groupClause) != NULL
+							 ? "true" : "false");
 			appendStringInfoChar(&b, '}');
 		}
 	}
@@ -861,6 +894,7 @@ group_dependent_columns(Query *q)
 	List	   *vars;
 	ListCell   *lc;
 	Index		maxref = 0;
+	int			grp = group_rti(q);
 
 	if (q->groupClause == NIL)
 		return;
@@ -872,8 +906,12 @@ group_dependent_columns(Query *q)
 	}
 	foreach(lc, q->targetList)
 		maxref = Max(maxref, ((TargetEntry *) lfirst(lc))->ressortgroupref);
-	vars = list_concat(vars_of(flatten_group(q, (Node *) q->targetList), true),
-					   vars_of(flatten_group(q, q->havingQual), true));
+	/*
+	 * Grouped expressions in the target list and HAVING are references to the grouping step
+	 * (Postgres 18); a column read inside one is grouped through it. Only the table columns
+	 * left over are read without being grouped.
+	 */
+	vars = list_concat(vars_of((Node *) q->targetList, true), vars_of(q->havingQual, true));
 	foreach(lc, vars)
 	{
 		Var		   *v = (Var *) lfirst(lc);
@@ -881,6 +919,9 @@ group_dependent_columns(Query *q)
 		SortGroupClause *sgc;
 		ListCell   *lg;
 		bool		found = false;
+
+		if (grp > 0 && v->varno == grp)
+			continue;
 
 		foreach(lg, grouped)
 		{
@@ -978,11 +1019,19 @@ isomer_engine_sql(PG_FUNCTION_ARGS)
 			{
 				Oid			factrel;
 
-				if (i >= ntmpls || tmpls_null[i])
+				if (i >= ntmpls)
 					elog(ERROR, "isomer: no replacement given for aggregate %d", i);
 				factrel = rt_fetch(fact, q->rtable)->relid;
-				ctx.replacements = lappend(ctx.replacements,
-										   analyze_template(TextDatumGetCString(tmpls[i]), factrel, fact));
+				/*
+				 * No template: the aggregate is kept as written. Its state is a copy of every fact
+				 * row it reads (the fact's key is among the kept columns), so it runs over the
+				 * same rows as over the tables.
+				 */
+				if (tmpls_null[i])
+					ctx.replacements = lappend(ctx.replacements, copyObject(a));
+				else
+					ctx.replacements = lappend(ctx.replacements,
+											   analyze_template(TextDatumGetCString(tmpls[i]), factrel, fact));
 			}
 			i++;
 		}
@@ -1039,6 +1088,13 @@ isomer_engine_sql(PG_FUNCTION_ARGS)
 				: (Expr *) makeBoolConst(true, false);
 			Expr	   *filter = a->aggfilter ? a->aggfilter : (Expr *) makeBoolConst(true, false);
 			Node	   *bare = strip_relabel((Node *) arg);
+
+			/* An aggregate kept as written (a NULL template) needs no partial aggregate. */
+			if (i < ntmpls && tmpls_null[i])
+			{
+				i++;
+				continue;
+			}
 
 			/*
 			 * count(t.*) counts the rows of t: a whole-row value is never null for a row that
