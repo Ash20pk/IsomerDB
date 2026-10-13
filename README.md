@@ -63,7 +63,7 @@ for billing, and pages on-call when a projection drifts or falls behind its lag 
 | **Embedder** | Computes embeddings for vector projections, from a hosted API or bge-small on its own CPU. | Built |
 | **Kubernetes operator** | Provisions and scales clusters, fails over to standbys, backs up and restores to a point in time, rolls upgrades, issues node certificates. | Built |
 | **Cloud control plane** | Managed IsomerDB: a sign-up page, regions, plans, provisioning through the operator, usage collected from each cluster and priced on invoices. | Built |
-| **Edge replicas** | Projections served from memory close to users, fed by the change feed; access and read-your-writes as at the origin. | Built |
+| **Edge replicas** | Projections served from memory close to users, over HTTP and MongoDB, fed by the change feed and kept on disk across restarts; access and read-your-writes as at the origin. | Built |
 
 ### Level 3: inside the coordinator
 
@@ -347,7 +347,7 @@ coordinator, and on every node's clock. They have found and fixed three bugs so 
 | Area | Not built yet | PRD |
 |---|---|---|
 | Projections | Incremental state sharded across nodes (it is kept on the coordinator); incremental maintenance of nested documents (`jsonb_agg`), `DISTINCT` aggregates and sync freshness | FR-P6 |
-| Projections | Analytics projections maintained incrementally (they are rebuilt in full when their sources change); an edge replica that keeps its copy across restarts and speaks MongoDB | Later |
+| Projections | Analytics projections maintained incrementally (they are rebuilt in full when their sources change) | Later |
 | Adoption | Attach and cutover run against each real managed provider in CI: the provider check and a run as a non-superuser role are done, real providers need their accounts | FR-A11 |
 | Cloud | Charging cards (invoices are computed, collecting payment needs a payment provider account); regions in other clouds run for real | FR-CL1, CL2 |
 | Product | Trademark clearance, ParadeDB HA licensing, design partners | PRD §15 |

@@ -309,9 +309,10 @@ async fn list_projections(State(app): State<Shared>, headers: HeaderMap) -> ApiR
     let db = app.pool.get().await?;
     let row = db
         .query_one(
-            "SELECT coalesce(jsonb_agg(jsonb_build_object('name', name, 'kind', kind, 'freshness', freshness,
-                                                          'history', history::text)), '[]')
-             FROM isomer.api_projections($1::text::name)",
+            "SELECT coalesce(jsonb_agg(jsonb_build_object('name', a.name, 'kind', a.kind, 'freshness', a.freshness,
+                                                          'history', a.history::text, 'database', p.mongo_database,
+                                                          'history_since', p.history_since) ORDER BY a.name), '[]')
+             FROM isomer.api_projections($1::text::name) a JOIN isomer.projections p ON p.name = a.name",
             &[&role],
         )
         .await?;

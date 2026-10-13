@@ -99,8 +99,10 @@ services:
     volumes:
       - ./tests/mockhooks/server.py:/srv/server.py:ro
 
-  # An edge replica: projections served from memory, fed by the API's change feed. Projections it
-  # serves need history on (isomer.set_history), and ISOMER_EDGE_KEY an API key that may read them:
+  # An edge replica: projections served from memory, fed by the API's change feed, kept on disk
+  # across restarts, over HTTP (8081) and MongoDB (27018, the API key as the password with
+  # authMechanism=PLAIN; set ISOMER_EDGE_TLS_CERT/KEY for TLS). Projections it serves need history
+  # on (isomer.set_history), and ISOMER_EDGE_KEY an API key that may read them:
   #   ISOMER_EDGE_KEY=... ISOMER_EDGE_PROJECTIONS=customer_card docker compose --profile edge up -d edge
   edge:
     build:
@@ -113,8 +115,17 @@ services:
       ISOMER_ORIGIN: http://api:8080
       ISOMER_ORIGIN_KEY: ${ISOMER_EDGE_KEY:-}
       ISOMER_EDGE_PROJECTIONS: ${ISOMER_EDGE_PROJECTIONS:-}
+      ISOMER_EDGE_DATA_DIR: /var/lib/isomer-edge
+      ISOMER_EDGE_MONGO_LISTEN: 0.0.0.0:27017
+      ISOMER_EDGE_TLS_CERT: ${ISOMER_EDGE_TLS_CERT:-}
+      ISOMER_EDGE_TLS_KEY: ${ISOMER_EDGE_TLS_KEY:-}
+      # Local development only: without TLS, API keys cross the network in the clear.
+      ISOMER_EDGE_MONGO_PLAINTEXT: ${ISOMER_EDGE_MONGO_PLAINTEXT:-1}
+    volumes:
+      - edgedata:/var/lib/isomer-edge
     ports:
       - "8081:8081"
+      - "27018:27017"
 
   # Citus worker nodes, for multi-node clusters:
   #   docker compose --profile cluster up -d   then   SELECT isomer.add_node('worker1');
@@ -169,3 +180,4 @@ volumes:
   pgsocket:
   worker1data:
   worker2data:
+  edgedata:

@@ -45,6 +45,53 @@ opt-in setting.
    unmodified as its own import commit on a branch, then re-apply our changes. Update the tables
    above in the same change.
 
+## 2026-10-13 — Edge replicas: a copy on disk, and MongoDB (README roadmap)
+
+`tests/edge.sh` passes, with the new checks below.
+
+- **A copy on disk** (`ISOMER_EDGE_DATA_DIR`, `services/edge/src/store.rs`). Each projection has
+  `snapshot.json` (every document and the cursor they are as of) and `log.jsonl` (each change
+  applied since). A change is appended as it is applied and the log is synced once per batch the
+  origin sends. A crash that loses the log's tail only moves the cursor back, and changes are
+  keyed upserts and deletes, so applying them again is harmless; a torn last line is cut off on
+  restore. Once the log holds 10,000 changes and more than the snapshot has documents, it is
+  folded into a new snapshot (written aside, then renamed over the old). A restarted edge serves
+  the copy at once and resumes the feed from its cursor: the test stops it, writes, starts it, and
+  sees the write arrive without a new snapshot.
+- **Which copy is valid.** A feed cursor means nothing across incarnations of a projection: one
+  dropped and created again keeps its name but starts a new history, and the old cursor would
+  replay the new feed on top of stale documents that are never deleted. The snapshot records the
+  origin and when the projection's history was turned on (`history_since`, now in the API's
+  projection listing, with the MongoDB database); a copy from anything else is discarded. The
+  test recreates the projection with fewer rows while the edge is down, and the rows that are
+  gone are gone at the edge too.
+- **MongoDB** (`ISOMER_EDGE_MONGO_LISTEN`, `services/edge/src/mongo.rs`, `query.rs`). The edge
+  speaks the wire protocol (OP_MSG, and OP_QUERY for the legacy handshake) as a read-only
+  standalone server. find (filters, sort, skip, limit, projection, batches and getMore), count,
+  distinct, aggregate ($match, $sort, $skip, $limit, $project, $count, $group with $sum, $avg,
+  $min, $max, $first, $last, $push, $addToSet), listCollections, listDatabases. Filters follow
+  MongoDB's semantics over the JSON documents: arrays match by element, numbers by value whatever
+  their width, comparisons only within a type, `{f: null}` matches a missing field; $eq, $ne, $gt,
+  $gte, $lt, $lte, $in, $nin, $exists, $regex, $size, $all, $elemMatch, $not, $and, $or, $nor. A
+  filter on `_id` is a lookup by key. Anything else is refused with "send this query to the
+  origin" rather than answered differently; writes are refused naming the origin.
+- **Authentication is the origin's.** The password is an IsomerDB API key, sent with SASL PLAIN
+  (`authMechanism=PLAIN&authSource=$external`), checked against the origin like a bearer token;
+  a collection is visible only if the key's role may read the projection. SCRAM can't work: the
+  edge never holds a password's verifier, and a client that tries it is told what to use. PLAIN
+  sends the key as it is, so the listener takes TLS and refuses to start without it unless
+  `ISOMER_EDGE_MONGO_PLAINTEXT=1` (compose sets it for local development).
+- **Read your writes over MongoDB.** A causally consistent session sends
+  `readConcern.afterClusterTime`. The edge turns the timestamp back into the write token
+  (the inverse of `isomer.token_to_mongo_timestamp`) and waits as `X-Isomer-After` does. The test
+  writes at the origin, advances a session to the write's timestamp, and reads it back at the
+  edge three times in a row.
+- Events (event projections) in the feed only move the cursor; they were stored as documents
+  before.
+
+Not built: the edge keeps no key's access on disk, so after a restart it serves only once the
+origin's API answers who a key is; that is deliberate (a revoked key must stop working).
+
 ## 2026-10-13 — The sign-up page (FR-CL1)
 
 The control plane serves a page at `/`: a team signs up or logs in, creates a cluster in a region
@@ -176,8 +223,7 @@ if the origin has pruned past its cursor.
   The test writes and reads back through the edge five times in a row.
 - The projections need history on: the feed is what the edge follows.
 
-Not built: persistence across an edge restart (it takes a new snapshot), and serving MongoDB from
-the edge.
+Persistence across restarts and MongoDB were added on 2026-10-13 (below).
 
 ## 2026-10-12 — Embedding backfills through provider batch APIs, and bundled models (FR-V1a, FR-V1b)
 
