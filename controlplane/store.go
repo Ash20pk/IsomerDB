@@ -159,6 +159,13 @@ func (s *Store) Login(ctx context.Context, email, password string) (string, erro
 	return token, err
 }
 
+// Revoke deletes an API token (logging out).
+func (s *Store) Revoke(ctx context.Context, token string) error {
+	sum := sha256.Sum256([]byte(token))
+	_, err := s.db.Exec(ctx, "DELETE FROM tokens WHERE hash = $1", hex.EncodeToString(sum[:]))
+	return err
+}
+
 // Caller is who a request comes from.
 type Caller struct {
 	UserID int64

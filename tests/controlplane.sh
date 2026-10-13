@@ -88,6 +88,11 @@ expect "logging in gives another token for the same team" "acme-$RUN" "$(call GE
 expect "a wrong password is refused" "401" \
   "$(call POST /v1/tokens "$(login "ops-$RUN@acme.test" "wrong wrong wrong")" | cut -d' ' -f1)"
 expect "no token, no clusters" "401" "$(call GET /v1/clusters | cut -d' ' -f1)"
+expect "logging out revokes that token" "204 401" \
+  "$(call DELETE /v1/tokens/current '' "$LOGIN" | cut -d' ' -f1) $(call GET /v1/me '' "$LOGIN" | cut -d' ' -f1)"
+page=$(curl -sS -D - "http://localhost:$PORT/")
+contains "the sign-up page is served" "Create your account" "$(curl -sS "http://localhost:$PORT/app.js")"
+contains "under a content security policy" "default-src 'self'" "$page"
 contains "regions are listed" "local-1" "$(call GET /v1/regions)"
 contains "plans are listed with prices" "nodeHourUSD" "$(call GET /v1/plans)"
 
@@ -143,4 +148,8 @@ eventually "and its IsomerCluster is gone" "" "kubectl -n $NS get isomer -o name
 expect "it is no longer listed" "200 []" "$(call GET /v1/clusters '' "$TOKEN")"
 expect "but the time it ran is still billed" "t" \
   "$(call GET "/v1/invoices/$MONTH" '' "$TOKEN" | json '"t" if any(l["cluster"] == "app" for l in d["lines"]) else "f"')"
+echo "== sign-up and log-in attempts are limited per address"
+codes=""
+for _ in $(seq 1 12); do codes="$codes $(call POST /v1/tokens "$(login "nobody-$RUN@acme.test" "wrong wrong wrong")" | cut -d' ' -f1)"; done
+contains "a burst of failed log-ins is cut off" "429" "$codes"
 echo "controlplane: all checks passed"

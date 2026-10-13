@@ -8,6 +8,7 @@ COPY controlplane/go.mod controlplane/go.sum controlplane/
 RUN cd controlplane && go mod download
 COPY operator/api operator/api
 COPY controlplane/*.go controlplane/
+COPY controlplane/web controlplane/web
 RUN cd controlplane && CGO_ENABLED=0 go build -trimpath -o /controlplane .
 
 FROM gcr.io/distroless/static-debian12:nonroot

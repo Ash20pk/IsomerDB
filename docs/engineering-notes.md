@@ -45,6 +45,31 @@ opt-in setting.
    unmodified as its own import commit on a branch, then re-apply our changes. Update the tables
    above in the same change.
 
+## 2026-10-13 — The sign-up page (FR-CL1)
+
+The control plane serves a page at `/`: a team signs up or logs in, creates a cluster in a region
+on a plan (the plan's size and its monthly price as created are shown before creating), reads its
+connection strings once it is ready, scales it, deletes it after typing its name, and sees this
+month's invoice. It is plain JavaScript in `controlplane/web`, compiled into the binary with
+`go:embed`, on the API's own origin, so it calls the same public API and needs no CORS. It builds
+the page from text nodes only, never HTML from the server, under a content security policy that
+allows nothing but its own origin.
+
+- **The token** is kept in `sessionStorage` and revoked on log out (`DELETE /v1/tokens/current`,
+  new), so closing the tab or logging out ends it.
+- **Sign-up and log-in are rate limited** per client address: a burst of 10, then one every 6
+  seconds. Behind a proxy, `CP_CLIENT_IP_HEADER` names the header carrying the client's address.
+- Checked in Chrome through Playwright against the control plane on kind: sign up, create and
+  delete a cluster, log out, a wrong password, log back in, at desktop and phone widths, light and
+  dark. `tests/controlplane.sh` checks the page is served under its policy, that log out revokes,
+  and that a burst of failed log-ins is cut off.
+
+What bit us: **a `pattern` attribute is compiled with the `v` flag,** under which an unescaped `-`
+at the end of a character class is a syntax error; the name field's pattern escapes it.
+
+Not built: email verification (it needs a mail provider), and the console's operator views are
+still a separate app (`clients/console`) run against a cluster's own API.
+
 ## 2026-10-12 — Jepsen: coordinator faults, clock skew, MongoDB, incremental projections (FR-K4)
 
 `tests/jepsen.sh` now covers what the first Jepsen entry below left out:
@@ -208,9 +233,8 @@ What bit us: **macOS's `/bin/bash` 3.2 mangles escaped quotes nested inside `"$(
 second sign-up arrived as a JSON string instead of an object. Request bodies are now built with
 `printf` first.
 
-Not built: a sign-up page (the API is the interface), payment collection (invoices are computed;
-charging a card needs a payment provider account), and regions in other clouds (any kubeconfig
-works, none has been run).
+Not built: payment collection (invoices are computed; charging a card needs a payment provider
+account), and regions in other clouds (any kubeconfig works, none has been run).
 
 ## 2026-10-12 — Incremental maintenance across shards (FR-P6, FR-S5) and the strategy chooser (FR-S7)
 

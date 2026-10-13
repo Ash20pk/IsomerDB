@@ -27,8 +27,9 @@ func newAPI(cfg Config, store *Store, rs regions, col *collector, adminToken str
 	a := &api{cfg: cfg, store: store, regions: rs, collector: col, adminToken: adminToken, log: log}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNoContent) })
-	mux.HandleFunc("POST /v1/signup", a.signup)
-	mux.HandleFunc("POST /v1/tokens", a.login)
+	mux.HandleFunc("POST /v1/signup", limit(a.signup))
+	mux.HandleFunc("POST /v1/tokens", limit(a.login))
+	mux.HandleFunc("DELETE /v1/tokens/current", a.authed(a.logout))
 	mux.HandleFunc("GET /v1/regions", a.listRegions)
 	mux.HandleFunc("GET /v1/plans", a.listPlans)
 	mux.HandleFunc("GET /v1/me", a.authed(a.me))
@@ -41,6 +42,7 @@ func newAPI(cfg Config, store *Store, rs regions, col *collector, adminToken str
 	mux.HandleFunc("GET /v1/usage", a.authed(a.usage))
 	mux.HandleFunc("GET /v1/invoices/{month}", a.authed(a.invoice))
 	mux.HandleFunc("POST /v1/admin/collect", a.admin(a.collectNow))
+	mux.Handle("GET /", webHandler())
 	return mux
 }
 
@@ -163,6 +165,14 @@ func (a *api) login(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	reply(w, http.StatusCreated, map[string]string{"token": token})
+}
+
+func (a *api) logout(w http.ResponseWriter, r *http.Request, _ Caller) {
+	if err := a.store.Revoke(r.Context(), bearer(r)); err != nil {
+		a.fail(w, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func (a *api) me(w http.ResponseWriter, _ *http.Request, c Caller) {
