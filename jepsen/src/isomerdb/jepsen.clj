@@ -491,11 +491,14 @@
                      (gen/sleep 15)))]
     (case workload
       :append
-      ;; READ COMMITTED forbids G0, G1a, G1b and G1c; Elle looks for exactly those (and internal
-      ;; inconsistency), so a search for anomalies RC allows can't time out into "unknown".
+      ;; READ COMMITTED forbids G0, G1a, G1b and G1c; Elle looks for exactly those, so a search
+      ;; for anomalies RC allows can't time out into "unknown". Not :internal: it expects every
+      ;; read in a transaction to equal its earlier reads plus its own appends, but under READ
+      ;; COMMITTED each statement sees what had committed when it began, so a later read rightly
+      ;; includes other transactions' appends too.
       (let [w (append/test {:key-count 12 :min-txn-length 2 :max-txn-length 4 :max-writes-per-key 64
                             :consistency-models [:read-committed]
-                            :anomalies [:G0 :G1a :G1b :G1c :internal]
+                            :anomalies [:G0 :G1a :G1b :G1c]
                             :cycle-search-timeout 30000})]
         (assoc base
                :client    (map->AppendClient {})

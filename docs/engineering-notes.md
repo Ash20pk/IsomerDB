@@ -256,8 +256,16 @@ still a separate app (`clients/console`) run against a cluster's own API.
   may be left on the workers, no pull left prepared, and the certificate must hold.
 - **A report per release.** `./tests/jepsen.sh report` runs every workload with faults on the
   workers, on the coordinator, and with skew on every node, and writes the matrix to
-  `docs/jepsen/isomer-<version>.md`. Elle checks append for G0, G1a, G1b, G1c and internal
-  consistency, with 30 seconds to search for cycles (the default ran out and answered "unknown").
+  `docs/jepsen/isomer-<version>.md`. Elle checks append for G0, G1a, G1b and G1c, with 30
+  seconds to search for cycles (the default ran out and answered "unknown"). It checked internal
+  consistency too, until the 0.21.0 report flagged it in every run, clock skew alone included:
+  Elle's internal check expects a transaction's later read to equal its earlier one plus its own
+  appends, but the client runs READ COMMITTED, where each statement rightly sees what others
+  committed meanwhile (`[1]`, then `[1 2 … 15 8]` with its own 8 last). The database did what READ
+  COMMITTED promises; the check asked for more. All 12 runs of the 0.21.0 report are valid.
+  One earlier report run hung for 40 minutes in the incremental workload's setup, dropping the
+  previous run's projection after the coordinator had been killed in the run before; it did not
+  happen again in that sequence or in the full matrix, with lock waits watched for.
 
 It found a third bug, fixed:
 
