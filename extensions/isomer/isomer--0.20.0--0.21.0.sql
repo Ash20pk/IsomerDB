@@ -15,6 +15,15 @@
 --     projection's tables take turns from their first write to commit. Its tables must be plain
 --     tables here (not sharded, not replicated to workers, not attached).
 
+--   * Analytics projections maintained incrementally (create_analytics_projection(strategy =>
+--     'incremental'), or 'auto', which picks it when the query fits and keeps no copy of every
+--     row): the engine folds each change into its state and rewrites only the rows it reaches,
+--     into a heap of changed rows beside the columnar table; readers see the columnar table with
+--     those rows replaced, and at most every refresh interval the two are merged into a new
+--     columnar table, without running the query again. strategy => 'rebuild' is the 0.20 way.
+--   * dump_projections writes analytics and event projections back with their own functions
+--     (event projections now record their rules).
+
 \echo Use "ALTER EXTENSION isomer UPDATE TO '0.21.0'" to load this file. \quit
 
 -- ── Shape: aggregates kept as written, DISTINCT, grouping expressions ───────
@@ -636,7 +645,7 @@ DECLARE
     v_args    text;
 BEGIN
     SELECT * INTO STRICT p FROM isomer.projections WHERE name = p_projection;
-    IF p.kind = 'analytics' THEN
+    IF p.kind = 'analytics' AND p.strategy <> 'incremental' THEN
         RETURN;   -- noticed from table statistics, no triggers
     END IF;
     SELECT e.plan INTO v_plan FROM isomer.engine_plans e WHERE e.projection = p.name;
@@ -1103,3 +1112,931 @@ BEGIN
     checks := checks || jsonb_build_object('check', 'deltas flowing', 'passed', v_age IS NULL OR v_age < greatest(p.lag_budget * 10, interval '30 seconds'),
         'detail', CASE WHEN v_age IS NULL THEN 'nothing waiting' ELSE format('oldest waiting %s', date_trunc('second', v_age)) END);
 END $$;
+
+-- ── Analytics projections maintained incrementally ─────────────────────────
+--
+-- An analytics projection whose query the engine can maintain keeps the engine's state, like a
+-- document projection, and its rows in two tables: a columnar table (the base) and a heap of the
+-- rows written since (the changes), each row tagged with its key, the jsonb array of its grouped
+-- output columns. Each key the deltas reach is re-derived from the state into the changes (or
+-- marked deleted there); readers see the base with those rows replaced. At most every refresh
+-- interval, the two are merged into a new columnar table, without running the query again.
+
+ALTER TABLE isomer.analytics_builds
+    ADD COLUMN key_columns  text[],     -- incremental: the grouped output columns that identify a row
+    ADD COLUMN refresh      interval,   -- incremental: how often changes are merged into the base
+    ADD COLUMN merged_rows  bigint;     -- incremental: changed rows merged at the last merge
+
+-- Recorded definitions, for projections created by something other than create_projection, so
+-- dump_projections can write them back.
+ALTER TABLE isomer.projections ADD COLUMN definition jsonb;
+
+-- The output columns that identify a row of an analytics query (its grouped outputs; none for a
+-- single aggregate row), or why its rows can't be told apart.
+CREATE FUNCTION isomer._analytics_keys(p_query text, OUT keys text[], OUT reason text)
+LANGUAGE plpgsql SET search_path = pg_catalog AS $$
+DECLARE
+    a jsonb;
+BEGIN
+    BEGIN
+        a := isomer._engine_analyze(p_query);
+    EXCEPTION WHEN OTHERS THEN
+        reason := 'the query could not be analysed: ' || SQLERRM;
+        RETURN;
+    END;
+    keys := ARRAY(SELECT t ->> 'name' FROM jsonb_array_elements(a -> 'target') WITH ORDINALITY e(t, n)
+                  WHERE (t ->> 'grouped')::boolean ORDER BY n);
+    IF cardinality(keys) < jsonb_array_length(a -> 'group') THEN
+        reason := 'it groups by something it doesn''t return, so its rows can''t be told apart by their columns';
+        keys := NULL;
+    ELSIF (SELECT count(DISTINCT k) FROM unnest(keys) k) < cardinality(keys) THEN
+        reason := 'two of its grouped columns have the same name';
+        keys := NULL;
+    END IF;
+END $$;
+
+-- The projection's columns as a select list (kept in the plan of an incremental one).
+CREATE FUNCTION isomer._analytics_columns(p isomer.projections)
+RETURNS text LANGUAGE sql SET search_path = pg_catalog AS $$
+    SELECT coalesce(
+        (SELECT string_agg(format('%I', c), ', ') FROM isomer.engine_plans e, jsonb_array_elements_text(e.plan -> 'columns') c
+         WHERE e.projection = p.name),
+        (SELECT string_agg(format('%I', column_name), ', ') FROM isomer._query_columns(p.query)))
+$$;
+
+CREATE FUNCTION isomer._analytics_delta(p_projection text)
+RETURNS text LANGUAGE sql IMMUTABLE AS $$
+    SELECT format('isomer_analytics.%I', p_projection || '_changes')
+$$;
+
+CREATE FUNCTION isomer._analytics_base(p_projection text, p_generation integer)
+RETURNS text LANGUAGE sql IMMUTABLE AS $$
+    SELECT format('isomer_analytics.%I', p_projection || '_' || p_generation)
+$$;
+
+-- Point the projection's view at a base table (and, incremental, its changes).
+CREATE FUNCTION isomer._analytics_view(p isomer.projections, p_base text)
+RETURNS void LANGUAGE plpgsql SET search_path = pg_catalog SET citus.enable_ddl_propagation = off AS $$
+DECLARE
+    v_cols text := isomer._analytics_columns(p);
+BEGIN
+    IF p.strategy = 'incremental' THEN
+        EXECUTE format('CREATE OR REPLACE VIEW %I.%I AS '
+                       'SELECT %s FROM %s b WHERE NOT EXISTS (SELECT 1 FROM %s d WHERE d.__k = b.__k) '
+                       'UNION ALL SELECT %s FROM %s d WHERE NOT d.__deleted',
+                       p.target_schema, p.name, v_cols, p_base, isomer._analytics_delta(p.name), v_cols, isomer._analytics_delta(p.name));
+    ELSE
+        EXECUTE format('CREATE OR REPLACE VIEW %I.%I AS SELECT * FROM %s', p.target_schema, p.name, p_base);
+    END IF;
+END $$;
+
+-- Build an incremental analytics projection from its tables: the engine's state, a base table
+-- from the query, no changes. Run with the sources locked (or in the transaction that creates the
+-- capture triggers), so the state, the base and the deltas that follow meet without a gap.
+--   p_state => false: the state was just rebuilt (after a TRUNCATE); build the rows only.
+CREATE FUNCTION isomer._analytics_rebuild(p_projection text, p_state boolean DEFAULT true)
+RETURNS text LANGUAGE plpgsql SET search_path = pg_catalog SET citus.enable_ddl_propagation = off AS $$
+DECLARE
+    p       isomer.projections;
+    b       isomer.analytics_builds;
+    plan    jsonb;
+    s       record;
+    v_base  text;
+    v_start timestamptz := clock_timestamp();
+    v_rows  bigint;
+BEGIN
+    SELECT * INTO STRICT p FROM isomer.projections WHERE name = p_projection;
+    SELECT * INTO STRICT b FROM isomer.analytics_builds WHERE projection = p.name FOR UPDATE;
+    IF p_state THEN
+        FOR s IN SELECT source_table FROM isomer.projection_sources WHERE projection = p.name LOOP
+            EXECUTE format('LOCK TABLE %s IN SHARE MODE', s.source_table);
+        END LOOP;
+        IF isomer._multi_node() THEN
+            PERFORM run_command_on_workers(format('DELETE FROM isomer.node_deltas WHERE projection = %L', p.name));
+        END IF;
+        DELETE FROM isomer.deltas WHERE projection = p.name;
+        PERFORM isomer._engine_build(p.name);
+    END IF;
+    DELETE FROM isomer.pending WHERE projection = p.name;
+    plan := (SELECT e.plan FROM isomer.engine_plans e WHERE e.projection = p.name);
+    v_base := isomer._analytics_base(p.name, b.generation + 1);
+    EXECUTE format('CREATE TABLE %s USING columnar AS SELECT %s AS __k, q.* FROM (%s) q', v_base, plan ->> 'key_expr', p.query);
+    GET DIAGNOSTICS v_rows = ROW_COUNT;
+    EXECUTE format('DELETE FROM %s', isomer._analytics_delta(p.name));
+    PERFORM isomer._analytics_view(p, v_base);
+    IF b.generation > 0 THEN
+        EXECUTE format('DROP TABLE IF EXISTS %s', isomer._analytics_base(p.name, b.generation));
+    END IF;
+    UPDATE isomer.analytics_builds
+    SET generation = b.generation + 1, built_at = clock_timestamp(), build_ms = extract(epoch FROM clock_timestamp() - v_start) * 1000,
+        rows = v_rows, bytes = pg_total_relation_size(v_base::regclass), merged_rows = 0, last_error = NULL
+    WHERE projection = p.name;
+    RETURN format('%s rows, %s columnar, maintained incrementally', v_rows, pg_size_pretty(pg_total_relation_size(v_base::regclass)));
+END $$;
+
+-- Merge the changed rows into a new columnar table. Changes being applied wait (the changes table
+-- is locked against writes); readers don't.
+CREATE FUNCTION isomer._analytics_merge(p_projection text)
+RETURNS text LANGUAGE plpgsql SET search_path = pg_catalog SET citus.enable_ddl_propagation = off AS $$
+DECLARE
+    p       isomer.projections;
+    b       isomer.analytics_builds;
+    v_delta text := isomer._analytics_delta(p_projection);
+    v_old   text;
+    v_new   text;
+    v_cols  text;
+    v_n     bigint;
+    v_rows  bigint;
+    v_start timestamptz := clock_timestamp();
+BEGIN
+    SELECT * INTO STRICT p FROM isomer.projections WHERE name = p_projection;
+    SELECT * INTO STRICT b FROM isomer.analytics_builds WHERE projection = p.name FOR UPDATE;
+    EXECUTE format('LOCK TABLE %s IN EXCLUSIVE MODE', v_delta);
+    EXECUTE format('SELECT count(*) FROM %s', v_delta) INTO v_n;
+    IF v_n = 0 THEN
+        UPDATE isomer.analytics_builds SET built_at = clock_timestamp() WHERE projection = p.name;
+        RETURN 'unchanged';
+    END IF;
+    v_cols := isomer._analytics_columns(p);
+    v_old := isomer._analytics_base(p.name, b.generation);
+    v_new := isomer._analytics_base(p.name, b.generation + 1);
+    EXECUTE format('CREATE TABLE %1$s USING columnar AS '
+                   'SELECT __k, %2$s FROM %3$s b WHERE NOT EXISTS (SELECT 1 FROM %4$s d WHERE d.__k = b.__k) '
+                   'UNION ALL SELECT __k, %2$s FROM %4$s d WHERE NOT d.__deleted',
+                   v_new, v_cols, v_old, v_delta);
+    GET DIAGNOSTICS v_rows = ROW_COUNT;
+    PERFORM isomer._analytics_view(p, v_new);
+    EXECUTE format('DELETE FROM %s', v_delta);
+    EXECUTE format('DROP TABLE IF EXISTS %s', v_old);
+    UPDATE isomer.analytics_builds
+    SET generation = b.generation + 1, built_at = clock_timestamp(), build_ms = extract(epoch FROM clock_timestamp() - v_start) * 1000,
+        rows = v_rows, bytes = pg_total_relation_size(v_new::regclass), merged_rows = v_n, last_error = NULL
+    WHERE projection = p.name;
+    RETURN format('%s changed rows merged: %s rows, %s columnar', v_n, v_rows, pg_size_pretty(pg_total_relation_size(v_new::regclass)));
+END $$;
+
+-- Write the rows for these keys, re-derived from the state, to the changes; a key the query no
+-- longer returns is marked deleted there.
+CREATE FUNCTION isomer._analytics_apply(p_projection text, p_keys text[])
+RETURNS void LANGUAGE plpgsql SET search_path = pg_catalog AS $$
+DECLARE
+    p         isomer.projections;
+    plan      jsonb;
+    v_delta   text := isomer._analytics_delta(p_projection);
+    v_expr    text;
+    v_push    text;
+    v_written bigint;
+    v_deleted bigint;
+BEGIN
+    SELECT * INTO STRICT p FROM isomer.projections WHERE name = p_projection;
+    plan := (SELECT e.plan FROM isomer.engine_plans e WHERE e.projection = p.name);
+    v_expr := plan ->> 'key_expr';
+    -- The keys' columns, as conditions the planner pushes below the derivation's grouping (it
+    -- would otherwise derive every row to compare whole keys).
+    SELECT string_agg(format(
+        '(q.%1$I = ANY (ARRAY(SELECT (k::jsonb ->> %2$s)::%3$s FROM unnest($1) k WHERE k::jsonb -> %2$s <> ''null''::jsonb)) '
+        'OR (q.%1$I IS NULL AND EXISTS (SELECT 1 FROM unnest($1) k WHERE k::jsonb -> %2$s = ''null''::jsonb)))',
+        c.name, c.n - 1, plan -> 'key_types' ->> (c.n - 1)::int), ' AND ' ORDER BY c.n)
+    INTO v_push
+    FROM jsonb_array_elements_text(plan -> 'key_columns') WITH ORDINALITY c(name, n);
+    EXECUTE format('DELETE FROM %s WHERE __k = ANY ($1)', v_delta) USING p_keys;
+    EXECUTE format('INSERT INTO %1$s SELECT %2$s, false, q.* FROM (%3$s) q WHERE %4$s AND %2$s = ANY ($1)',
+                   v_delta, v_expr, p.derive_query, coalesce(v_push, 'true')) USING p_keys;
+    GET DIAGNOSTICS v_written = ROW_COUNT;
+    EXECUTE format('INSERT INTO %1$s (__k, __deleted) SELECT k, true FROM unnest($1) k '
+                   'WHERE NOT EXISTS (SELECT 1 FROM %1$s d WHERE d.__k = k) ON CONFLICT (__k) DO NOTHING', v_delta) USING p_keys;
+    GET DIAGNOSTICS v_deleted = ROW_COUNT;
+    UPDATE isomer.projection_stats
+    SET documents_written = documents_written + v_written, documents_deleted = documents_deleted + v_deleted
+    WHERE projection = p.name;
+END $$;
+
+DROP FUNCTION isomer.create_analytics_projection(text, text, interval, text);
+
+-- strategy: 'rebuild' runs the query in full into a new columnar table when the sources change
+-- (at most once per refresh); 'incremental' folds each change into the engine's state and
+-- rewrites only the rows it reaches, merged into a new columnar table at most once per refresh;
+-- 'auto' (the default) picks incremental when the query fits and its state is small (no
+-- aggregate kept as written, which would keep a copy of every row it reads).
+CREATE FUNCTION isomer.create_analytics_projection(
+    name          text,
+    query         text,
+    refresh       interval DEFAULT '5 minutes',
+    target_schema text DEFAULT 'public',
+    strategy      text DEFAULT 'auto')
+-- The query resolves with the caller's search path, then is stored schema-qualified.
+RETURNS text LANGUAGE plpgsql SET citus.enable_ddl_propagation = off AS $$
+DECLARE
+    v_probe    text := format('pg_temp.isomer_create_%s', pg_backend_pid());
+    v_first    text;
+    v_result   text;
+    v_keys     text[];
+    v_reason   text;
+    v_shape    jsonb;
+    v_strategy text := 'recompute';
+    v_why      text;
+    v_cols     jsonb;
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_am WHERE amname = 'columnar') THEN
+        RAISE EXCEPTION 'isomer: analytics projections need columnar storage'
+            USING HINT = 'CREATE EXTENSION citus_columnar; (new clusters have it).';
+    END IF;
+    IF strategy NOT IN ('auto', 'rebuild', 'incremental') THEN
+        RAISE EXCEPTION 'isomer: strategy must be ''auto'', ''rebuild'' or ''incremental'', not %', strategy;
+    END IF;
+    EXECUTE format('CREATE OR REPLACE TEMP VIEW %s AS %s', v_probe, query);
+    query := isomer._viewdef(v_probe::regclass);
+    EXECUTE format('DROP VIEW %s', v_probe);
+    SELECT column_name INTO v_first FROM isomer._query_columns(query) LIMIT 1;
+
+    SELECT k.keys, k.reason INTO v_keys, v_reason FROM isomer._analytics_keys(query) k;
+    IF v_reason IS NULL THEN
+        v_shape := isomer._engine_shape(query, coalesce(v_keys[1], v_first), 'analytics');
+        IF NOT (v_shape ->> 'ok')::boolean THEN
+            v_reason := v_shape ->> 'reason';
+        END IF;
+    END IF;
+    IF create_analytics_projection.strategy = 'incremental' AND v_reason IS NOT NULL THEN
+        RAISE EXCEPTION 'isomer: analytics projection % cannot be maintained incrementally: %', name, v_reason
+            USING HINT = 'Use strategy => ''rebuild''.';
+    END IF;
+    IF create_analytics_projection.strategy = 'incremental' THEN
+        v_strategy := 'incremental';
+        v_why := 'chosen by create_analytics_projection(strategy => ''incremental'')';
+    ELSIF create_analytics_projection.strategy = 'auto' AND v_reason IS NULL THEN
+        IF EXISTS (SELECT 1 FROM jsonb_array_elements(v_shape -> 'aggs') g WHERE g ->> 'cls' = 'keep') THEN
+            v_why := format('rebuilt as a columnar table when its sources change, at most every %s: maintained incrementally it would keep a copy of every row its %s read',
+                            refresh, (SELECT string_agg(DISTINCT g ->> 'fn', ', ') FROM jsonb_array_elements(v_shape -> 'aggs') g WHERE g ->> 'cls' = 'keep'));
+        ELSE
+            v_strategy := 'incremental';
+            v_why := format('each change is folded into partial aggregates and only the rows it reaches are rewritten, merged into a new columnar table at most every %s', refresh);
+        END IF;
+    ELSE
+        v_why := format('rebuilt as a columnar table when its sources change, at most every %s', refresh)
+              || CASE WHEN create_analytics_projection.strategy = 'auto' THEN format(' (incremental maintenance does not apply: %s)', v_reason) ELSE '' END;
+    END IF;
+
+    INSERT INTO isomer.projections (name, kind, query, key_column, key_type, freshness, lag_budget, target_schema, strategy, strategy_reason, definition)
+    VALUES (name, 'analytics', query, coalesce(v_keys[1], v_first), 'text', 'bounded',
+            CASE WHEN v_strategy = 'incremental' THEN interval '2 seconds' ELSE refresh END, target_schema, v_strategy, v_why,
+            jsonb_build_object('refresh', refresh, 'strategy', create_analytics_projection.strategy));
+    INSERT INTO isomer.projection_sources (projection, source_table, key_column)
+    SELECT name, isomer._qualified(t), NULL FROM isomer._query_tables(query) t;
+    INSERT INTO isomer.projection_stats (projection) VALUES (name) ON CONFLICT DO NOTHING;
+    INSERT INTO isomer.analytics_builds (projection, key_columns, refresh)
+    VALUES (name, CASE WHEN v_strategy = 'incremental' THEN v_keys END, CASE WHEN v_strategy = 'incremental' THEN refresh END);
+
+    IF v_strategy = 'incremental' THEN
+        PERFORM isomer._engine_compile(name);
+        SELECT jsonb_agg(column_name ORDER BY n) INTO v_cols FROM isomer._query_columns(query) WITH ORDINALITY q(column_name, column_type, type_oid, n);
+        UPDATE isomer.engine_plans e
+        SET plan = e.plan || jsonb_build_object(
+            'key_columns', to_jsonb(v_keys),
+            'key_types', (SELECT coalesce(jsonb_agg(c.column_type ORDER BY k.n), '[]') FROM unnest(v_keys) WITH ORDINALITY k(name, n)
+                          JOIN isomer._query_columns(query) c ON c.column_name = k.name),
+            'key_expr', format('jsonb_build_array(%s)::text', (SELECT coalesce(string_agg(format('q.%I', k), ', '), '') FROM unnest(v_keys) k)),
+            'columns', v_cols)
+        WHERE e.projection = name;
+        EXECUTE format('CREATE TABLE %s AS SELECT NULL::text AS __k, false AS __deleted, q.* FROM (%s) q WITH NO DATA',
+                       isomer._analytics_delta(name), query);
+        EXECUTE format('ALTER TABLE %1$s ALTER COLUMN __k SET NOT NULL, ALTER COLUMN __deleted SET NOT NULL, ADD PRIMARY KEY (__k)',
+                       isomer._analytics_delta(name));
+        -- The capture triggers lock every shard against writes until this transaction commits,
+        -- so the state, the base table and the deltas that follow meet without a gap.
+        PERFORM isomer._create_source_triggers(name);
+        v_result := isomer._analytics_rebuild(name, true);
+    ELSE
+        v_result := isomer.refresh_analytics(name, force => true);
+    END IF;
+    RETURN format('analytics projection %s: %s; read it as %I.%I', name, v_result, target_schema, name);
+END $$;
+
+-- The keys a key query reaches, as text: the key column, or (analytics) an expression over q.
+CREATE FUNCTION isomer._engine_keys_of(p_sql text, p_key text, p_expr text)
+RETURNS text[] LANGUAGE plpgsql SET search_path = pg_catalog AS $$
+DECLARE
+    v text[];
+BEGIN
+    IF p_expr IS NULL THEN
+        RETURN isomer._engine_keys_of(p_sql, p_key);
+    END IF;
+    EXECUTE format('SELECT array_agg(DISTINCT %s) FROM (%s) q', p_expr, p_sql) INTO v;
+    RETURN coalesce(v, '{}');
+END $$;
+
+CREATE OR REPLACE FUNCTION isomer._engine_touched(plan jsonb, p_key text, p_relids oid[])
+RETURNS text[] LANGUAGE plpgsql SET search_path = pg_catalog AS $$
+DECLARE
+    k      jsonb;
+    v_keys text[] := '{}';
+BEGIN
+    FOR k IN SELECT * FROM jsonb_array_elements(plan -> 'key_sqls') LOOP
+        CONTINUE WHEN NOT ((k ->> 'relid')::oid = ANY (p_relids));
+        v_keys := v_keys || ARRAY(SELECT DISTINCT q FROM unnest(isomer._engine_keys_of(k ->> 'sql', p_key, plan ->> 'key_expr')) q);
+    END LOOP;
+    RETURN v_keys;
+END $$;
+
+CREATE OR REPLACE FUNCTION isomer._apply(p_projection text, p_keys text[])
+RETURNS void LANGUAGE plpgsql SET search_path = pg_catalog AS $$
+DECLARE
+    p          isomer.projections;
+    v_query    text;
+    v_updates  jsonb;
+    v_docs     jsonb;
+    v_found    text[];
+    v_missing  jsonb;
+    v_ok       boolean;
+    v_result   text;
+    v_written  integer;
+    v_deleted  integer;
+BEGIN
+    IF p_keys IS NULL OR cardinality(p_keys) = 0 THEN
+        RETURN;
+    END IF;
+    SELECT * INTO STRICT p FROM isomer.projections WHERE name = p_projection;
+    v_query := coalesce(p.derive_query, p.query);
+    IF p.kind = 'analytics' THEN
+        PERFORM isomer._analytics_apply(p.name, p_keys);
+        RETURN;
+    END IF;
+
+    IF p.kind = 'cache' THEN
+        EXECUTE format(
+            $q$WITH src AS (SELECT q.%1$I::text AS key, to_jsonb(q.value) AS value FROM (%2$s) q WHERE q.%1$I = ANY ($1::%3$s[])),
+                    up AS (INSERT INTO %4$s AS c (key, value, updated_at) SELECT key, value, clock_timestamp() FROM src
+                           ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = EXCLUDED.updated_at
+                           WHERE c.value IS DISTINCT FROM EXCLUDED.value RETURNING 1),
+                    del AS (DELETE FROM %4$s c WHERE c.key = ANY ($1) AND c.key NOT IN (SELECT key FROM src) RETURNING 1)
+               SELECT (SELECT count(*) FROM up)::int, (SELECT count(*) FROM del)::int,
+                      (SELECT jsonb_object_agg(key, value) FROM src WHERE $2)$q$,
+            p.key_column, v_query, p.key_type, isomer._cache_store(p.name))
+        INTO v_written, v_deleted, v_docs USING p_keys, p.history IS NOT NULL;
+        UPDATE isomer.projection_stats SET documents_written = documents_written + v_written,
+                                           documents_deleted = documents_deleted + v_deleted
+        WHERE projection = p.name;
+        PERFORM isomer._log_changes(p, p_keys, v_docs);
+        RETURN;
+    END IF;
+
+    -- In a cluster the collection's shard may live on another node, written in a two-phase
+    -- commit. The coordinator commits first and releases the per-key lock while the worker's
+    -- COMMIT PREPARED is still on its way, and DocumentDB's update, meeting a row whose newer
+    -- version is not yet committed, can match nothing and lose the write. Locking the documents
+    -- first waits for any such commit, so the update below reads the latest version.
+    IF isomer._multi_node() THEN
+        EXECUTE format(
+            $q$SELECT 1 FROM %s c
+               WHERE c.shard_key_value = %s
+                 AND c.object_id OPERATOR(documentdb_core.=) ANY (ARRAY(
+                     SELECT jsonb_build_object('', to_jsonb(k::%s))::text::documentdb_core.bson FROM unnest($1::text[]) k))
+               FOR UPDATE$q$,
+            isomer._collection_table(p.mongo_database, p.name),
+            (SELECT collection_id FROM documentdb_api_catalog.collections
+             WHERE database_name = p.mongo_database AND collection_name = p.name),
+            p.key_type)
+        USING p_keys;
+    END IF;
+
+    EXECUTE format(
+        $q$SELECT coalesce(jsonb_agg(jsonb_build_object(
+                     'q', jsonb_build_object('_id', to_jsonb(q.%1$I)),
+                     'u', q.doc::jsonb || jsonb_build_object('_id', to_jsonb(q.%1$I)),
+                     'upsert', true)), '[]'::jsonb),
+                  coalesce(array_agg(q.%1$I::text), '{}'),
+                  CASE WHEN $2 THEN jsonb_object_agg(q.%1$I::text, q.doc::jsonb || jsonb_build_object('_id', to_jsonb(q.%1$I))) END
+           FROM (%2$s) q
+           WHERE q.%1$I = ANY ($1::%3$s[])$q$,
+        p.key_column, v_query, p.key_type)
+    INTO v_updates, v_found, v_docs
+    USING p_keys, p.history IS NOT NULL;
+
+    IF jsonb_array_length(v_updates) > 0 THEN
+        SELECT r.p_success, r.p_result::text INTO v_ok, v_result
+        FROM documentdb_api.update(
+            p.mongo_database,
+            jsonb_build_object('update', p.name, 'updates', v_updates, 'ordered', false)::text::documentdb_core.bson) r;
+        IF NOT v_ok THEN
+            RAISE EXCEPTION 'isomer: writing documents for projection % failed: %', p.name, v_result;
+        END IF;
+    END IF;
+
+    EXECUTE format(
+        $q$SELECT jsonb_agg(to_jsonb(k::%s)) FROM unnest($1::text[]) k WHERE k <> ALL ($2)$q$,
+        p.key_type)
+    INTO v_missing
+    USING p_keys, v_found;
+
+    IF v_missing IS NOT NULL THEN
+        SELECT r.p_success, r.p_result::text INTO v_ok, v_result
+        FROM documentdb_api.delete(
+            p.mongo_database,
+            jsonb_build_object('delete', p.name, 'deletes', jsonb_build_array(jsonb_build_object(
+                'q', jsonb_build_object('_id', jsonb_build_object('$in', v_missing)),
+                'limit', 0)))::text::documentdb_core.bson) r;
+        IF NOT v_ok THEN
+            RAISE EXCEPTION 'isomer: deleting documents for projection % failed: %', p.name, v_result;
+        END IF;
+    END IF;
+
+    INSERT INTO isomer.projection_stats AS s (projection, documents_written, documents_deleted)
+    VALUES (p.name, cardinality(v_found), coalesce(jsonb_array_length(v_missing), 0))
+    ON CONFLICT (projection) DO UPDATE
+        SET documents_written = s.documents_written + EXCLUDED.documents_written,
+            documents_deleted = s.documents_deleted + EXCLUDED.documents_deleted;
+
+    -- Keys are canonicalised through the key type, as the documents' _id are.
+    IF p.history IS NOT NULL THEN
+        EXECUTE format('SELECT array_agg(k::%s::text) FROM unnest($1::text[]) k', p.key_type) INTO p_keys USING p_keys;
+        PERFORM isomer._log_changes(p, p_keys, v_docs);
+    END IF;
+END $$;
+
+CREATE OR REPLACE FUNCTION isomer.drain(p_batch integer DEFAULT 500)
+RETURNS integer LANGUAGE plpgsql SET search_path = pg_catalog AS $$
+DECLARE
+    p        record;
+    v_keys   text[];
+    v_phases text[];
+    v_oldest timestamptz;
+    v_token  bigint;
+    v_n      integer;
+    v_total  integer := 0;
+    v_lag_ms double precision;
+    v_until  timestamptz;
+BEGIN
+    -- Queued keys reach pending for every projection, paused ones too: their work waits there.
+    FOR p IN SELECT DISTINCT projection AS name FROM isomer.key_log LOOP
+        BEGIN
+            PERFORM isomer._merge_key_log(p.name);
+        EXCEPTION WHEN OTHERS THEN
+            PERFORM isomer._log('error', p.name, format('merging queued keys failed: %s', SQLERRM));
+        END;
+    END LOOP;
+    -- Event projections: captured changes become events.
+    FOR p IN SELECT name, lag_budget FROM isomer.projections WHERE kind = 'event' AND status = 'active' LOOP
+        v_until := clock_timestamp() + greatest(p.lag_budget / 2, interval '200 milliseconds');
+        BEGIN
+            LOOP
+                v_n := isomer._event_fold(p.name);
+                v_total := v_total + v_n;
+                EXIT WHEN v_n = 0 OR clock_timestamp() > v_until;
+            END LOOP;
+        EXCEPTION WHEN OTHERS THEN
+            PERFORM isomer._log('error', p.name, format('turning changes into events failed: %s', SQLERRM));
+        END;
+    END LOOP;
+    FOR p IN SELECT name, kind, lag_budget, strategy FROM isomer.projections
+             WHERE ((kind IN ('document', 'vector', 'cache') AND freshness = 'bounded') OR (kind = 'analytics' AND strategy = 'incremental'))
+               AND status = 'active'
+    LOOP
+        IF p.strategy = 'incremental' THEN
+            v_until := clock_timestamp() + greatest(p.lag_budget / 2, interval '200 milliseconds');
+            BEGIN
+                LOOP
+                    EXIT WHEN isomer._engine_fold(p.name) = 0 OR clock_timestamp() > v_until;
+                END LOOP;
+            EXCEPTION WHEN OTHERS THEN
+                PERFORM isomer._log('error', p.name, format('folding changes failed: %s', SQLERRM));
+            END;
+        END IF;
+        LOOP
+            BEGIN
+                WITH batch AS (
+                    DELETE FROM isomer.pending
+                    WHERE (projection, key) IN (
+                        SELECT projection, key FROM isomer.pending
+                        WHERE projection = p.name
+                        ORDER BY enqueued_at LIMIT p_batch
+                        FOR UPDATE SKIP LOCKED)
+                    RETURNING key, enqueued_at, phase, token)
+                SELECT array_agg(key), array_agg(DISTINCT phase), min(enqueued_at), max(token), count(*)
+                INTO v_keys, v_phases, v_oldest, v_token, v_n FROM batch;
+
+                EXIT WHEN v_n = 0;
+                IF p.kind IN ('document', 'cache', 'analytics') THEN
+                    PERFORM isomer._apply(p.name, v_keys);
+                    v_lag_ms := extract(epoch FROM clock_timestamp() - v_oldest) * 1000;
+                    INSERT INTO isomer.projection_stats AS s
+                        (projection, last_applied_at, last_batch_size, last_lag_ms, max_lag_ms, budget_breaches)
+                    VALUES (p.name, clock_timestamp(), v_n, v_lag_ms, v_lag_ms,
+                            (v_lag_ms > extract(epoch FROM p.lag_budget) * 1000)::int)
+                    ON CONFLICT (projection) DO UPDATE
+                        SET last_applied_at = EXCLUDED.last_applied_at,
+                            last_batch_size = EXCLUDED.last_batch_size,
+                            last_lag_ms     = EXCLUDED.last_lag_ms,
+                            max_lag_ms      = greatest(s.max_lag_ms, EXCLUDED.max_lag_ms),
+                            budget_breaches = s.budget_breaches + EXCLUDED.budget_breaches;
+                    IF v_lag_ms > extract(epoch FROM p.lag_budget) * 1000 THEN
+                        PERFORM isomer._log('warning', p.name,
+                            format('lag %s ms exceeded budget %s', round(v_lag_ms::numeric), p.lag_budget));
+                    END IF;
+                ELSE
+                    PERFORM isomer._enqueue_embeddings(p.name, v_keys,
+                        CASE WHEN 'backfill' = ANY (v_phases) THEN 'backfill' ELSE 'steady' END);
+                    UPDATE isomer.embed_jobs SET (enqueued_at, token) = (least(enqueued_at, v_oldest), greatest(embed_jobs.token, v_token))
+                    WHERE projection = p.name AND key = ANY (v_keys);
+                END IF;
+                v_total := v_total + v_n;
+            EXCEPTION WHEN OTHERS THEN
+                PERFORM isomer._log('error', p.name, format('drain failed: %s', SQLERRM));
+                EXIT;
+            END;
+        END LOOP;
+        IF p.kind = 'vector' THEN
+            PERFORM isomer._maybe_swap_model(p.name);
+        END IF;
+    END LOOP;
+    RETURN v_total;
+END $$;
+
+CREATE OR REPLACE FUNCTION isomer.refresh_analytics(p_projection text, force boolean DEFAULT false)
+RETURNS text LANGUAGE plpgsql SET search_path = pg_catalog SET citus.enable_ddl_propagation = off AS $$
+DECLARE
+    p       isomer.projections;
+    b       isomer.analytics_builds;
+    v_fp    text;
+    v_table text;
+    v_start timestamptz := clock_timestamp();
+    v_rows  bigint;
+    v_bytes bigint;
+BEGIN
+    SELECT * INTO STRICT p FROM isomer.projections WHERE name = p_projection;
+    -- Incremental: merge the changed rows (or, forced, build everything again from the tables).
+    IF p.strategy = 'incremental' THEN
+        RETURN CASE WHEN force THEN isomer._analytics_rebuild(p.name, true) ELSE isomer._analytics_merge(p.name) END;
+    END IF;
+    SELECT * INTO STRICT b FROM isomer.analytics_builds WHERE projection = p.name FOR UPDATE;
+    v_fp := isomer._sources_fingerprint(p.name);
+    IF NOT force AND b.fingerprint = v_fp THEN
+        RETURN 'unchanged';
+    END IF;
+    v_table := format('isomer_analytics.%I', p.name || '_' || (b.generation + 1));
+    EXECUTE format('CREATE TABLE %s USING columnar AS %s', v_table, p.query);
+    GET DIAGNOSTICS v_rows = ROW_COUNT;
+    EXECUTE format('DROP VIEW IF EXISTS %I.%I', p.target_schema, p.name);
+    EXECUTE format('CREATE VIEW %I.%I AS SELECT * FROM %s', p.target_schema, p.name, v_table);
+    IF b.generation > 0 THEN
+        EXECUTE format('DROP TABLE IF EXISTS isomer_analytics.%I', p.name || '_' || b.generation);
+    END IF;
+    v_bytes := pg_total_relation_size(v_table::regclass);
+    UPDATE isomer.analytics_builds
+    SET generation = b.generation + 1, fingerprint = v_fp, built_at = clock_timestamp(),
+        build_ms = extract(epoch FROM clock_timestamp() - v_start) * 1000, rows = v_rows, bytes = v_bytes, last_error = NULL
+    WHERE projection = p.name;
+    UPDATE isomer.projection_stats
+    SET last_applied_at = clock_timestamp(), documents_written = documents_written + v_rows, last_batch_size = v_rows
+    WHERE projection = p.name;
+    RETURN format('%s rows, %s columnar', v_rows, pg_size_pretty(v_bytes));
+END $$;
+
+CREATE OR REPLACE FUNCTION isomer.refresh_analytics_due()
+RETURNS integer LANGUAGE plpgsql SET search_path = pg_catalog AS $$
+DECLARE
+    p   record;
+    v_n integer := 0;
+BEGIN
+    FOR p IN SELECT pr.name FROM isomer.projections pr JOIN isomer.analytics_builds b ON b.projection = pr.name
+             WHERE pr.kind = 'analytics' AND pr.status = 'active'
+               AND (b.built_at IS NULL OR b.built_at < clock_timestamp() - coalesce(b.refresh, pr.lag_budget)) LOOP
+        BEGIN
+            IF isomer.refresh_analytics(p.name) <> 'unchanged' THEN
+                v_n := v_n + 1;
+            END IF;
+        EXCEPTION WHEN OTHERS THEN
+            UPDATE isomer.analytics_builds SET last_error = SQLERRM WHERE projection = p.name;
+            PERFORM isomer._log('error', p.name, format('analytics refresh failed: %s', SQLERRM));
+        END;
+    END LOOP;
+    RETURN v_n;
+END $$;
+
+-- Deltas of a projection still waiting on the workers.
+CREATE FUNCTION isomer._analytics_on_workers(p_projection text)
+RETURNS bigint LANGUAGE plpgsql SET search_path = pg_catalog AS $$
+BEGIN
+    IF NOT isomer._multi_node() THEN
+        RETURN 0;
+    END IF;
+    RETURN (SELECT coalesce(sum(result::bigint), 0) FROM run_command_on_workers(
+        format('SELECT count(*) FROM isomer.node_deltas WHERE projection = %L', p_projection)) WHERE success);
+END $$;
+
+CREATE OR REPLACE FUNCTION isomer.analytics_differences(p_projection text)
+RETURNS bigint LANGUAGE plpgsql SET search_path = pg_catalog AS $$
+DECLARE
+    p isomer.projections;
+    b isomer.analytics_builds;
+    v bigint;
+BEGIN
+    SELECT * INTO STRICT p FROM isomer.projections WHERE name = p_projection AND kind = 'analytics';
+    SELECT * INTO STRICT b FROM isomer.analytics_builds WHERE projection = p.name;
+    IF p.strategy = 'incremental' THEN
+        -- Checked in one statement, so the tables, the rows and the queues are seen at one moment:
+        -- with nothing queued, every committed change is in the rows. Changes still on a worker
+        -- aren't in that moment; they are checked before and after.
+        IF isomer._analytics_on_workers(p.name) > 0 THEN
+            RETURN NULL;
+        END IF;
+        EXECUTE format(
+            $q$SELECT CASE WHEN EXISTS (SELECT 1 FROM isomer.deltas WHERE projection = %4$L)
+                             OR EXISTS (SELECT 1 FROM isomer.pending WHERE projection = %4$L)
+                             OR EXISTS (SELECT 1 FROM isomer.key_log WHERE projection = %4$L) THEN NULL
+                        ELSE (WITH a AS (SELECT to_jsonb(q) AS r FROM (%1$s) q), b AS (SELECT to_jsonb(t) AS r FROM %2$I.%3$I t)
+                              SELECT (SELECT count(*) FROM (SELECT r FROM a EXCEPT ALL SELECT r FROM b) x)
+                                   + (SELECT count(*) FROM (SELECT r FROM b EXCEPT ALL SELECT r FROM a) y)) END$q$,
+            p.query, p.target_schema, p.name, p.name) INTO v;
+        IF isomer._analytics_on_workers(p.name) > 0 THEN
+            RETURN NULL;
+        END IF;
+        RETURN v;
+    END IF;
+    IF b.fingerprint IS DISTINCT FROM isomer._sources_fingerprint(p.name) THEN
+        RETURN NULL;
+    END IF;
+    EXECUTE format(
+        $q$WITH a AS (SELECT to_jsonb(q) AS r FROM (%1$s) q), b AS (SELECT to_jsonb(t) AS r FROM %2$I.%3$I t)
+           SELECT (SELECT count(*) FROM (SELECT r FROM a EXCEPT ALL SELECT r FROM b) x)
+                + (SELECT count(*) FROM (SELECT r FROM b EXCEPT ALL SELECT r FROM a) y)$q$,
+        p.query, p.target_schema, p.name) INTO v;
+    RETURN v;
+END $$;
+
+CREATE OR REPLACE FUNCTION isomer.drop_projection(name text)
+RETURNS void LANGUAGE plpgsql SET search_path = pg_catalog
+    SET citus.enable_ddl_propagation = off SET citus.enable_unsafe_triggers = on AS $$
+DECLARE
+    p isomer.projections;
+BEGIN
+    SELECT * INTO p FROM isomer.projections WHERE projections.name = drop_projection.name;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'isomer: no projection named %', name;
+    END IF;
+    IF p.kind = 'event' THEN
+        PERFORM isomer._drop_source_triggers(p.name);
+    ELSIF p.kind = 'analytics' THEN
+        EXECUTE format('DROP VIEW IF EXISTS %I.%I', p.target_schema, p.name);
+        EXECUTE format('DROP TABLE IF EXISTS isomer_analytics.%I',
+                       p.name || '_' || (SELECT generation FROM isomer.analytics_builds WHERE projection = p.name));
+        IF p.strategy = 'incremental' THEN
+            PERFORM isomer._drop_source_triggers(p.name);
+            PERFORM isomer._engine_drop_state(p.name);
+            EXECUTE format('DROP TABLE IF EXISTS %s', isomer._analytics_delta(p.name));
+        END IF;
+    ELSIF p.kind IN ('document', 'vector', 'cache') THEN
+        PERFORM isomer._drop_source_triggers(p.name);
+        IF p.strategy = 'incremental' THEN
+            PERFORM isomer._engine_drop_state(p.name);
+        END IF;
+        IF p.kind = 'document' THEN
+            PERFORM documentdb_api.drop_collection(p.mongo_database, p.name);
+        ELSIF p.kind = 'vector' THEN
+            EXECUTE format('DROP VIEW IF EXISTS %I.%I', p.target_schema, p.name);
+            EXECUTE format('DROP TABLE IF EXISTS %s', isomer._vector_store(p.name));
+        ELSE
+            EXECUTE format('DROP VIEW IF EXISTS %I.%I', p.target_schema, p.name);
+            EXECUTE format('DROP TABLE IF EXISTS %s', isomer._cache_store(p.name));
+        END IF;
+    ELSE
+        PERFORM set_config('isomer.dropping_projection', p.name, true);
+        PERFORM pgtrickle.drop_stream_table(format('%I.%I', p.target_schema, p.name), false);
+    END IF;
+    DELETE FROM isomer.embed_dead_letter WHERE projection = p.name;
+    DELETE FROM isomer.audit_suspects WHERE projection = p.name;
+    DELETE FROM isomer.projections WHERE projections.name = p.name;
+END $$;
+
+CREATE OR REPLACE FUNCTION isomer.certificate(p_projection text)
+RETURNS jsonb LANGUAGE plpgsql SET search_path = pg_catalog AS $$
+DECLARE
+    p        isomer.projections;
+    v_checks jsonb := '[]';
+    v_rules  jsonb;
+    v_assume jsonb;
+    v_ok     boolean;
+    v_detail text;
+    v_reason text;
+    s        record;
+    v_tables regclass[];
+    st       record;
+    v_n      bigint;
+    v_dist   boolean;
+BEGIN
+    SELECT * INTO STRICT p FROM isomer.projections WHERE name = p_projection;
+
+    IF p.kind = 'event' THEN
+        v_rules := jsonb_build_array(
+            'capture: each change to a source row is recorded with its old and new images, in the writing transaction, on the node holding the row',
+            'delivery: changes recorded on a worker reach the coordinator exactly once (a prepared transaction on the worker, committed after the coordinator records the pull)',
+            'derivation: each change is turned into the events whose conditions hold for its old and new rows, and appended to the feed under the feed lock, so ids follow commit order');
+        v_assume := jsonb_build_array(
+            'the capture trigger is on every placement of the source, ENABLE ALWAYS',
+            'changes to one row are on one node, so its events keep their order; events of different rows written on different nodes are ordered as they are pulled',
+            format('events are kept for %s', p.history));
+        FOR s IN SELECT * FROM isomer.projection_sources WHERE projection = p.name LOOP
+            v_dist := (isomer._distribution(s.source_table::regclass)).method IN ('h', 'n');
+            v_ok := CASE WHEN v_dist THEN isomer._triggers_on_all_placements(s.source_table::regclass, p.name)
+                         ELSE EXISTS (SELECT 1 FROM pg_trigger WHERE tgrelid = s.source_table::regclass AND tgname = 'isomer_' || p.name AND tgenabled = 'A') END;
+            v_checks := v_checks || jsonb_build_object('check', 'capture on ' || s.source_table, 'passed', v_ok,
+                'detail', CASE WHEN v_ok THEN 'present, ENABLE ALWAYS' ELSE 'missing or disabled: run isomer._create_source_triggers(' || quote_literal(p.name) || ')' END);
+        END LOOP;
+    ELSIF p.kind = 'analytics' AND p.strategy <> 'incremental' THEN
+        v_rules := jsonb_build_array(
+            'recompute: the query is run in full into a new columnar table, which replaces the old one in one transaction',
+            format('when: the sources'' statistics (rows inserted, updated, deleted, and their files) have changed since the last build, checked every 30 seconds, at most once per %s', p.lag_budget));
+        v_assume := jsonb_build_array('table statistics count every change (they do for SQL writes, replication and TRUNCATE alike)');
+        SELECT * INTO st FROM isomer.analytics_builds WHERE projection = p.name;
+        v_checks := v_checks || jsonb_build_object('check', 'last build', 'passed', st.last_error IS NULL AND st.built_at IS NOT NULL,
+            'detail', coalesce('failed: ' || st.last_error, format('%s rows, built %s', st.rows, st.built_at)));
+        v_n := isomer.analytics_differences(p.name);
+        v_checks := v_checks || jsonb_build_object('check', 'equals the query', 'passed', coalesce(v_n = 0, true),
+            'detail', CASE WHEN v_n IS NULL THEN 'the sources changed since the last build; checked again after the next'
+                           WHEN v_n = 0 THEN 'the columnar table holds exactly what the query returns'
+                           ELSE format('%s row(s) differ', v_n) END);
+    ELSIF p.strategy = 'incremental' THEN
+        SELECT c.rules, c.assumptions, c.checks INTO v_rules, v_assume, v_checks FROM isomer._engine_certificate(p) c;
+        IF p.kind = 'analytics' THEN
+            v_rules := v_rules || to_jsonb(format('rows: each key the deltas reach is re-derived from the state into a table of changed rows (or marked deleted there); readers see the columnar table with those rows replaced; at most every %s the two are merged into a new columnar table, without running the query again',
+                                                  (SELECT refresh FROM isomer.analytics_builds WHERE projection = p.name)));
+            v_n := isomer.analytics_differences(p.name);
+            v_checks := v_checks || jsonb_build_object('check', 'equals the query', 'passed', coalesce(v_n = 0, true),
+                'detail', CASE WHEN v_n IS NULL THEN 'changes are in flight; checked again once they are applied'
+                               WHEN v_n = 0 THEN 'the columnar table with its changed rows holds exactly what the query returns'
+                               ELSE format('%s row(s) differ', v_n) END);
+        END IF;
+    ELSIF p.kind IN ('document', 'cache', 'vector') THEN
+        v_rules := jsonb_build_array(
+            'key-recompute: a write to a source row marks the projection keys it maps to (old and new values of the mapped column)',
+            CASE WHEN p.kind = 'vector'
+                 THEN 'for each marked key the text is re-derived with the projection''s own query; an embedding is requested only if md5(text) changed, and written only if the job''s hash still matches'
+                 ELSE 'for each marked key the value is re-derived with the projection''s own query and written; keys the query no longer produces are deleted' END,
+            'so the stored value for a key equals recomputation from the tables at the time it was applied');
+        v_assume := jsonb_build_array(
+            'every relation the query reads is a mapped source (completeness)',
+            'each mapped column holds the projection key for that row, or the table is a lookup table (null mapping: any change re-derives every key)',
+            CASE WHEN p.freshness = 'sync' THEN 'sync: the triggers run in the writing transaction, on the shard holding every row the key depends on (co-location), under a per-key lock'
+                 ELSE format('bounded: queued keys (including those queued on worker nodes) are applied within the lag budget (%s); read-your-writes via isomer.wait_for', p.lag_budget) END);
+
+        v_tables := ARRAY(SELECT isomer._query_tables(p.query));
+        SELECT bool_and(EXISTS (SELECT 1 FROM isomer.projection_sources ps WHERE ps.projection = p.name AND ps.source_table::regclass = t)),
+               string_agg(t::text, ', ') FILTER (WHERE NOT EXISTS (SELECT 1 FROM isomer.projection_sources ps WHERE ps.projection = p.name AND ps.source_table::regclass = t))
+        INTO v_ok, v_detail FROM unnest(v_tables) t;
+        v_checks := v_checks || jsonb_build_object('check', 'completeness', 'passed', coalesce(v_ok, false),
+            'detail', CASE WHEN v_ok THEN format('%s relation(s) read, all mapped', cardinality(v_tables)) ELSE 'unmapped: ' || v_detail END);
+
+        FOR s IN SELECT * FROM isomer.projection_sources WHERE projection = p.name LOOP
+            v_dist := (isomer._distribution(s.source_table::regclass)).method = 'h';
+            IF v_dist THEN
+                v_ok := isomer._triggers_on_all_placements(s.source_table::regclass, p.name);
+            ELSE
+                v_ok := EXISTS (SELECT 1 FROM pg_trigger WHERE tgrelid = s.source_table::regclass
+                                AND tgname = 'isomer_' || p.name AND tgenabled = 'A');
+            END IF;
+            v_checks := v_checks || jsonb_build_object('check', 'capture on ' || s.source_table, 'passed', v_ok,
+                'detail', CASE WHEN v_ok THEN 'row and truncate triggers present, ENABLE ALWAYS' || CASE WHEN v_dist THEN ', on every shard placement on every node' ELSE '' END
+                               ELSE 'missing or disabled: run isomer._create_source_triggers(' || quote_literal(p.name) || ')' END);
+        END LOOP;
+
+        IF p.freshness = 'sync' THEN
+            v_reason := isomer._check_sources(p.name, 'sync');
+            v_checks := v_checks || jsonb_build_object('check', 'sync preconditions', 'passed', v_reason IS NULL,
+                'detail', coalesce(v_reason, 'IsomerDB is primary for every source and distributed sources are co-located on the key'));
+        END IF;
+    ELSE
+        SELECT * INTO st FROM pgtrickle.pgt_stream_tables WHERE pgt_schema = p.target_schema AND pgt_name = p.name;
+        v_rules := jsonb_build_array(
+            format('pg_trickle %s maintenance: %s', coalesce(st.effective_refresh_mode, st.refresh_mode),
+                   CASE WHEN coalesce(st.effective_refresh_mode, st.refresh_mode) = 'DIFFERENTIAL'
+                        THEN 'changes are captured per source row and the query''s delta is applied (DBSP-style incremental rules)'
+                        WHEN coalesce(st.effective_refresh_mode, st.refresh_mode) = 'IMMEDIATE'
+                        THEN 'the delta is applied inside the writing transaction'
+                        ELSE 'the query is recomputed in full each refresh' END),
+            'BM25 index maintained by pg_search on the stream table');
+        v_assume := jsonb_build_array('change capture fires for every write to every source, including replicated ones (CDC triggers ENABLE ALWAYS, row mode)');
+        SELECT bool_and(t.tgenabled = 'A'), count(*) INTO v_ok, v_n
+        FROM pgtrickle.pgt_dependencies d JOIN pg_trigger t ON t.tgrelid = d.source_relid AND t.tgname LIKE 'pg_trickle_cdc_%'
+        WHERE d.pgt_id = st.pgt_id;
+        v_checks := v_checks || jsonb_build_object('check', 'capture on sources', 'passed', coalesce(v_ok, false),
+            'detail', CASE WHEN v_ok THEN 'pg_trickle CDC triggers present and ENABLE ALWAYS' ELSE 'CDC triggers missing or not ENABLE ALWAYS' END);
+        v_checks := v_checks || jsonb_build_object('check', 'stream table healthy', 'passed', coalesce(st.status = 'ACTIVE', false),
+            'detail', format('status %s', coalesce(st.status, 'missing')));
+    END IF;
+
+    SELECT * INTO st FROM isomer.audit_stats WHERE projection = p.name;
+    RETURN jsonb_build_object(
+        'projection', p.name, 'kind', p.kind, 'freshness', p.freshness, 'strategy', p.strategy,
+        'strategy_reason', p.strategy_reason,
+        'valid', NOT EXISTS (SELECT 1 FROM jsonb_array_elements(v_checks) c WHERE NOT (c ->> 'passed')::boolean),
+        'rules', v_rules, 'assumptions', v_assume, 'checks', v_checks,
+        'auditor', jsonb_build_object('checks', coalesce(st.checks, 0), 'drift', coalesce(st.drift, 0), 'since', st.since),
+        'issued_at', now());
+END $$;
+
+CREATE OR REPLACE FUNCTION isomer._full_refresh(p_projection text)
+RETURNS void LANGUAGE plpgsql SET search_path = pg_catalog AS $$
+DECLARE
+    p isomer.projections;
+BEGIN
+    SELECT * INTO STRICT p FROM isomer.projections WHERE name = p_projection;
+    IF p.kind IN ('document', 'cache') THEN
+        PERFORM isomer._rebuild_all(p.name);
+    ELSIF p.kind = 'analytics' AND p.strategy = 'incremental' THEN
+        PERFORM isomer._analytics_rebuild(p.name, false);   -- the state was just rebuilt
+    ELSIF p.kind = 'vector' THEN
+        EXECUTE format('DELETE FROM %s WHERE key NOT IN (SELECT isomer._all_keys(%L))',
+                       isomer._vector_store(p.name), p.name);
+        DELETE FROM isomer.embed_jobs j WHERE j.projection = p.name
+            AND j.key NOT IN (SELECT isomer._all_keys(p.name));
+        INSERT INTO isomer.pending (projection, key, token)
+        SELECT p.name, k, isomer.current_token() FROM isomer._all_keys(p.name) k ON CONFLICT DO NOTHING;
+    END IF;
+END $$;
+
+CREATE OR REPLACE FUNCTION isomer.create_event_projection(
+    name      text,
+    source    regclass,
+    events    jsonb,
+    key       text DEFAULT NULL,
+    retention interval DEFAULT '7 days')
+RETURNS text LANGUAGE plpgsql SET search_path = pg_catalog AS $$
+DECLARE
+    v_src    text := isomer._qualified(source);
+    v_pk     text[] := isomer._primary_key(source);
+    v_key    text;
+    v_union  text;
+    v_sql    text;
+    v_probe  text;
+BEGIN
+    IF jsonb_typeof(events) <> 'object' OR events = '{}' THEN
+        RAISE EXCEPTION 'isomer: events must be an object of event types, e.g. {"order_paid": {"when": "new.status = ''paid''"}}';
+    END IF;
+    v_key := coalesce(key, CASE WHEN cardinality(v_pk) = 1 THEN format('coalesce(new.%1$I, old.%1$I)', v_pk[1]) END);
+    IF v_key IS NULL THEN
+        RAISE EXCEPTION 'isomer: % has no single-column primary key; give key => an expression over old and new', source;
+    END IF;
+    SELECT string_agg(format('SELECT %L::text AS type, (%s)::jsonb AS payload WHERE %s',
+                             e.type,
+                             -- A missing row reads as a row of nulls, which IS NULL.
+                             coalesce(e.def ->> 'payload', 'to_jsonb(CASE WHEN new IS NULL THEN old ELSE new END)'),
+                             coalesce(e.def ->> 'when', 'true')), ' UNION ALL ' ORDER BY e.type)
+    INTO v_union FROM jsonb_each(events) e(type, def);
+    -- One statement turns a batch of captured changes (old and new images) into events.
+    v_sql := format(
+        $q$SELECT d.id, d.token, ev.type, (%1$s)::text AS key, ev.payload
+           FROM unnest($1::isomer.deltas[]) d
+           CROSS JOIN LATERAL jsonb_populate_record(NULL::%2$s, CASE WHEN jsonb_typeof(d.image -> 'old') = 'object' THEN d.image -> 'old' END) AS old
+           CROSS JOIN LATERAL jsonb_populate_record(NULL::%2$s, CASE WHEN jsonb_typeof(d.image -> 'new') = 'object' THEN d.image -> 'new' END) AS new
+           CROSS JOIN LATERAL (%3$s) ev
+           ORDER BY d.id, ev.type$q$,
+        v_key, v_src, v_union);
+    -- Check it compiles now, not at the first write.
+    v_probe := format('SELECT * FROM (%s) s LIMIT 0', replace(v_sql, '$1::isomer.deltas[]', 'ARRAY[]::isomer.deltas[]'));
+    BEGIN
+        EXECUTE v_probe;
+    EXCEPTION WHEN OTHERS THEN
+        RAISE EXCEPTION 'isomer: the event rules for % do not compile: %', name, SQLERRM
+            USING HINT = 'Each "when" is a condition and each "payload" a jsonb expression, over old and new.';
+    END;
+
+    INSERT INTO isomer.projections (name, kind, query, key_column, key_type, freshness, lag_budget, history, history_since, strategy, strategy_reason, definition)
+    VALUES (name, 'event', v_sql, 'key', 'text', 'bounded', interval '2 seconds', retention, clock_timestamp(),
+            'incremental', 'events are derived from each captured change',
+            jsonb_build_object('source', v_src, 'events', events, 'key', key));
+    INSERT INTO isomer.projection_sources (projection, source_table, key_column) VALUES (name, v_src, NULL);
+    INSERT INTO isomer.projection_stats (projection) VALUES (name) ON CONFLICT DO NOTHING;
+    PERFORM isomer._create_source_triggers(name);
+    RETURN format('event projection %s: %s event type(s) from %s, kept %s; read with isomer.changes_since(%L, cursor)',
+                  name, (SELECT count(*) FROM jsonb_object_keys(events)), v_src, retention, name);
+END $$;
+
+-- Projections as the statements that create them again: analytics and event projections through
+-- their own functions (an event projection created before 0.21.0 kept only its compiled form, so
+-- it is listed as a comment).
+CREATE OR REPLACE FUNCTION isomer.dump_projections()
+RETURNS SETOF text LANGUAGE sql STABLE SET search_path = pg_catalog AS $$
+    SELECT CASE p.kind
+        WHEN 'analytics' THEN
+            format('SELECT isomer.create_analytics_projection(name => %L, query => %L, refresh => %L, target_schema => %L, strategy => %L);',
+                   p.name, p.query, coalesce((p.definition ->> 'refresh')::interval, p.lag_budget), coalesce(p.target_schema, 'public'),
+                   CASE p.strategy WHEN 'incremental' THEN 'incremental' ELSE 'rebuild' END)
+        WHEN 'event' THEN
+            CASE WHEN p.definition IS NULL
+                 THEN format('-- event projection %s was created before 0.21.0 and its rules were not recorded: recreate it with isomer.create_event_projection', p.name)
+                 ELSE format('SELECT isomer.create_event_projection(name => %L, source => %L, events => %L, key => %L, retention => %L);',
+                             p.name, p.definition ->> 'source', p.definition -> 'events', p.definition ->> 'key', p.history) END
+        ELSE
+            format('SELECT isomer.create_projection(name => %L, query => %L, kind => %L, key => %L, '
+                   'freshness => %L, lag => %L, sources => %L, database => %L, index_columns => %L, target_schema => %L, model => %L, strategy => %L);',
+                   p.name, p.query, p.kind, p.key_column, p.freshness, p.lag_budget,
+                   (SELECT jsonb_object_agg(s.source_table, s.key_column) FROM isomer.projection_sources s WHERE s.projection = p.name),
+                   coalesce(p.mongo_database, 'isomer'), p.index_columns, coalesce(p.target_schema, 'public'), p.model, p.strategy) END
+    FROM isomer.projections p ORDER BY p.created_at
+$$;
+
+REVOKE EXECUTE ON FUNCTION isomer.create_analytics_projection(text, text, interval, text, text),
+                           isomer._analytics_keys(text), isomer._analytics_columns(isomer.projections),
+                           isomer._analytics_view(isomer.projections, text), isomer._analytics_rebuild(text, boolean),
+                           isomer._analytics_merge(text), isomer._analytics_apply(text, text[]), isomer._analytics_on_workers(text),
+                           isomer._engine_keys_of(text, text, text), isomer._sync_incremental_blocker(regclass[]),
+                           isomer._sync_fold(text), isomer._on_source_statement()
+    FROM PUBLIC;

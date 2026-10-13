@@ -252,7 +252,9 @@ SELECT isomer.create_event_projection('order_events', 'orders', events => '{
                  "payload": "jsonb_build_object(''total'', new.total)"}}');
 SELECT * FROM isomer.changes_since('order_events', 0);
 
--- A query kept as a columnar table for analytics, rebuilt when its sources change
+-- A query kept as a columnar table for analytics. This one is maintained incrementally: each
+-- change rewrites only the days it reaches, merged into the columnar table every 5 minutes. A
+-- query the engine can't maintain is rebuilt when its sources change instead.
 SELECT isomer.create_analytics_projection('daily_revenue',
   $$ SELECT date_trunc('day', o.created_at) AS day, sum(o.total) AS revenue FROM orders o GROUP BY 1 $$,
   refresh => '5 minutes');
@@ -349,7 +351,6 @@ coordinator, and on every node's clock. They have found and fixed three bugs so 
 | Area | Not built yet | PRD |
 |---|---|---|
 | Projections | Incremental state sharded across nodes (it is kept on the coordinator); correlated subqueries are re-derived by key (the same document written with a join and `GROUP BY` is maintained incrementally) | FR-P6 |
-| Projections | Analytics projections maintained incrementally (they are rebuilt in full when their sources change) | Later |
 | Adoption | Attach and cutover run against each real managed provider in CI: the provider check and a run as a non-superuser role are done, real providers need their accounts | FR-A11 |
 | Cloud | Charging cards (invoices are computed, collecting payment needs a payment provider account); regions in other clouds run for real | FR-CL1, CL2 |
 | Product | Trademark clearance, ParadeDB HA licensing, design partners | PRD §15 |

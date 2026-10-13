@@ -1,7 +1,7 @@
 #!/bin/bash
 # Event projections (domain events from row changes, in commit order per row, exactly once) and
-# analytics projections (a query kept as a columnar table, rebuilt when its sources change). Runs
-# on one node and on the cluster.
+# analytics projections (a query kept as a columnar table, rebuilt when its sources change, or
+# maintained incrementally from row deltas and merged). Runs on one node and on the cluster.
 #
 #   docker compose --profile attach --profile test up -d && ./tests/events_analytics.sh
 set -euo pipefail
@@ -82,7 +82,7 @@ expect "and a consumer behind them is told to start again" "IS003" \
 echo "== analytics projections"
 $ISO -c "INSERT INTO ev.orders SELECT g, g % 20, CASE WHEN g % 3 = 0 THEN 'paid' ELSE 'new' END, g FROM generate_series(1000, 5999) g" >/dev/null
 contains "a query kept as a columnar table" "columnar" \
-  "$($ISO -c "SELECT isomer.create_analytics_projection('ev_by_status', 'SELECT o.status, count(*) AS orders, sum(o.total) AS revenue FROM ev.orders o GROUP BY o.status', refresh => '1 second')")"
+  "$($ISO -c "SELECT isomer.create_analytics_projection('ev_by_status', 'SELECT o.status, count(*) AS orders, sum(o.total) AS revenue FROM ev.orders o GROUP BY o.status', refresh => '1 second', strategy => 'rebuild')")"
 expect "stored by the columnar access method" "columnar" \
   "$($ISO -c "SELECT a.amname FROM pg_class c JOIN pg_am a ON a.oid = c.relam WHERE c.oid = 'isomer_analytics.ev_by_status_1'::regclass")"
 expect "it holds what the query returns" "0" "$($ISO -c "SELECT isomer.analytics_differences('ev_by_status')")"
@@ -98,5 +98,38 @@ expect "the certificate holds" "true" "$($ISO -c "SELECT isomer.certificate('ev_
 $ISO -c "SELECT isomer.drop_projection('ev_by_status')" >/dev/null
 expect "dropping removes the view and its table" "0" \
   "$($ISO -c "SELECT count(*) FROM pg_class WHERE relnamespace = 'isomer_analytics'::regnamespace AND relname LIKE 'ev\_by\_status%'")"
+
+echo "== analytics projections maintained incrementally"
+$ISO -c "INSERT INTO ev.orders SELECT g, g % 40, CASE WHEN g % 3 = 0 THEN 'paid' ELSE 'new' END, g % 500 FROM generate_series(10000, 29999) g" >/dev/null
+BY_CUSTOMER='SELECT o.customer_id, o.status, count(*) AS orders, sum(o.total) AS revenue, max(o.total) AS largest, count(DISTINCT o.total) AS amounts FROM ev.orders o GROUP BY o.customer_id, o.status'
+contains "a grouped query is maintained incrementally, and says why" "each change is folded into partial aggregates" \
+  "$($ISO -c "SELECT isomer.create_analytics_projection('ev_by_customer', '$BY_CUSTOMER', refresh => '1 hour')" -c "SELECT strategy_reason FROM isomer.projections WHERE name = 'ev_by_customer'")"
+expect "it holds what the query returns" "0" "$($ISO -c "SELECT isomer.analytics_differences('ev_by_customer')")"
+contains "a percentile would keep a copy of every row, so it is rebuilt instead" "keep a copy of every row its percentile_disc read" \
+  "$($ISO -c "SELECT isomer.create_analytics_projection('ev_median', 'SELECT o.status, percentile_disc(0.5) WITHIN GROUP (ORDER BY o.total) AS median FROM ev.orders o GROUP BY o.status')" -c "SELECT strategy_reason FROM isomer.projections WHERE name = 'ev_median'")"
+$ISO -c "SELECT isomer.drop_projection('ev_median')" >/dev/null
+$ISO -c "INSERT INTO ev.orders VALUES (90001, 3, 'paid', 999), (90002, 41, 'new', 5)" \
+     -c "UPDATE ev.orders SET status = 'refunded' WHERE customer_id = 5 AND id % 2 = 0" \
+     -c "UPDATE ev.orders SET total = total + 1 WHERE customer_id = 6" \
+     -c "DELETE FROM ev.orders WHERE customer_id = 7" >/dev/null
+eventually "inserts, moves between groups, updates and deletes reach the rows" "0" "$ISO -c \"SELECT isomer.analytics_differences('ev_by_customer')\""
+expect "without running the query again: the same columnar table, plus changed rows" "1 true" \
+  "$($ISO -c "SELECT generation || ' ' || ((SELECT count(*) FROM isomer_analytics.ev_by_customer_changes) > 0) FROM isomer.analytics_builds WHERE projection = 'ev_by_customer'")"
+expect "a customer whose orders are all gone has no rows" "0" "$($ISO -c "SELECT count(*) FROM public.ev_by_customer WHERE customer_id = 7")"
+expect "a new customer has a row" "1" "$($ISO -c "SELECT orders FROM public.ev_by_customer WHERE customer_id = 41")"
+contains "changed rows are merged into a new columnar table" "changed rows merged" "$($ISO -c "SELECT isomer.refresh_analytics('ev_by_customer')")"
+expect "leaving no changes, and the same rows" "0 0" \
+  "$($ISO -c "SELECT (SELECT count(*) FROM isomer_analytics.ev_by_customer_changes) || ' ' || isomer.analytics_differences('ev_by_customer')")"
+expect "the old columnar table is gone" "f" "$($ISO -c "SELECT to_regclass('isomer_analytics.ev_by_customer_1') IS NOT NULL")"
+$ISO -c "TRUNCATE ev.orders" -c "INSERT INTO ev.orders VALUES (1, 1, 'paid', 10), (2, 1, 'paid', 20)" >/dev/null
+eventually "a TRUNCATE rebuilds it" "0 1" "$ISO -c \"SELECT isomer.analytics_differences('ev_by_customer') || ' ' || (SELECT count(*) FROM public.ev_by_customer)\""
+expect "the certificate holds" "true" "$($ISO -c "SELECT isomer.certificate('ev_by_customer') ->> 'valid'")"
+contains "and names how rows are kept" "re-derived from the state into a table of changed rows" "$($ISO -c "SELECT isomer.certificate('ev_by_customer') -> 'rules'")"
+contains "dump_projections writes it back with its own function" "create_analytics_projection(name => 'ev_by_customer'" "$($ISO -c "SELECT string_agg(d, ' ') FROM isomer.dump_projections() d")"
+contains "and the event projection with its rules" "create_event_projection(name => 'ev_orders'" "$($ISO -c "SELECT string_agg(d, ' ') FROM isomer.dump_projections() d")"
+$ISO -c "SELECT isomer.drop_projection('ev_by_customer')" >/dev/null
+expect "dropping removes its tables and state" "0 0" \
+  "$($ISO -c "SELECT (SELECT count(*) FROM pg_class WHERE relnamespace = 'isomer_analytics'::regnamespace AND relname LIKE 'ev\_by\_customer%') || ' ' || (SELECT count(*) FROM pg_class WHERE relnamespace = 'isomer_state'::regnamespace AND relname LIKE isomer._engine_prefix('ev_by_customer') || '%')")"
+
 $ISO -c "SELECT isomer.drop_projection('ev_orders')" >/dev/null
 echo "events_analytics: all checks passed"

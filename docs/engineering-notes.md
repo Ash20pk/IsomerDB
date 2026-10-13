@@ -45,6 +45,42 @@ opt-in setting.
    unmodified as its own import commit on a branch, then re-apply our changes. Update the tables
    above in the same change.
 
+## 2026-10-13 — Analytics projections maintained incrementally (roadmap)
+
+`tests/events_analytics.sh` passes on one node and on the three-node cluster (isomer 0.21.0).
+
+An analytics projection whose query the engine can maintain (`create_analytics_projection(...,
+strategy => 'incremental')`, or `'auto'`) keeps the engine's state like a document projection, and
+its rows in two tables:
+
+- **a columnar table** (the base), each row tagged with its key `__k`: the jsonb array of the
+  query's grouped output columns (`[]` for a single aggregate row). A query whose rows can't be
+  told apart by their columns (it groups by something it doesn't return) isn't maintained this
+  way;
+- **a heap of changed rows** (`<name>_changes`): each key the deltas reach is re-derived from the
+  state there, or marked deleted when the query no longer returns it. The derivation is filtered
+  by each key column's values, so the planner pushes the filter below the grouping and derives
+  only those keys, then by the whole key.
+
+The view is the base with its changed rows replaced (an anti-join on `__k`, hashed: the changes
+are few). At most every refresh interval the two are merged into a new columnar table, without
+running the query; the changes table is locked against writes for the merge, readers are not.
+`refresh_analytics(name, force => true)` builds everything again from the tables. A TRUNCATE of a
+source rebuilds the state and the base.
+
+`'auto'` picks incremental maintenance when the query fits and none of its aggregates is kept as
+written (a percentile would keep a copy of every row it reads, larger than the table it
+produces); `'rebuild'` is how 0.20 kept every analytics projection.
+
+`analytics_differences` checks an incremental one in one statement, so the tables, the rows and
+the queues are seen at one moment: with nothing queued, every committed change is in the rows. On
+a cluster, deltas still on a worker are outside that moment, so they are checked before and after.
+
+Also: `dump_projections` wrote every projection as `create_projection(...)`, which refuses the
+analytics and event kinds, so a dump of a database with either failed on restore. It now writes
+them with their own functions; event projections record their rules (one created before 0.21.0
+kept only its compiled form, and is listed as a comment).
+
 ## 2026-10-13 — Incremental maintenance for more queries: nested documents, DISTINCT, grouping expressions, sync (FR-P6)
 
 `tests/incremental.sh` passes on one node and on the three-node cluster (isomer 0.21.0).
