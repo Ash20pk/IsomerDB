@@ -21,6 +21,10 @@
 --     into a heap of changed rows beside the columnar table; readers see the columnar table with
 --     those rows replaced, and at most every refresh interval the two are merged into a new
 --     columnar table, without running the query again. strategy => 'rebuild' is the 0.20 way.
+--   * state => 'distributed' (create_projection, alter_projection): an incremental projection's
+--     partial aggregates are hash-distributed across the nodes by group, and the joined tables'
+--     kept columns are reference tables on every node. Folds write each group on the node holding
+--     its shard; a key is derived by a distributed query filtered by the key on every shard.
 --   * dump_projections writes analytics and event projections back with their own functions
 --     (event projections now record their rules).
 
@@ -281,6 +285,77 @@ BEGIN
                                       UNION ALL SELECT jsonb_array_length(a -> 'rtes')) s));
 END $$;
 
+-- ── Incremental state distributed across the cluster ───────────────────────
+--
+-- state => 'distributed' (create_projection, alter_projection): the aggregated table's partial
+-- aggregates, and the multisets behind min and max, are hash-distributed across the nodes by
+-- group, and the joined tables' kept columns are reference tables, on every node. Folding writes
+-- each group's partial aggregates on the node holding its shard; a key is derived by a
+-- distributed query that filters by the key on every shard, aggregates there, and combines the
+-- partial results on the coordinator. The coordinator keeps only the staging tables a fold
+-- passes through.
+
+ALTER TABLE isomer.projections
+    ADD COLUMN state_placement text NOT NULL DEFAULT 'coordinator' CHECK (state_placement IN ('coordinator', 'distributed'));
+
+-- Why an incremental projection's state can't be distributed, or NULL.
+CREATE FUNCTION isomer._distribute_blocker(p_shape jsonb)
+RETURNS text LANGUAGE plpgsql STABLE SET search_path = pg_catalog AS $$
+BEGIN
+    IF NOT isomer._multi_node() THEN
+        RETURN 'there are no worker nodes to distribute it across';
+    END IF;
+    IF NOT (p_shape ->> 'ok')::boolean THEN
+        RETURN 'it isn''t maintained incrementally: ' || (p_shape ->> 'reason');
+    END IF;
+    RETURN NULL;
+END $$;
+
+-- Fold a joined table's changed rows (its staging table) into the columns kept for it (see
+-- 0.17.0). A reference table on every node can't be written from a table on the coordinator
+-- alone, so for a distributed state the netted rows are read here first and written from a
+-- parameter.
+CREATE OR REPLACE FUNCTION isomer._engine_fold_dim(src jsonb)
+RETURNS void LANGUAGE plpgsql SET search_path = pg_catalog AS $$
+DECLARE
+    v_cols  text := (SELECT string_agg(format('%I', c), ', ') FROM jsonb_array_elements_text(src -> 'cols') c);
+    v_xcols text := (SELECT string_agg(format('x.%I', c), ', ') FROM jsonb_array_elements_text(src -> 'cols') c);
+    v_pk    text := (SELECT string_agg(format('%I', c), ', ') FROM jsonb_array_elements_text(src -> 'pk') c);
+    v_upd   text := (SELECT string_agg(format('%1$I = EXCLUDED.%1$I', c), ', ') FROM jsonb_array_elements_text(src -> 'cols') c
+                     WHERE NOT (src -> 'pk' ? c));
+    v_net   text;
+    v_rows  jsonb;
+BEGIN
+    v_net := format('SELECT %s, sum(__w) AS __w FROM %s GROUP BY %s', v_cols, src ->> 'staging', v_cols);
+    IF coalesce((src ->> 'replicated')::boolean, false) THEN
+        EXECUTE format('SELECT jsonb_agg(x) FROM (%s) x WHERE x.__w <> 0', v_net) INTO v_rows;
+        IF v_rows IS NULL THEN
+            RETURN;
+        END IF;
+        v_net := format('SELECT * FROM jsonb_to_recordset($1) AS r(%s, __w bigint)',
+                        (SELECT string_agg(format('%I %s', c, isomer._coltype((src ->> 'table')::regclass, c)), ', ')
+                         FROM jsonb_array_elements_text(src -> 'cols') c));
+    END IF;
+    IF jsonb_typeof(src -> 'pk') = 'array' THEN
+        EXECUTE format('UPDATE %1$s s SET __w = s.__w + x.__w FROM (%2$s) x WHERE x.__w < 0 AND (%3$s) = (%4$s)',
+                       src ->> 'state', v_net,
+                       (SELECT string_agg(format('s.%I', c), ', ') FROM jsonb_array_elements_text(src -> 'pk') c),
+                       (SELECT string_agg(format('x.%I', c), ', ') FROM jsonb_array_elements_text(src -> 'pk') c))
+        USING v_rows;
+        EXECUTE format('DELETE FROM %s WHERE __w <= 0', src ->> 'state');
+        EXECUTE format('INSERT INTO %1$s AS s (%2$s, __w) SELECT %3$s, x.__w FROM (%4$s) x WHERE x.__w > 0 '
+                       'ON CONFLICT (%5$s) DO UPDATE SET %6$s__w = s.__w + EXCLUDED.__w',
+                       src ->> 'state', v_cols, v_xcols, v_net, v_pk, coalesce(v_upd || ', ', ''))
+        USING v_rows;
+    ELSE
+        EXECUTE format('INSERT INTO %1$s AS s (__h, %2$s, __w) SELECT md5(jsonb_build_array(%3$s)::text), %3$s, x.__w FROM (%4$s) x WHERE x.__w <> 0 '
+                       'ON CONFLICT (__h) DO UPDATE SET __w = s.__w + EXCLUDED.__w',
+                       src ->> 'state', v_cols, v_xcols, v_net)
+        USING v_rows;
+        EXECUTE format('DELETE FROM %s WHERE __w = 0', src ->> 'state');
+    END IF;
+END $$;
+
 -- Compile (see 0.17.0); aggregates kept as written have no partial aggregate and a NULL template.
 CREATE OR REPLACE FUNCTION isomer._engine_compile(p_projection text)
 RETURNS jsonb LANGUAGE plpgsql SET search_path = pg_catalog SET citus.enable_ddl_propagation = off AS $$
@@ -313,6 +388,7 @@ DECLARE
     v_i        integer;
     v_fpv      text;
     v_truth    text;
+    v_keyed    text;
 BEGIN
     SELECT * INTO STRICT p FROM isomer.projections WHERE name = p_projection;
     s := isomer._engine_shape(p.query, p.key_column, p.kind);
@@ -425,6 +501,25 @@ BEGIN
     END LOOP;
     EXECUTE format('CREATE UNLOGGED TABLE %s AS SELECT * FROM (%s) d WITH NO DATA', v_fd, v_fstage);
 
+    -- Distributed: the partial aggregates and multisets hash-distributed by group, the joined
+    -- tables' kept columns on every node; keys are derived with the key filter inside the query,
+    -- so each shard filters before it aggregates.
+    IF p.state_placement = 'distributed' THEN
+        v_keyed := isomer._engine_sql(p.query, 'derive_keyed', v_fact, NULL, v_rels, v_tmpls, ARRAY[p.key_column]);
+        -- The state is built and read again in this transaction: one connection per node.
+        PERFORM set_config('citus.multi_shard_modify_mode', 'sequential', true);
+        PERFORM set_config('citus.enable_ddl_propagation', 'on', true);
+        PERFORM create_distributed_table(v_p, '__h');
+        FOR x IN SELECT * FROM jsonb_array_elements(v_minmax) LOOP
+            PERFORM create_distributed_table(x ->> 'table', '__h', colocate_with => v_p);
+        END LOOP;
+        FOR r IN SELECT e.key, e.value FROM jsonb_each(v_sources) e WHERE e.value ? 'state' LOOP
+            PERFORM create_reference_table(r.value ->> 'state');
+            v_sources := jsonb_set(v_sources, ARRAY[r.key, 'replicated'], 'true');
+        END LOOP;
+        PERFORM set_config('citus.enable_ddl_propagation', 'off', true);
+    END IF;
+
     x := s || jsonb_build_object('p_table', v_p, 'minmax', v_minmax);
     -- What the tables produce, for the auditor, when the cluster can't run the query as written
     -- (an outer join between tables that are not co-located, say): the same derivation over the
@@ -445,7 +540,8 @@ BEGIN
     x := s || jsonb_build_object(
         'prefix', v_prefix, 'p_table', v_p, 'p_view', v_pv, 'fd_table', v_fd, 'minmax', v_minmax,
         'sources', v_sources, 'derive_sql', v_derive, 'fact_stage_sql', v_fstage,
-        'fact_base_sql', v_fbase, 'key_sqls', v_keys, 'templates', to_jsonb(v_tmpls));
+        'fact_base_sql', v_fbase, 'key_sqls', v_keys, 'templates', to_jsonb(v_tmpls),
+        'distributed', p.state_placement = 'distributed', 'derive_keyed', v_keyed);
     INSERT INTO isomer.engine_plans (projection, plan) VALUES (p.name, x)
     ON CONFLICT (projection) DO UPDATE SET plan = EXCLUDED.plan, compiled_at = clock_timestamp();
     UPDATE isomer.projections SET derive_query = v_derive, truth_query = v_truth WHERE name = p.name;
@@ -702,6 +798,8 @@ BEGIN
     END LOOP;
 END $$;
 
+DROP FUNCTION isomer.create_projection(text, text, text, text, text, interval, jsonb, text, text[], text, text, text);
+
 CREATE OR REPLACE FUNCTION isomer.create_projection(
     name          text,
     query         text,
@@ -714,7 +812,8 @@ CREATE OR REPLACE FUNCTION isomer.create_projection(
     index_columns text[]   DEFAULT NULL,
     target_schema text     DEFAULT 'public',
     model         text     DEFAULT NULL,
-    strategy      text     DEFAULT 'auto')
+    strategy      text     DEFAULT 'auto',
+    state         text     DEFAULT 'coordinator')
 -- No SET search_path here: the query and source names resolve with the caller's search path,
 -- then get stored schema-qualified. Probe views are local, so Citus must not propagate them.
 RETURNS text LANGUAGE plpgsql SET citus.enable_ddl_propagation = off AS $$
@@ -744,6 +843,14 @@ BEGIN
     END IF;
     IF strategy NOT IN ('auto', 'recompute', 'incremental') THEN
         RAISE EXCEPTION 'isomer: strategy must be ''auto'', ''recompute'' or ''incremental'', not %', strategy;
+    END IF;
+    IF state NOT IN ('coordinator', 'distributed') THEN
+        RAISE EXCEPTION 'isomer: state must be ''coordinator'' or ''distributed'', not %', state;
+    END IF;
+    -- A distributed state is created, built and read again in this transaction: Citus must use
+    -- one connection per node from the first statement on.
+    IF state = 'distributed' THEN
+        PERFORM set_config('citus.multi_shard_modify_mode', 'sequential', true);
     END IF;
     IF kind = 'vector' THEN
         IF freshness = 'sync' THEN
@@ -840,14 +947,28 @@ BEGIN
         END IF;
     END IF;
 
+    IF state = 'distributed' THEN
+        IF v_strategy <> 'incremental' THEN
+            RAISE EXCEPTION 'isomer: projection % is maintained by key, which keeps no state to distribute (%)', name, v_why
+                USING HINT = 'Pass strategy => ''incremental''.';
+        END IF;
+        IF freshness = 'sync' THEN
+            RAISE EXCEPTION 'isomer: projection % is sync: it folds in the writing transaction, on its tables'' node', name;
+        END IF;
+        v_reason := isomer._distribute_blocker(isomer._engine_shape(query, key, kind));
+        IF v_reason IS NOT NULL THEN
+            RAISE EXCEPTION 'isomer: the state of projection % can''t be distributed: %', name, v_reason;
+        END IF;
+        v_reason := NULL;
+    END IF;
     INSERT INTO isomer.projections (name, kind, query, key_column, key_type, freshness, lag_budget,
-                                    mongo_database, target_schema, index_columns, model, strategy, strategy_reason)
+                                    mongo_database, target_schema, index_columns, model, strategy, strategy_reason, state_placement)
     VALUES (name, kind, query, key, v_key_type, freshness, lag,
             CASE WHEN kind = 'document' THEN database END,
             CASE WHEN kind IN ('search', 'vector', 'cache') THEN target_schema END,
             CASE WHEN kind = 'search' THEN key || coalesce(index_columns, v_index) END,
             CASE WHEN kind = 'vector' THEN model END,
-            v_strategy, v_why);
+            v_strategy, v_why, state);
 
     IF kind IN ('document', 'vector', 'cache') THEN
         IF v_strategy = 'incremental' THEN
@@ -892,13 +1013,15 @@ BEGIN
             RAISE EXCEPTION 'isomer: projection %: maintained incrementally, % row(s) differ from the query', name, v_diff
                 USING HINT = 'Please report this. Create it with strategy => ''recompute'' meanwhile.';
         END IF;
-        v_result := v_result || ', maintained incrementally';
+        v_result := v_result || ', maintained incrementally' || CASE WHEN state = 'distributed' THEN ', its state distributed across the cluster' ELSE '' END;
     END IF;
     RETURN v_result;
 END $$;
 
+DROP FUNCTION isomer.alter_projection(text, text, interval, text, jsonb);
+
 CREATE OR REPLACE FUNCTION isomer.alter_projection(name text, freshness text DEFAULT NULL, lag interval DEFAULT NULL,
-                                        strategy text DEFAULT NULL, sources jsonb DEFAULT NULL)
+                                        strategy text DEFAULT NULL, sources jsonb DEFAULT NULL, state text DEFAULT NULL)
 RETURNS text LANGUAGE plpgsql SET search_path = pg_catalog AS $$
 DECLARE
     p        isomer.projections;
@@ -911,6 +1034,11 @@ BEGIN
     SELECT * INTO p FROM isomer.projections WHERE projections.name = alter_projection.name FOR NO KEY UPDATE;
     IF NOT FOUND THEN
         RAISE EXCEPTION 'isomer: no projection named %', name;
+    END IF;
+    -- A distributed state is dropped, created or built and read again in this transaction:
+    -- Citus must use one connection per node from the first statement on.
+    IF p.state_placement = 'distributed' OR alter_projection.state = 'distributed' THEN
+        PERFORM set_config('citus.multi_shard_modify_mode', 'sequential', true);
     END IF;
     IF strategy IS NOT NULL AND strategy <> p.strategy THEN
         IF strategy NOT IN ('recompute', 'incremental') THEN
@@ -989,11 +1117,45 @@ BEGIN
         PERFORM isomer._apply(p.name, ARRAY(SELECT key FROM isomer.pending WHERE projection = p.name));
         DELETE FROM isomer.pending WHERE projection = p.name;
     END IF;
+    IF state IS NOT NULL AND state <> p.state_placement THEN
+        IF state NOT IN ('coordinator', 'distributed') THEN
+            RAISE EXCEPTION 'isomer: state must be ''coordinator'' or ''distributed'', not %', state;
+        END IF;
+        IF p.strategy <> 'incremental' THEN
+            RAISE EXCEPTION 'isomer: projection % is maintained by key, which keeps no state to distribute', p.name
+                USING HINT = 'Switch it to strategy => ''incremental'' first.';
+        END IF;
+        IF state = 'distributed' THEN
+            IF p.freshness = 'sync' THEN
+                RAISE EXCEPTION 'isomer: projection % is sync: it folds in the writing transaction, on its tables'' node', p.name;
+            END IF;
+            v_reason := isomer._distribute_blocker(isomer._engine_shape(p.query, p.key_column, p.kind));
+            IF v_reason IS NOT NULL THEN
+                RAISE EXCEPTION 'isomer: the state of projection % can''t be distributed: %', p.name, v_reason;
+            END IF;
+        END IF;
+        -- Built again where it now lives. Dropping the capture triggers locks every shard against
+        -- writes until commit, so the deltas still queued (here and on the workers) are all in the
+        -- tables the new state is built from.
+        PERFORM isomer._drop_source_triggers(p.name);
+        PERFORM isomer._engine_drop_state(p.name);
+        UPDATE isomer.projections SET state_placement = alter_projection.state WHERE projections.name = p.name;
+        DELETE FROM isomer.deltas WHERE projection = p.name;
+        IF isomer._multi_node() THEN
+            PERFORM run_command_on_workers(format('DELETE FROM isomer.node_deltas WHERE projection = %L', p.name));
+        END IF;
+        PERFORM isomer._engine_compile(p.name);
+        PERFORM isomer._create_source_triggers(p.name);
+        PERFORM isomer._engine_build(p.name);
+        PERFORM isomer._rebuild_all(p.name);
+        DELETE FROM isomer.pending WHERE projection = p.name;
+    END IF;
     IF lag IS NOT NULL THEN
         UPDATE isomer.projections SET lag_budget = lag WHERE projections.name = p.name;
     END IF;
     SELECT * INTO p FROM isomer.projections WHERE projections.name = alter_projection.name;
-    RETURN format('%s: freshness %s, lag budget %s, strategy %s', p.name, p.freshness, p.lag_budget, p.strategy);
+    RETURN format('%s: freshness %s, lag budget %s, strategy %s%s', p.name, p.freshness, p.lag_budget, p.strategy,
+                  CASE WHEN p.strategy = 'incremental' THEN ', state on the ' || CASE p.state_placement WHEN 'distributed' THEN 'cluster' ELSE 'coordinator' END ELSE '' END);
 END $$;
 
 CREATE OR REPLACE FUNCTION isomer.choose_strategy(query text, key text, kind text DEFAULT 'document',
@@ -1079,6 +1241,13 @@ BEGIN
         'distinct: count, sum and avg (DISTINCT c) keep c among the grouped columns, so each partial row is one value of c, present while any row holds it',
         'kept as written: an aggregate that is not decomposable (jsonb_agg, string_agg, ordered aggregates) runs as written over partial rows that are one per row of the fact (its primary key is grouped), so over the same rows as the tables give',
         'joins over integrated state: a key can change only if a delta of one input reaches it through the state of the others, before or after the fold (the change of A join B is dA join B + A join dB + dA join dB), so exactly those keys are re-derived, from the state');
+    IF coalesce((plan ->> 'distributed')::boolean, false) THEN
+        rules := rules || to_jsonb(format('distributed state: %s''s partial aggregates are hash-distributed by group across %s nodes and the joined tables'' kept columns are reference tables on every node; a key is derived by filtering on it on every shard, aggregating there, and combining on the coordinator',
+            v_fact, (SELECT count(DISTINCT pl.groupid) FROM pg_dist_shard sh JOIN pg_dist_placement pl USING (shardid) WHERE sh.logicalrelid = (plan ->> 'p_table')::regclass)));
+        checks := checks || jsonb_build_object('check', 'state distributed',
+            'passed', EXISTS (SELECT 1 FROM pg_dist_partition WHERE logicalrelid = (plan ->> 'p_table')::regclass AND partmethod = 'h'),
+            'detail', format('%s shards of partial aggregates', (SELECT count(*) FROM pg_dist_shard WHERE logicalrelid = (plan ->> 'p_table')::regclass)));
+    END IF;
     assumptions := jsonb_build_array(
         'every relation the query reads has a capture trigger on every placement, ENABLE ALWAYS',
         'the unique keys the joins land on still exist (re-checked below)',
@@ -1459,6 +1628,10 @@ BEGIN
     IF p.kind = 'analytics' THEN
         PERFORM isomer._analytics_apply(p.name, p_keys);
         RETURN;
+    END IF;
+    -- A distributed state is derived with the key filter inside the query ($1, the keys).
+    IF p.state_placement = 'distributed' THEN
+        v_query := (SELECT e.plan ->> 'derive_keyed' FROM isomer.engine_plans e WHERE e.projection = p.name);
     END IF;
 
     IF p.kind = 'cache' THEN
@@ -2009,6 +2182,124 @@ BEGIN
                   name, (SELECT count(*) FROM jsonb_object_keys(events)), v_src, retention, name);
 END $$;
 
+CREATE OR REPLACE FUNCTION isomer._engine_drop_state(p_projection text)
+RETURNS void LANGUAGE plpgsql SET search_path = pg_catalog SET citus.enable_ddl_propagation = off AS $$
+DECLARE
+    r record;
+BEGIN
+    FOR r IN SELECT c.oid::regclass AS rel, c.relkind,
+                    EXISTS (SELECT 1 FROM pg_dist_partition d WHERE d.logicalrelid = c.oid) AS citus
+             FROM pg_class c
+             WHERE c.relnamespace = 'isomer_state'::regnamespace
+               AND c.relname LIKE isomer._engine_prefix(p_projection) || '\_%' AND c.relkind IN ('v', 'r')
+             ORDER BY c.relkind = 'r'
+    LOOP
+        -- A distributed state's tables are known to every node: drop them everywhere.
+        PERFORM set_config('citus.enable_ddl_propagation', CASE WHEN r.citus THEN 'on' ELSE 'off' END, true);
+        EXECUTE format('DROP %s IF EXISTS %s CASCADE', CASE r.relkind WHEN 'v' THEN 'VIEW' ELSE 'TABLE' END, r.rel);
+    END LOOP;
+    PERFORM set_config('citus.enable_ddl_propagation', 'off', true);
+    DELETE FROM isomer.engine_plans WHERE projection = p_projection;
+END $$;
+
+CREATE OR REPLACE FUNCTION isomer._engine_fold(p_projection text, p_batch integer DEFAULT 20000)
+RETURNS integer LANGUAGE plpgsql SET search_path = pg_catalog AS $$
+DECLARE
+    p        isomer.projections;
+    plan     jsonb;
+    v_rows   isomer.deltas[];
+    v_relids oid[];
+    v_keys   text[];
+    v_token  bigint;
+    v_oldest timestamptz;
+    src      jsonb;
+    v_rel    oid;
+BEGIN
+    SELECT * INTO STRICT p FROM isomer.projections WHERE name = p_projection;
+    SELECT e.plan INTO plan FROM isomer.engine_plans e WHERE e.projection = p.name;
+    IF plan IS NULL THEN
+        RETURN 0;
+    END IF;
+    PERFORM pg_advisory_xact_lock(hashtext('isomer.engine'), hashtext(p.name));
+    -- A distributed state is written and then read again in this transaction (the keys a fold
+    -- reaches, the derivation): one connection per node, or Citus can't see its own writes.
+    IF coalesce((plan ->> 'distributed')::boolean, false) THEN
+        PERFORM set_config('citus.multi_shard_modify_mode', 'sequential', true);
+    END IF;
+
+    WITH taken AS (
+        DELETE FROM isomer.deltas WHERE id IN (
+            SELECT id FROM isomer.deltas WHERE projection = p.name ORDER BY id LIMIT p_batch)
+        RETURNING *)
+    SELECT array_agg(t ORDER BY t.id) INTO v_rows FROM taken t;
+    IF v_rows IS NULL THEN
+        RETURN 0;
+    END IF;
+    IF EXISTS (SELECT 1 FROM unnest(v_rows) d WHERE d.image IS NULL) THEN
+        PERFORM isomer._engine_rebuild(p.name);
+        RETURN cardinality(v_rows);
+    END IF;
+
+    SELECT min(d.token) FILTER (WHERE d.token > 0), min(d.enqueued_at) INTO v_token, v_oldest FROM unnest(v_rows) d;
+    v_relids := ARRAY(SELECT DISTINCT d.source::regclass::oid FROM unnest(v_rows) d);
+
+    FOREACH v_rel IN ARRAY v_relids LOOP
+        src := plan -> 'sources' -> v_rel::text;
+        CONTINUE WHEN src IS NULL;
+        EXECUTE format('TRUNCATE %s', src ->> 'staging');
+        EXECUTE format('INSERT INTO %1$s SELECT (jsonb_populate_record(NULL::%1$s, d.image || jsonb_build_object(''__w'', d.weight))).* '
+                       'FROM unnest($1) d WHERE d.source::regclass = $2', src ->> 'staging')
+        USING v_rows, v_rel::regclass;
+    END LOOP;
+
+    v_keys := isomer._engine_touched(plan, p.key_column, v_relids);
+
+    IF (plan ->> 'fact_relid')::oid = ANY (v_relids) THEN
+        EXECUTE format('TRUNCATE %s', plan ->> 'fd_table');
+        EXECUTE format('INSERT INTO %s SELECT * FROM (%s) d', plan ->> 'fd_table', plan ->> 'fact_stage_sql');
+        PERFORM isomer._engine_fold_fact(plan, plan ->> 'fd_table');
+    END IF;
+    FOREACH v_rel IN ARRAY v_relids LOOP
+        src := plan -> 'sources' -> v_rel::text;
+        CONTINUE WHEN src IS NULL OR NOT (src ? 'state');
+        PERFORM isomer._engine_fold_dim(src);
+    END LOOP;
+
+    v_keys := v_keys || isomer._engine_touched(plan, p.key_column, v_relids);
+
+    INSERT INTO isomer.pending AS q (projection, key, token, enqueued_at)
+    SELECT p.name, k, coalesce(v_token, 0), v_oldest FROM (SELECT DISTINCT k FROM unnest(v_keys) k) s
+    ON CONFLICT (projection, key) DO UPDATE
+        SET token = CASE WHEN q.token = 0 THEN EXCLUDED.token
+                         WHEN EXCLUDED.token = 0 THEN q.token
+                         ELSE least(q.token, EXCLUDED.token) END,
+            enqueued_at = least(q.enqueued_at, EXCLUDED.enqueued_at);
+    UPDATE isomer.projection_stats SET deltas_folded = deltas_folded + cardinality(v_rows) WHERE projection = p.name;
+    RETURN cardinality(v_rows);
+END $$;
+
+CREATE OR REPLACE FUNCTION isomer.repair(p_projection text, p_keys text[] DEFAULT NULL)
+RETURNS integer LANGUAGE plpgsql SET search_path = pg_catalog AS $$
+DECLARE
+    v_keys text[] := coalesce(p_keys, ARRAY(SELECT DISTINCT key FROM isomer.drift_samples WHERE projection = p_projection));
+    s      record;
+BEGIN
+    IF (SELECT strategy FROM isomer.projections WHERE name = p_projection) = 'incremental' THEN
+        IF (SELECT state_placement FROM isomer.projections WHERE name = p_projection) = 'distributed' THEN
+            PERFORM set_config('citus.multi_shard_modify_mode', 'sequential', true);
+        END IF;
+        PERFORM pg_advisory_xact_lock(hashtext('isomer.engine'), hashtext(p_projection));
+        FOR s IN SELECT source_table FROM isomer.projection_sources WHERE projection = p_projection LOOP
+            EXECUTE format('LOCK TABLE %s IN SHARE MODE', s.source_table);
+        END LOOP;
+        PERFORM run_command_on_workers(format('DELETE FROM isomer.node_deltas WHERE projection = %L', p_projection));
+        DELETE FROM isomer.deltas WHERE projection = p_projection;
+        PERFORM isomer._engine_build(p_projection);
+    END IF;
+    PERFORM isomer._apply(p_projection, v_keys);
+    RETURN cardinality(v_keys);
+END $$;
+
 -- Projections as the statements that create them again: analytics and event projections through
 -- their own functions (an event projection created before 0.21.0 kept only its compiled form, so
 -- it is listed as a comment).
@@ -2026,10 +2317,10 @@ RETURNS SETOF text LANGUAGE sql STABLE SET search_path = pg_catalog AS $$
                              p.name, p.definition ->> 'source', p.definition -> 'events', p.definition ->> 'key', p.history) END
         ELSE
             format('SELECT isomer.create_projection(name => %L, query => %L, kind => %L, key => %L, '
-                   'freshness => %L, lag => %L, sources => %L, database => %L, index_columns => %L, target_schema => %L, model => %L, strategy => %L);',
+                   'freshness => %L, lag => %L, sources => %L, database => %L, index_columns => %L, target_schema => %L, model => %L, strategy => %L, state => %L);',
                    p.name, p.query, p.kind, p.key_column, p.freshness, p.lag_budget,
                    (SELECT jsonb_object_agg(s.source_table, s.key_column) FROM isomer.projection_sources s WHERE s.projection = p.name),
-                   coalesce(p.mongo_database, 'isomer'), p.index_columns, coalesce(p.target_schema, 'public'), p.model, p.strategy) END
+                   coalesce(p.mongo_database, 'isomer'), p.index_columns, coalesce(p.target_schema, 'public'), p.model, p.strategy, p.state_placement) END
     FROM isomer.projections p ORDER BY p.created_at
 $$;
 
@@ -2038,5 +2329,9 @@ REVOKE EXECUTE ON FUNCTION isomer.create_analytics_projection(text, text, interv
                            isomer._analytics_view(isomer.projections, text), isomer._analytics_rebuild(text, boolean),
                            isomer._analytics_merge(text), isomer._analytics_apply(text, text[]), isomer._analytics_on_workers(text),
                            isomer._engine_keys_of(text, text, text), isomer._sync_incremental_blocker(regclass[]),
-                           isomer._sync_fold(text), isomer._on_source_statement()
+                           isomer._sync_fold(text), isomer._on_source_statement(),
+                           isomer._analytics_delta(text), isomer._analytics_base(text, integer),
+                           isomer.create_projection(text, text, text, text, text, interval, jsonb, text, text[], text, text, text, text),
+                           isomer.alter_projection(text, text, interval, text, jsonb, text), isomer._distribute_blocker(jsonb),
+                           isomer._usage_add(text, text, numeric, timestamptz), isomer._usage_delta(text, numeric, boolean)
     FROM PUBLIC;

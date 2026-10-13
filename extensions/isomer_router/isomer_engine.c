@@ -29,6 +29,9 @@
  *     or staging relations whose columns line up with the originals (so every Var stays valid):
  *       'derive'  aggregates replaced by expressions over the fact's partial aggregates, and the
  *                 fact's own filters dropped (they were applied while folding);
+ *       'derive_keyed'  the same, for the keys in $1 (text[]) only: the key column named in
+ *                 fact_columns must equal one of them, a condition in WHERE, so a distributed state
+ *                 is filtered on each shard before it is grouped;
  *       'keys'    aggregates replaced by NULL and HAVING dropped: which keys the rows of one
  *                 relation (driving) reach; the fact's filters are dropped unless it drives;
  *       'fact'    one row per fact row: its grouping and join columns, each aggregate's argument
@@ -41,6 +44,7 @@
 #include "access/table.h"
 #include "catalog/namespace.h"
 #include "catalog/pg_aggregate.h"
+#include "catalog/pg_collation_d.h"
 #include "catalog/pg_type_d.h"
 #include "fmgr.h"
 #include "lib/stringinfo.h"
@@ -51,6 +55,7 @@
 #include "optimizer/optimizer.h"
 #include "parser/analyze.h"
 #include "parser/parse_expr.h"
+#include "parser/parse_coerce.h"
 #include "parser/parse_node.h"
 #include "parser/parse_oper.h"
 #include "parser/parse_relation.h"
@@ -998,11 +1003,12 @@ isomer_engine_sql(PG_FUNCTION_ARGS)
 		rte->relkind = get_rel_relkind(relid);
 	}
 
-	if (strcmp(mode, "derive") == 0 || strcmp(mode, "keys") == 0)
+	if (strcmp(mode, "derive") == 0 || strcmp(mode, "derive_keyed") == 0 || strcmp(mode, "keys") == 0)
 	{
 		ReplaceCtx	ctx;
 		ListCell   *lc;
 		bool		keys = strcmp(mode, "keys") == 0;
+		bool		keyed = strcmp(mode, "derive_keyed") == 0;
 
 		group_dependent_columns(q);
 		ctx.aggs = aggs;
@@ -1050,6 +1056,45 @@ isomer_engine_sql(PG_FUNCTION_ARGS)
 			List	   *taken = NIL;
 
 			split_fact_quals_from((Node *) q->jointree, fact, &taken);
+		}
+
+		/*
+		 * The key is grouped, so filtering the rows by it before grouping gives the same groups
+		 * for those keys: WHERE <key> = ANY ($1::<key type>[]).
+		 */
+		if (keyed)
+		{
+			char	   *key;
+			Node	   *e = NULL;
+			Param	   *prm = makeNode(Param);
+			Node	   *arr;
+			Expr	   *cond;
+
+			if (nfcols != 1 || fcols_null[0])
+				elog(ERROR, "isomer: mode 'derive_keyed' needs the key column");
+			key = TextDatumGetCString(fcols[0]);
+			foreach(lc, q->targetList)
+			{
+				TargetEntry *tle = (TargetEntry *) lfirst(lc);
+
+				if (!tle->resjunk && tle->resname && strcmp(tle->resname, key) == 0)
+					e = flatten_group(q, (Node *) tle->expr);
+			}
+			if (e == NULL)
+				elog(ERROR, "isomer: the query has no column %s", key);
+			prm->paramkind = PARAM_EXTERN;
+			prm->paramid = 1;
+			prm->paramtype = TEXTARRAYOID;
+			prm->paramtypmod = -1;
+			prm->paramcollid = DEFAULT_COLLATION_OID;
+			prm->location = -1;
+			arr = coerce_to_target_type(NULL, (Node *) prm, TEXTARRAYOID, get_array_type(exprType(e)), -1,
+										COERCION_EXPLICIT, COERCE_EXPLICIT_CAST, -1);
+			if (arr == NULL)
+				elog(ERROR, "isomer: the key %s can't be compared with text values", key);
+			cond = make_scalar_array_op(make_parsestate(NULL), list_make1(makeString("=")), true,
+										copyObject(e), arr, -1);
+			AddQual(q, (Node *) cond);
 		}
 	}
 	else if (strcmp(mode, "fact") == 0)

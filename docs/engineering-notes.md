@@ -45,6 +45,47 @@ opt-in setting.
    unmodified as its own import commit on a branch, then re-apply our changes. Update the tables
    above in the same change.
 
+## 2026-10-14 — Incremental state distributed across the cluster (FR-P6)
+
+`tests/incremental.sh` passes on the three-node cluster with a projection whose state is
+distributed, through concurrent writers, a switch to the coordinator and back, and repair; on one
+node it is refused ("no worker nodes").
+
+`create_projection(..., state => 'distributed')` (or `alter_projection(name, state => ...)`):
+
+- **Placement.** The aggregated table's partial aggregates, and the multisets behind min and max,
+  are Citus tables distributed by the group's hash (`__h`), co-located with each other; the joined
+  tables' kept columns are reference tables, on every node. The coordinator keeps only the
+  staging tables a fold passes through. The certificate names the rule and checks the
+  distribution.
+- **Folding** writes each group on the node holding its shard (INSERT ... ON CONFLICT from the
+  coordinator's staging rows). A reference table can't be updated from a table on the coordinator
+  alone, so the joined tables' netted rows are read on the coordinator first and written from a
+  parameter (`jsonb_to_recordset` with the column types spelled out: the staging table's row type
+  doesn't exist on the workers).
+- **Deriving a key** is a distributed query: the pushed-down join of partial aggregates with the
+  reference tables, aggregated on each shard and combined on the coordinator. The derivation
+  filtered from outside (`SELECT ... FROM (derive) q WHERE q.key = ...`) made Citus compute every
+  group as an intermediate result and filter after, so a fold's few keys cost a scan of the whole
+  state. The compiler now writes a keyed derivation (`_engine_sql(..., 'derive_keyed')`) with
+  `key = ANY ($1)` in its WHERE clause: the key is grouped, so filtering rows before grouping gives
+  the same groups, and every shard filters before it aggregates. Every aggregate kind derives the
+  same through Citus (jsonb_agg with ORDER BY, DISTINCT, percentiles were checked).
+
+Things that bit us:
+
+- **Citus couldn't read what it had just written.** A fold writes the distributed state over
+  several connections per node, then reads it in a join with the coordinator's staging tables
+  ("cannot perform query with placements that were modified over multiple connections").
+  Transactions that write a distributed state use one connection per node
+  (`citus.multi_shard_modify_mode = sequential`), set before anything else in the transaction:
+  Citus refuses to switch, or to distribute a table in sequential mode, once a parallel query
+  has run.
+- **Dropping the state left tables on the workers.** The engine drops its state with DDL
+  propagation off (its other relations are the coordinator's alone), which for a Citus table
+  dropped the coordinator's copy only; distributing again failed with "relation already exists"
+  on a worker. Citus tables are now dropped with propagation on.
+
 ## 2026-10-13 — Analytics projections maintained incrementally (roadmap)
 
 `tests/events_analytics.sh` passes on one node and on the three-node cluster (isomer 0.21.0).

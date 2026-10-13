@@ -128,6 +128,34 @@ expect "MongoDB clients read the same document" \
   "$($ISO -c "SELECT (isomer.get('ic_cat_sales', '2') ->> 'revenue')::numeric::float8")" \
   "$("${MONGO[@]}" --eval 'print(db.getSiblingDB("isomer").ic_cat_sales.findOne({_id: 2}).revenue)' 2>&1 | tail -1)"
 
+echo "== state distributed across the cluster"
+if [ "$MULTI" = "t" ]; then
+  contains "sales per category, its state on every node" "its state distributed across the cluster" \
+    "$($ISO -c "SELECT isomer.create_projection('ic_cat_dist', \$q\$$CAT_SALES\$q\$, 'document', 'id', state => 'distributed')")"
+  expect "it equals the query" "0" "$(drift ic_cat_dist)"
+  DPFX=$($ISO -c "SELECT isomer._engine_prefix('ic_cat_dist')")
+  expect "its partial aggregates are sharded across the nodes" "t" \
+    "$($ISO -c "SELECT count(DISTINCT pl.groupid) >= 2 FROM pg_dist_shard sh JOIN pg_dist_placement pl USING (shardid) WHERE sh.logicalrelid = 'isomer_state.${DPFX}_p'::regclass")"
+  expect "the joined tables' columns are on every node" "2" \
+    "$($ISO -c "SELECT count(*) FROM pg_dist_partition WHERE partmethod = 'n' AND logicalrelid::text LIKE 'isomer_state.${DPFX}_s%'")"
+  contains "the certificate says how it is kept" "distributed state" "$($ISO -c "SELECT isomer.certificate('ic_cat_dist') -> 'rules'")"
+  expect "and checks it" "true" "$($ISO -c "SELECT isomer.certificate('ic_cat_dist') ->> 'valid'")"
+  $ISO -c "UPDATE ic.lines SET qty = qty + 1 WHERE order_id % 13 = 0" -c "UPDATE ic.products SET category_id = 3 WHERE id IN (11, 12)" \
+       -c "UPDATE ic.categories SET name = 'renamed again' WHERE id = 4" -c "DELETE FROM ic.lines WHERE order_id BETWEEN 500 AND 520" >/dev/null
+  eventually "writes to every table reach it" "0" "drift ic_cat_dist"
+  contains "moved to the coordinator" "state on the coordinator" "$($ISO -c "SELECT isomer.alter_projection('ic_cat_dist', state => 'coordinator')")"
+  expect "where it still equals the query" "0" "$(drift ic_cat_dist)"
+  contains "and back to the cluster" "state on the cluster" "$($ISO -c "SELECT isomer.alter_projection('ic_cat_dist', state => 'distributed')")"
+  $ISO -c "UPDATE ic.lines SET qty = qty + 1 WHERE order_id % 19 = 0" >/dev/null
+  eventually "where it still follows writes" "0" "drift ic_cat_dist"
+  $ISO -c "UPDATE isomer_state.$($ISO -c "SELECT isomer._engine_prefix('ic_cat_dist')")_p SET __n = __n + 7 WHERE product_id = 2" >/dev/null
+  $ISO -c "SELECT isomer.repair('ic_cat_dist', ARRAY(SELECT id::text FROM ic.categories))" >/dev/null
+  expect "repair builds its state again from the tables" "0" "$(drift ic_cat_dist)"
+else
+  contains "on one node there is nothing to distribute it across" "no worker nodes" \
+    "$($ISO_NOFAIL -c "SELECT isomer.create_projection('ic_bad', \$q\$$CAT_SALES\$q\$, 'document', 'id', state => 'distributed')" 2>&1)"
+fi
+
 echo "== nested documents, DISTINCT, grouping expressions"
 # Each customer with their orders, newest first: jsonb_agg kept as written over a copy of orders.
 CUST_DOCS='SELECT c.id, jsonb_build_object('"'"'name'"'"', c.name, '"'"'orders'"'"',
@@ -233,6 +261,9 @@ for pid in "${pids[@]}"; do wait "$pid" || fail "a writer failed" "exit 0" "exit
 eventually "after 600 concurrent transactions, every key equals the query" "0" "drift ic_cat_sales" 60
 eventually "and every nested order" "0" "drift ic_order_docs" 60
 eventually "and every expression group" "0" "drift ic_status" 60
+if [ "$MULTI" = "t" ]; then
+  eventually "and the distributed state" "0" "drift ic_cat_dist" 60
+fi
 
 
 echo "== TRUNCATE rebuilds the state"
@@ -241,6 +272,9 @@ eventually "the LEFT JOIN cache after a truncate" "0" "drift ic_cust_orders"
 eventually "the global aggregate after a truncate" "0" "drift ic_totals"
 eventually "the nested orders after a truncate" "0" "drift ic_cust_docs"
 expect "two orders remain" "2" "$($ISO -c "SELECT isomer.get('ic_totals', 'all') ->> 'orders'")"
+
+# Checked above; the auditor below samples every projection, so they go first.
+$ISO -c "SELECT isomer.drop_projection(name) FROM isomer.projections WHERE name IN ('ic_cust_docs', 'ic_order_docs', 'ic_status', 'ic_sync', 'ic_cat_dist')" >/dev/null
 
 echo "== FR-S5 the certificate names the rules"
 expect "valid" "true" "$($ISO -c "SELECT isomer.certificate('ic_cat_sales') ->> 'valid'")"
