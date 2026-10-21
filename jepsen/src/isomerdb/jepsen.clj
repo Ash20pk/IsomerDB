@@ -24,7 +24,15 @@
             order through products and a reference table) under random inserts, updates, deletes,
             product moves and statements spanning shards. Its state is folded from row deltas pulled
             from the workers exactly once; at the end it must equal recomputation, with nothing left
-            queued on the workers and no pull left prepared."
+            queued on the workers and no pull left prepared.
+
+    subqueries
+            A customer document built from correlated subqueries (counts, sums, a maximum, the latest
+            order, a lookup of the customer's tier, an EXISTS filter), its state distributed: each
+            subquery's state sharded with the customers it belongs to, the tiers on every node. Under
+            orders inserted, changed, deleted and moved between customers (across shards, in one
+            transaction), customers changing tier, tiers renamed and statements spanning every shard;
+            checked as incremental is."
   (:require [clojure.string :as str]
             [clojure.tools.logging :refer [info warn]]
             [jepsen [checker :as checker]
@@ -416,6 +424,95 @@
          :failed        (count (filter #(= :fail (:type %)) writes))
          :final         final}))))
 
+;; ── the subqueries workload ─────────────────────────────────────────────────
+
+(def sub-customers 200)
+(def sub-tiers 3)
+
+(def sub-query
+  (str "SELECT c.id, jsonb_build_object(''tier'', (SELECT t.name FROM jp_sub.tiers t WHERE t.id = c.tier_id), "
+       "''n'', (SELECT count(*) FROM jp_sub.orders o WHERE o.customer_id = c.id), "
+       "''spent'', (SELECT sum(o.total) FROM jp_sub.orders o WHERE o.customer_id = c.id), "
+       "''biggest'', (SELECT max(o.total) FROM jp_sub.orders o WHERE o.customer_id = c.id), "
+       "''latest'', (SELECT o.id FROM jp_sub.orders o WHERE o.customer_id = c.id ORDER BY o.id DESC LIMIT 1)) AS doc "
+       "FROM jp_sub.customers c WHERE EXISTS (SELECT 1 FROM jp_sub.orders o WHERE o.customer_id = c.id AND o.total > 50)"))
+
+(defn sub-op []
+  (let [c (inc (rand-int sub-customers))]
+    (rand-nth [[:insert c (rand-int 100000) (rand-int 100)]
+               [:insert c (rand-int 100000) (rand-int 100)]
+               [:update c]
+               [:delete c (rand-int 7)]
+               [:move c (inc (rand-int sub-customers)) (rand-int 7)]
+               [:tier c (inc (rand-int sub-tiers))]
+               [:rename (inc (rand-int sub-tiers)) (rand-int 1000)]
+               [:wide (rand-int 100)]])))
+
+(defrecord SubClient [ds conn]
+  client/Client
+  (open! [this test _node]
+    (let [ds (datasource test)]
+      (assoc this :ds ds :conn (atom (jdbc/get-connection ds)))))
+  (setup! [_ test]
+    (once! :subqueries #(with-open [c (jdbc/get-connection (setup-datasource test))]
+      (jdbc/execute! c ["SELECT isomer.drop_projection(name) FROM isomer.projections WHERE name = 'jp_sub_docs'"])
+      (jdbc/execute! c ["DROP SCHEMA IF EXISTS jp_sub CASCADE"])
+      (jdbc/execute! c ["CREATE SCHEMA jp_sub"])
+      (jdbc/execute! c ["CREATE TABLE jp_sub.tiers (id int PRIMARY KEY, name text NOT NULL)"])
+      (jdbc/execute! c ["CREATE TABLE jp_sub.customers (id bigint PRIMARY KEY, tier_id int NOT NULL)"])
+      (jdbc/execute! c ["CREATE TABLE jp_sub.orders (id bigint NOT NULL, customer_id bigint NOT NULL, total numeric NOT NULL, PRIMARY KEY (customer_id, id))"])
+      (jdbc/execute! c ["SELECT create_reference_table('jp_sub.tiers')"])
+      (jdbc/execute! c ["SELECT create_distributed_table('jp_sub.customers', 'id', shard_count => 8)"])
+      (jdbc/execute! c ["SELECT create_distributed_table('jp_sub.orders', 'customer_id', colocate_with => 'jp_sub.customers')"])
+      (jdbc/execute! c [(str "INSERT INTO jp_sub.tiers SELECT g, 'tier ' || g FROM generate_series(1, " sub-tiers ") g")])
+      (jdbc/execute! c [(str "INSERT INTO jp_sub.customers SELECT g, 1 + g % " sub-tiers " FROM generate_series(1, " sub-customers ") g")])
+      (jdbc/execute! c [(str "INSERT INTO jp_sub.orders SELECT g, 1 + g % " sub-customers ", g % 100 FROM generate_series(1, 2000) g")])
+      (jdbc/execute! c [(str "SELECT isomer.create_projection(name => 'jp_sub_docs', kind => 'document', key => 'id', "
+                             "database => 'jp', lag => '2 seconds', strategy => 'incremental', state => 'distributed', "
+                             "query => '" sub-query "')")]))))
+  (invoke! [this _test op]
+    (case (:f op)
+      :write
+      (let [conn           (live! this)
+            [kind a b c] (:value op)]
+        (try
+          (case kind
+            :insert (jdbc/execute! conn ["INSERT INTO jp_sub.orders VALUES (?, ?, ?) ON CONFLICT (customer_id, id) DO UPDATE SET total = EXCLUDED.total"
+                                         b a c])
+            :update (jdbc/execute! conn ["UPDATE jp_sub.orders SET total = total + 7 WHERE customer_id = ?" a])
+            :delete (jdbc/execute! conn ["DELETE FROM jp_sub.orders WHERE customer_id = ? AND id % 7 = ?" a b])
+            ;; An order moving to another customer: its shard column changes, so it is deleted from
+            ;; one shard and inserted on another, in one distributed transaction.
+            :move   (jdbc/with-transaction [tx conn]
+                      (let [moved (jdbc/execute! tx ["DELETE FROM jp_sub.orders WHERE customer_id = ? AND id % 7 = ? RETURNING id, total" a c]
+                                                 {:builder-fn rs/as-unqualified-maps})]
+                        (doseq [{:keys [id total]} moved]
+                          (jdbc/execute! tx ["INSERT INTO jp_sub.orders VALUES (?, ?, ?) ON CONFLICT (customer_id, id) DO UPDATE SET total = EXCLUDED.total"
+                                             id b total]))))
+            :tier   (jdbc/execute! conn ["UPDATE jp_sub.customers SET tier_id = ? WHERE id = ?" b a])
+            ;; A lookup every customer of the tier reads, kept on every node.
+            :rename (jdbc/execute! conn ["UPDATE jp_sub.tiers SET name = 'tier ' || ? || '.' || ? WHERE id = ?" a b a])
+            ;; One statement across every shard of the orders.
+            :wide   (jdbc/execute! conn ["UPDATE jp_sub.orders SET total = total + 1 WHERE total = ?" a]))
+          (assoc op :type :ok)
+          (catch Exception e (outcome op e true))))
+      :final
+      (try
+        (with-retries this
+          (fn [conn]
+            (let [one (fn [q] (:v (jdbc/execute-one! conn [q] {:builder-fn rs/as-unqualified-maps})))]
+              (jdbc/execute! conn ["SELECT isomer.wait_for(isomer.current_token(), 'jp_sub_docs', '120 seconds')"])
+              (assoc op :type :ok
+                     :value {:drift          (one "SELECT count(*) AS v FROM isomer.verify('jp_sub_docs')")
+                             :worker-deltas  (one "SELECT coalesce(sum(result::bigint), 0) AS v FROM run_command_on_workers('SELECT count(*) FROM isomer.node_deltas')")
+                             :prepared-pulls (one (str "SELECT coalesce(sum(result::bigint), 0) AS v FROM run_command_on_workers("
+                                                       "$$SELECT count(*) FROM pg_prepared_xacts WHERE gid LIKE 'isomer\\_pull\\_%'$$)"))
+                             :deltas-folded  (one "SELECT deltas_folded AS v FROM isomer.projection_stats WHERE projection = 'jp_sub_docs'")
+                             :certificate    (one "SELECT isomer.certificate('jp_sub_docs') ->> 'valid' AS v")}))))
+        (catch Exception e (assoc op :type :fail :error (.getMessage e))))))
+  (teardown! [_ _test])
+  (close! [_ _test] (some-> conn deref .close)))
+
 ;; ── the nemesis: faults injected with the Docker CLI ────────────────────────
 
 (defn sh! [& args]
@@ -525,11 +622,20 @@
                           (gen/clients (gen/once {:f :final})))
              :checker   (checker/compose {:incremental (inc-checker)
                                           :timeline    (timeline/html)
-                                          :stats       (checker/stats)})))))
+                                          :stats       (checker/stats)}))
+      :subqueries
+      (assoc base
+             :client    (map->SubClient {})
+             :generator (gen/phases
+                          (timed (gen/stagger (/ 1 (:rate opts)) (fn [] {:f :write :value (sub-op)})))
+                          (gen/clients (gen/once {:f :final})))
+             :checker   (checker/compose {:subqueries (inc-checker)
+                                          :timeline   (timeline/html)
+                                          :stats      (checker/stats)})))))
 
 (def opt-spec
-  [[nil "--workload NAME" "append, ryw, mongo or incremental" :default :append :parse-fn keyword
-    :validate [#{:append :ryw :mongo :incremental} "append, ryw, mongo or incremental"]]
+  [[nil "--workload NAME" "append, ryw, mongo, incremental or subqueries" :default :append :parse-fn keyword
+    :validate [#{:append :ryw :mongo :incremental :subqueries} "append, ryw, mongo, incremental or subqueries"]]
    [nil "--fault-nodes LIST" "the containers faults hit: worker1, worker2, db (the coordinator)" :default ["worker1" "worker2"]
     :parse-fn (fn [s] (str/split s #","))]
    [nil "--skew" "the nodes run with libfaketime, so their clocks can be skewed (add skew to --faults)" :default false]

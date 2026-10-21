@@ -7,6 +7,8 @@
 #   mongo        the same through the MongoDB gateway, with a causally consistent driver session
 #   incremental  an incrementally maintained projection: equal to recomputation at the end, nothing
 #                left queued on the workers, no delta pull left prepared
+#   subqueries   a document of correlated subqueries, its state distributed across the cluster:
+#                checked as incremental is
 #
 #   ./tests/jepsen.sh                         # every workload, faults on the workers, 120s each
 #   ./tests/jepsen.sh ryw --time-limit 300    # one workload, more time (extra args go to Jepsen)
@@ -78,7 +80,7 @@ if [ "${1:-}" = "report" ]; then
     IFS='|' read -r nodes faults skew <<< "$scenario"
     echo "== cluster ($([ "$skew" = 1 ] && echo libfaketime || echo plain) image)"
     cluster "$skew"
-    for w in append ryw mongo incremental; do
+    for w in append ryw mongo incremental subqueries; do
       run "$w" "$nodes" "$faults" "$skew" "$@"
       [ "$verdict" = valid ] || failed+=("$w on $nodes ($faults)")
       rows+=("| $w | ${faults//,/, } | ${nodes//,/, } | $verdict | $(python3 tests/jepsen_summary.py "$last_log") |")
@@ -101,7 +103,7 @@ if [ "${1:-}" = "report" ]; then
   } > "$out"
   echo "== report: $out"
 else
-  workloads=(append ryw mongo incremental)
+  workloads=(append ryw mongo incremental subqueries)
   if [ $# -gt 0 ] && [[ "$1" != -* ]]; then workloads=("$1"); shift; fi
   nodes=${FAULT_NODES:-worker1,worker2}
   skew=${SKEW:-0}
