@@ -28,11 +28,12 @@
 
     subqueries
             A customer document built from correlated subqueries (counts, sums, a maximum, the latest
-            order, a lookup of the customer's tier, an EXISTS filter), its state distributed: each
-            subquery's state sharded with the customers it belongs to, the tiers on every node. Under
-            orders inserted, changed, deleted and moved between customers (across shards, in one
-            transaction), customers changing tier, tiers renamed and statements spanning every shard;
-            checked as incremental is."
+            order, each order's lines, a lookup of the customer's tier, an EXISTS filter), its state
+            distributed: each subquery's state sharded with the customers it belongs to, the lines'
+            anchored to their orders' customers, the tiers on every node. Under orders inserted,
+            changed, deleted and moved between customers (across shards, in one transaction, taking
+            their lines with them), lines written, customers changing tier, tiers renamed and
+            statements spanning every shard; checked as incremental is."
   (:require [clojure.string :as str]
             [clojure.tools.logging :refer [info warn]]
             [jepsen [checker :as checker]
@@ -434,7 +435,9 @@
        "''n'', (SELECT count(*) FROM jp_sub.orders o WHERE o.customer_id = c.id), "
        "''spent'', (SELECT sum(o.total) FROM jp_sub.orders o WHERE o.customer_id = c.id), "
        "''biggest'', (SELECT max(o.total) FROM jp_sub.orders o WHERE o.customer_id = c.id), "
-       "''latest'', (SELECT o.id FROM jp_sub.orders o WHERE o.customer_id = c.id ORDER BY o.id DESC LIMIT 1)) AS doc "
+       "''latest'', (SELECT o.id FROM jp_sub.orders o WHERE o.customer_id = c.id ORDER BY o.id DESC LIMIT 1), "
+       "''units'', (SELECT jsonb_agg(jsonb_build_object(''id'', o.id, ''units'', (SELECT sum(l.qty) FROM jp_sub.lines l WHERE l.order_id = o.id)) ORDER BY o.id) "
+       "FROM jp_sub.orders o WHERE o.customer_id = c.id)) AS doc "
        "FROM jp_sub.customers c WHERE EXISTS (SELECT 1 FROM jp_sub.orders o WHERE o.customer_id = c.id AND o.total > 50)"))
 
 (defn sub-op []
@@ -446,7 +449,9 @@
                [:move c (inc (rand-int sub-customers)) (rand-int 7)]
                [:tier c (inc (rand-int sub-tiers))]
                [:rename (inc (rand-int sub-tiers)) (rand-int 1000)]
-               [:wide (rand-int 100)]])))
+               [:wide (rand-int 100)]
+               [:line (rand-int 2000) (rand-int 3) (inc (rand-int 5))]
+               [:line-qty (rand-int 2000)]])))
 
 (defrecord SubClient [ds conn]
   client/Client
@@ -461,12 +466,16 @@
       (jdbc/execute! c ["CREATE TABLE jp_sub.tiers (id int PRIMARY KEY, name text NOT NULL)"])
       (jdbc/execute! c ["CREATE TABLE jp_sub.customers (id bigint PRIMARY KEY, tier_id int NOT NULL)"])
       (jdbc/execute! c ["CREATE TABLE jp_sub.orders (id bigint NOT NULL, customer_id bigint NOT NULL, total numeric NOT NULL, PRIMARY KEY (customer_id, id))"])
+      (jdbc/execute! c ["CREATE TABLE jp_sub.lines (order_id bigint NOT NULL, line int NOT NULL, qty int NOT NULL, PRIMARY KEY (order_id, line))"])
       (jdbc/execute! c ["SELECT create_reference_table('jp_sub.tiers')"])
       (jdbc/execute! c ["SELECT create_distributed_table('jp_sub.customers', 'id', shard_count => 8)"])
       (jdbc/execute! c ["SELECT create_distributed_table('jp_sub.orders', 'customer_id', colocate_with => 'jp_sub.customers')"])
+      ;; Lines are sharded by order, not with the orders (sharded by customer): their state is anchored.
+      (jdbc/execute! c ["SELECT create_distributed_table('jp_sub.lines', 'order_id', shard_count => 8, colocate_with => 'none')"])
       (jdbc/execute! c [(str "INSERT INTO jp_sub.tiers SELECT g, 'tier ' || g FROM generate_series(1, " sub-tiers ") g")])
       (jdbc/execute! c [(str "INSERT INTO jp_sub.customers SELECT g, 1 + g % " sub-tiers " FROM generate_series(1, " sub-customers ") g")])
       (jdbc/execute! c [(str "INSERT INTO jp_sub.orders SELECT g, 1 + g % " sub-customers ", g % 100 FROM generate_series(1, 2000) g")])
+      (jdbc/execute! c ["INSERT INTO jp_sub.lines SELECT o, l, 1 + (o + l) % 5 FROM generate_series(1, 2000) o, generate_series(0, 1) l"])
       (jdbc/execute! c [(str "SELECT isomer.create_projection(name => 'jp_sub_docs', kind => 'document', key => 'id', "
                              "database => 'jp', lag => '2 seconds', strategy => 'incremental', state => 'distributed', "
                              "query => '" sub-query "')")]))))
@@ -493,7 +502,9 @@
             ;; A lookup every customer of the tier reads, kept on every node.
             :rename (jdbc/execute! conn ["UPDATE jp_sub.tiers SET name = 'tier ' || ? || '.' || ? WHERE id = ?" a b a])
             ;; One statement across every shard of the orders.
-            :wide   (jdbc/execute! conn ["UPDATE jp_sub.orders SET total = total + 1 WHERE total = ?" a]))
+            :wide   (jdbc/execute! conn ["UPDATE jp_sub.orders SET total = total + 1 WHERE total = ?" a])
+            :line     (jdbc/execute! conn ["INSERT INTO jp_sub.lines VALUES (?, ?, ?) ON CONFLICT (order_id, line) DO UPDATE SET qty = EXCLUDED.qty" a b c])
+            :line-qty (jdbc/execute! conn ["UPDATE jp_sub.lines SET qty = qty + 1 WHERE order_id = ?" a]))
           (assoc op :type :ok)
           (catch Exception e (outcome op e true))))
       :final
