@@ -45,6 +45,85 @@ opt-in setting.
    unmodified as its own import commit on a branch, then re-apply our changes. Update the tables
    above in the same change.
 
+## 2026-10-18 — Correlated subqueries maintained incrementally (FR-P6)
+
+`tests/subqueries.sh` passes on one node and on the three-node cluster (isomer 0.22.0), and
+`tests/incremental.sh` and `tests/events_analytics.sh` still pass on both.
+
+A query with subqueries is compiled as **blocks**: the query itself and each subquery in it, in
+the order `isomer._engine_blocks` walks the parse tree (`_engine_sql_blocks` walks it the same way,
+so a block number means the same thing in both). Each block keeps its own state, the way a whole
+projection did:
+
+- **A block that aggregates** keeps its fact's partial aggregates, grouped by the columns its
+  conditions on the outer row read. `(SELECT count(*) FROM orders o WHERE o.customer_id = c.id)`
+  is one partial row per customer, however many orders each has; a filter on orders alone is
+  applied while folding. An aggregate that reads the outer row, or holds a subquery, is kept as
+  written, which is how nesting works: `jsonb_agg(... (SELECT jsonb_agg(...) FROM lines l WHERE
+  l.order_id = o.id) ...)` runs over a copy of the orders with each order's lines block beneath it.
+- **A block that doesn't aggregate** (`EXISTS`, `IN`, `ARRAY(SELECT ...)`, a lookup, `ORDER BY ...
+  LIMIT 1`) keeps copies of the columns it reads. Its derivation runs it as written over them, so
+  ORDER BY, LIMIT and DISTINCT are fine there.
+- A table read by several blocks has one staging table and, where some block joins it without
+  aggregating it, one copy holding every column any of them reads.
+
+**Deriving** a key runs the query as written with every block reading its state: a correlated
+subquery runs once per outer row, over that row's partial aggregates (indexed by the correlation
+column). **Keys**: for each relation of each block, the subqueries on the way up from that block
+become `EXISTS (a correlated changed row)` in their parents, in place of the conditions they were
+part of; `IN (...)` keeps its comparison inside (`(c.id = o.customer_id) IS NOT FALSE`), so a big
+order reaches its own customer, not all of them. Output subqueries of the query become NULL,
+typed before anything below is changed. An uncorrelated subquery reaches every key, as it should.
+
+Not maintained this way, with the reason given: a subquery in ON, GROUP BY, HAVING or LIMIT; a
+subquery outside the aggregates of a block that aggregates (in its WHERE: the filter would depend
+on another table while folding); subqueries in analytics projections; distributing the state of a
+query with subqueries (it stays on the coordinator).
+
+A materialized view declared with correlated subqueries (`tests/native.sh`) now gets incremental
+maintenance from the cost model, where it used to fall back to key recompute; its lookup-table
+notice is for key recompute only, so it is checked on a view that asks for that.
+
+Things that bit us:
+
+- **The auditor's reference over sharded tables.** Citus runs a correlated subquery between tables
+  that are not co-located on its own, but not once the query is filtered, compared (`EXCEPT ALL`)
+  or joined with anything ("complex joins are only supported when all distributed tables are
+  co-located"), not even inside a `MATERIALIZED` CTE. Reading each Citus table through a view
+  `SELECT ... FROM t OFFSET 0` makes it plan each one as an intermediate result on the
+  coordinator, after which the query runs anywhere. That is the projection's `truth_query`.
+- **An EXPLAIN poisons the transaction for documentdb.** `_key_cost` (the cost model) runs
+  `EXPLAIN` over plain tables. After any EXPLAIN, even `EXPLAIN SELECT 1`, Citus sends that
+  transaction's later queries on reference tables to this node over a connection, which can't see
+  what the transaction wrote: `create_projection(..., strategy => 'auto')` over plain tables
+  failed writing to its new collection ("Collection not found ... metadata sync issue", or
+  "cannot execute a distributed query from a query on a shard"). The existing tests only used
+  sharded tables there. The EXPLAIN now runs in a subtransaction that is rolled back (its plan is
+  kept in a variable).
+- **drop_projection left Citus metadata behind.** It runs with DDL propagation off, and a
+  documentdb collection dropped that way keeps its Citus table's shard and `pg_dist_partition`
+  entry, the table itself gone. The next `citus_add_node` failed ("cache lookup failed for
+  relation"), so a node that had ever dropped a document projection could not grow into a
+  cluster. `test-all.sh` recreates volumes between the single-node and cluster stages, so it never
+  saw it. The collection is now dropped with propagation on, and the 0.22.0 upgrade removes what
+  earlier drops left behind, the way Citus's drop trigger would have.
+- **Every fold scanned all its state.** Emptied groups, multiset values and joined rows were
+  deleted with `DELETE ... WHERE __n = 0` over the whole table. A correlated subquery's state has a
+  partial row per outer row, so with 200,000 customers a one-row write folded in 170-860 ms. Only
+  the groups a fold reached can empty, so the deletes are now limited to those: the same write
+  folds in about 4 ms, for a customer with 8 orders or 500,000.
+- **The auditor and trigger DDL deadlocked.** Creating or dropping a projection's capture
+  triggers locks every shard of its tables, and the auditor's reference queries lock shards too,
+  across nodes and in another order (a repartition join reads them in stages). On a cluster
+  Citus's distributed deadlock detector cancelled the DDL: `drop_projection` and
+  `alter_projection` failed now and then in `incremental.sh`, more often the slower the auditor
+  ran (a kind cluster alongside made it 10-60 s). Trigger DDL now takes an advisory lock before it
+  locks anything, waiting for a running audit, and an audit that finds the lock taken skips its
+  round (`audit` and `_create/_drop_source_triggers` are wrappers over the earlier functions).
+- `tests/multinode.sh` declares a projection with correlated subqueries and a lookup table, which
+  the cost model now maintains incrementally; that suite tests key recompute across nodes, so it
+  asks for it.
+
 ## 2026-10-14 — Incremental state distributed across the cluster (FR-P6)
 
 `tests/incremental.sh` passes on the three-node cluster with a projection whose state is

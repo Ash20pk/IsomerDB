@@ -36,6 +36,15 @@
  *                 relation (driving) reach; the fact's filters are dropped unless it drives;
  *       'fact'    one row per fact row: its grouping and join columns, each aggregate's argument
  *                 and filter, and its weight.
+ *
+ *   isomer._engine_blocks(query text) -> jsonb
+ *     A query with subqueries, as blocks: the query and each subquery in it, each with its own
+ *     analysis and where it sits in its parent. Each block keeps its own state.
+ *
+ *   isomer._engine_sql_blocks(query, mode, blocks, block, driving) -> text
+ *     _engine_sql for such a query, each block configured on its own: 'derive' rewrites every
+ *     block; 'keys' turns the subqueries above the driving relation into EXISTS in their parents;
+ *     'fact' is one block's fact rows; 'swap' only swaps relations.
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
@@ -67,11 +76,14 @@
 #include "utils/json.h"
 #include "utils/jsonb.h"
 #include "utils/lsyscache.h"
+#include "utils/numeric.h"
 #include "utils/rel.h"
 #include "utils/ruleutils.h"
 
 PG_FUNCTION_INFO_V1(isomer_engine_analyze);
 PG_FUNCTION_INFO_V1(isomer_engine_sql);
+PG_FUNCTION_INFO_V1(isomer_engine_blocks);
+PG_FUNCTION_INFO_V1(isomer_engine_sql_blocks);
 
 /* ── parsing ─────────────────────────────────────────────────────────────── */
 
@@ -142,10 +154,16 @@ flatten_group(Query *q, Node *node)
 
 /* ── walkers ─────────────────────────────────────────────────────────────── */
 
+/*
+ * The Vars of one query level. A subquery inside an expression is searched too, for the Vars it
+ * reads from this level (its correlation): they are columns this level must keep. Those come
+ * back as copies at level 0, so they can be looked up in this level's range table.
+ */
 typedef struct VarsCtx
 {
-	List	   *vars;			/* Var * at level 0 */
-	bool		skip_aggs;		/* don't look inside aggregates */
+	List	   *vars;			/* Var * of this level */
+	bool		skip_aggs;		/* don't look inside this level's aggregates */
+	int			depth;			/* how many subqueries down the walk is */
 } VarsCtx;
 
 static bool
@@ -155,22 +173,105 @@ vars_walker(Node *node, VarsCtx *ctx)
 		return false;
 	if (IsA(node, Var))
 	{
-		if (((Var *) node)->varlevelsup == 0)
+		Var		   *v = (Var *) node;
+
+		if (v->varlevelsup == ctx->depth && ctx->depth == 0)
 			ctx->vars = lappend(ctx->vars, node);
+		else if (v->varlevelsup == ctx->depth)
+		{
+			v = copyObject(v);
+			v->varlevelsup = 0;
+			ctx->vars = lappend(ctx->vars, v);
+		}
 		return false;
 	}
-	if (ctx->skip_aggs && IsA(node, Aggref))
+	if (ctx->skip_aggs && ctx->depth == 0 && IsA(node, Aggref))
 		return false;
+	if (IsA(node, Query))
+	{
+		bool		r;
+
+		ctx->depth++;
+		r = query_tree_walker((Query *) node, vars_walker, ctx, QTW_IGNORE_RT_SUBQUERIES | QTW_IGNORE_JOINALIASES);
+		ctx->depth--;
+		return r;
+	}
 	return expression_tree_walker(node, vars_walker, ctx);
 }
 
 static List *
 vars_of(Node *node, bool skip_aggs)
 {
-	VarsCtx		ctx = {NIL, skip_aggs};
+	VarsCtx		ctx = {NIL, skip_aggs, 0};
 
 	vars_walker(node, &ctx);
 	return ctx.vars;
+}
+
+/* Does an expression read a level above the query it belongs to (a correlated reference)? */
+static bool
+outer_walker(Node *node, int *depth)
+{
+	if (node == NULL)
+		return false;
+	if (IsA(node, Var))
+		return ((Var *) node)->varlevelsup > *depth;
+	if (IsA(node, Aggref))
+	{
+		if (((Aggref *) node)->agglevelsup > *depth)
+			return true;
+	}
+	if (IsA(node, Query))
+	{
+		bool		r;
+
+		(*depth)++;
+		r = query_tree_walker((Query *) node, outer_walker, depth, QTW_IGNORE_RT_SUBQUERIES | QTW_IGNORE_JOINALIASES);
+		(*depth)--;
+		return r;
+	}
+	return expression_tree_walker(node, outer_walker, depth);
+}
+
+static bool
+has_outer_ref(Node *node)
+{
+	int			depth = 0;
+
+	return outer_walker(node, &depth);
+}
+
+/* The subqueries directly in an expression (not those nested in them), outside aggregates or not. */
+typedef struct SublinkCount
+{
+	int			n;
+	bool		skip_aggs;
+} SublinkCount;
+
+static bool
+count_sublinks_walker(Node *node, SublinkCount *ctx)
+{
+	if (node == NULL)
+		return false;
+	if (IsA(node, SubLink))
+	{
+		ctx->n++;
+		return count_sublinks_walker(((SubLink *) node)->testexpr, ctx);
+	}
+	if (ctx->skip_aggs && IsA(node, Aggref))
+		return false;
+	if (IsA(node, Query))
+		return false;
+	return expression_tree_walker(node, count_sublinks_walker, ctx);
+}
+
+static int
+count_sublinks(Node *node, bool skip_aggs)
+{
+	SublinkCount ctx = {0, skip_aggs};
+
+	count_sublinks_walker(node, &ctx);
+	return ctx.n;
 }
 
 static Bitmapset *
@@ -378,13 +479,34 @@ is_equi(Node *expr, Var **l, Var **r)
 	return true;
 }
 
+/* Subqueries in the join tree: in WHERE, or in a join's ON. */
+static void
+count_from_sublinks(Node *node, int *where, int *join)
+{
+	if (node == NULL)
+		return;
+	if (IsA(node, JoinExpr))
+	{
+		count_from_sublinks(((JoinExpr *) node)->larg, where, join);
+		count_from_sublinks(((JoinExpr *) node)->rarg, where, join);
+		*join += count_sublinks(((JoinExpr *) node)->quals, false);
+	}
+	else if (IsA(node, FromExpr))
+	{
+		ListCell   *lc;
+
+		foreach(lc, ((FromExpr *) node)->fromlist)
+			count_from_sublinks(lfirst(lc), where, join);
+		*where += count_sublinks(((FromExpr *) node)->quals, false);
+	}
+}
+
 /* ── isomer._engine_analyze ──────────────────────────────────────────────── */
 
-Datum
-isomer_engine_analyze(PG_FUNCTION_ARGS)
+/* The shape of one query level, as a JSON object (see the top of this file). */
+static void
+analyze_query(Query *q, StringInfo out)
 {
-	char	   *sql = text_to_cstring(PG_GETARG_TEXT_PP(0));
-	Query	   *q = analyze_select(sql);
 	StringInfoData b;
 	bool		first = true;
 	ListCell   *lc;
@@ -592,7 +714,13 @@ isomer_engine_analyze(PG_FUNCTION_ARGS)
 			}
 			else
 				appendStringInfoString(&b, "null");
-			appendStringInfoChar(&b, '}');
+			/*
+			 * A condition on an outer query's row, or with a subquery in it, is not a filter of
+			 * one table's rows.
+			 */
+			appendStringInfo(&b, ",\"outer\":%s,\"sublink\":%s}",
+							 has_outer_ref(c->expr) ? "true" : "false",
+							 checkExprHasSubLink(c->expr) ? "true" : "false");
 		}
 	}
 	appendStringInfoChar(&b, ']');
@@ -631,6 +759,9 @@ isomer_engine_analyze(PG_FUNCTION_ARGS)
 			json_str(&b, format_type_be(a->aggtype));
 			appendStringInfoString(&b, ",\"rtis\":");
 			json_rtis(&b, rtis);
+			appendStringInfo(&b, ",\"outer\":%s,\"sublink\":%s",
+							 has_outer_ref((Node *) a) ? "true" : "false",
+							 checkExprHasSubLink((Node *) a) ? "true" : "false");
 			/* The argument, when it is a plain column (count(DISTINCT c) keeps c's values). */
 			appendStringInfoString(&b, ",\"argcol\":");
 			if (list_length(a->args) == 1)
@@ -739,7 +870,242 @@ isomer_engine_analyze(PG_FUNCTION_ARGS)
 	}
 	appendStringInfoChar(&b, ']');
 
+	/* Where its subqueries are, and whether it reads an outer query's row itself. */
+	{
+		int			where = 0;
+		int			join = 0;
+
+		count_from_sublinks((Node *) q->jointree, &where, &join);
+		json_key(&b, &first, "sublinks");
+		appendStringInfo(&b, "{\"target\":%d,\"aggs\":%d,\"where\":%d,\"join\":%d,\"having\":%d,\"group\":%d,\"other\":%d}",
+						 count_sublinks((Node *) q->targetList, true),
+						 count_sublinks((Node *) q->targetList, false) - count_sublinks((Node *) q->targetList, true)
+						 + count_sublinks(q->havingQual, false) - count_sublinks(q->havingQual, true),
+						 where, join,
+						 count_sublinks(q->havingQual, true),
+						 grp ? count_sublinks((Node *) rt_fetch(grp, q->rtable)->groupexprs, false) : 0,
+						 count_sublinks(q->limitCount, false) + count_sublinks(q->limitOffset, false));
+		json_key(&b, &first, "outer");
+		appendStringInfoString(&b, query_tree_walker(q, outer_walker, &(int){0},
+													 QTW_IGNORE_RT_SUBQUERIES | QTW_IGNORE_JOINALIASES)
+							   ? "true" : "false");
+	}
+
 	appendStringInfoChar(&b, '}');
+	appendBinaryStringInfo(out, b.data, b.len);
+}
+
+Datum
+isomer_engine_analyze(PG_FUNCTION_ARGS)
+{
+	char	   *sql = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	StringInfoData b;
+
+	initStringInfo(&b);
+	analyze_query(analyze_select(sql), &b);
+	PG_RETURN_DATUM(DirectFunctionCall1(jsonb_in, CStringGetDatum(b.data)));
+}
+
+/* ── Query blocks: the query and each subquery inside it ─────────────────── */
+
+/*
+ * A correlated subquery (SELECT jsonb_agg(...) FROM orders o WHERE o.customer_id = c.id) is a
+ * query block of its own: it keeps its own state, and the derivation runs it, as written, over
+ * that state for each outer row. Blocks are numbered in the order this walk meets them, the
+ * query itself first; _engine_blocks and _engine_sql_blocks walk the same parse tree the same
+ * way, so a number names the same block in both.
+ */
+typedef struct Block
+{
+	Query	   *q;
+	SubLink    *link;			/* the SubLink it is the subquery of, as parsed, or NULL */
+	int			parent;			/* -1 for the query itself */
+	int			type;			/* SubLinkType, or -1 */
+	const char *place;			/* where in the parent: target, agg, where, join, having, group, other */
+	int			agg;			/* the parent's aggregate it is inside, or -1 */
+} Block;
+
+typedef struct BlocksCtx
+{
+	List	   *blocks;
+	int			parent;
+	List	   *parent_aggs;
+	const char *place;
+	int			agg;
+} BlocksCtx;
+
+static void collect_blocks(Query *q, SubLink *link, int parent, const char *place, int agg, List **blocks);
+
+static bool
+blocks_walker(Node *node, BlocksCtx *ctx)
+{
+	if (node == NULL)
+		return false;
+	if (IsA(node, Aggref) && ((Aggref *) node)->agglevelsup == 0 && ctx->parent_aggs != NIL)
+	{
+		const char *place = ctx->place;
+		int			agg = ctx->agg;
+		int			i = 0;
+		ListCell   *lc;
+
+		foreach(lc, ctx->parent_aggs)
+		{
+			if (lfirst(lc) == (void *) node)
+				ctx->agg = i;
+			i++;
+		}
+		ctx->place = "agg";
+		expression_tree_walker(node, blocks_walker, ctx);
+		ctx->place = place;
+		ctx->agg = agg;
+		return false;
+	}
+	if (IsA(node, SubLink))
+	{
+		SubLink    *s = (SubLink *) node;
+
+		blocks_walker(s->testexpr, ctx);
+		collect_blocks((Query *) s->subselect, s, ctx->parent, ctx->place, ctx->agg, &ctx->blocks);
+		return false;
+	}
+	if (IsA(node, Query))
+		return false;
+	return expression_tree_walker(node, blocks_walker, ctx);
+}
+
+static void
+blocks_from(Node *node, BlocksCtx *ctx)
+{
+	if (node == NULL)
+		return;
+	if (IsA(node, JoinExpr))
+	{
+		blocks_from(((JoinExpr *) node)->larg, ctx);
+		blocks_from(((JoinExpr *) node)->rarg, ctx);
+		ctx->place = "join";
+		blocks_walker(((JoinExpr *) node)->quals, ctx);
+	}
+	else if (IsA(node, FromExpr))
+	{
+		ListCell   *lc;
+
+		foreach(lc, ((FromExpr *) node)->fromlist)
+			blocks_from(lfirst(lc), ctx);
+		ctx->place = "where";
+		blocks_walker(((FromExpr *) node)->quals, ctx);
+	}
+}
+
+static void
+collect_blocks(Query *q, SubLink *link, int parent, const char *place, int agg, List **blocks)
+{
+	Block	   *b = palloc0(sizeof(Block));
+	BlocksCtx	ctx;
+	int			grp = group_rti(q);
+
+	b->q = q;
+	b->link = link;
+	b->parent = parent;
+	b->type = link ? (int) link->subLinkType : -1;
+	b->place = place;
+	b->agg = agg;
+	*blocks = lappend(*blocks, b);
+
+	ctx.blocks = *blocks;
+	ctx.parent = list_length(*blocks) - 1;
+	ctx.parent_aggs = aggs_of(q);
+	ctx.agg = -1;
+	ctx.place = "target";
+	blocks_walker((Node *) q->targetList, &ctx);
+	blocks_from((Node *) q->jointree, &ctx);
+	ctx.place = "having";
+	blocks_walker(q->havingQual, &ctx);
+	if (grp)
+	{
+		ctx.place = "group";
+		blocks_walker((Node *) rt_fetch(grp, q->rtable)->groupexprs, &ctx);
+	}
+	ctx.place = "other";
+	blocks_walker(q->limitCount, &ctx);
+	blocks_walker(q->limitOffset, &ctx);
+	*blocks = ctx.blocks;
+}
+
+static List *
+blocks_of(Query *q)
+{
+	List	   *blocks = NIL;
+
+	collect_blocks(q, NULL, -1, NULL, -1, &blocks);
+	return blocks;
+}
+
+static const char *
+sublink_type_name(int type)
+{
+	switch (type)
+	{
+		case EXISTS_SUBLINK:
+			return "exists";
+		case ALL_SUBLINK:
+			return "all";
+		case ANY_SUBLINK:
+			return "any";
+		case ROWCOMPARE_SUBLINK:
+			return "rowcompare";
+		case EXPR_SUBLINK:
+			return "expr";
+		case MULTIEXPR_SUBLINK:
+			return "multiexpr";
+		case ARRAY_SUBLINK:
+			return "array";
+		case CTE_SUBLINK:
+			return "cte";
+	}
+	return NULL;
+}
+
+/*
+ * isomer._engine_blocks(query text) -> jsonb: each block, the query first, as
+ *   {"block": n, "parent": n|null, "type": "expr"|"exists"|"any"|..., "place": "target"|"agg"|...,
+ *    "agg": n|null, "analysis": <what _engine_analyze says of that block>}
+ */
+Datum
+isomer_engine_blocks(PG_FUNCTION_ARGS)
+{
+	char	   *sql = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	List	   *blocks = blocks_of(analyze_select(sql));
+	StringInfoData b;
+	ListCell   *lc;
+	int			i = 0;
+
+	initStringInfo(&b);
+	appendStringInfoChar(&b, '[');
+	foreach(lc, blocks)
+	{
+		Block	   *k = (Block *) lfirst(lc);
+
+		if (i > 0)
+			appendStringInfoChar(&b, ',');
+		appendStringInfo(&b, "{\"block\":%d,\"parent\":", i++);
+		if (k->parent < 0)
+			appendStringInfoString(&b, "null");
+		else
+			appendStringInfo(&b, "%d", k->parent);
+		appendStringInfoString(&b, ",\"type\":");
+		json_str(&b, sublink_type_name(k->type));
+		appendStringInfoString(&b, ",\"place\":");
+		json_str(&b, k->place);
+		appendStringInfoString(&b, ",\"agg\":");
+		if (k->agg < 0)
+			appendStringInfoString(&b, "null");
+		else
+			appendStringInfo(&b, "%d", k->agg);
+		appendStringInfoString(&b, ",\"analysis\":");
+		analyze_query(k->q, &b);
+		appendStringInfoChar(&b, '}');
+	}
+	appendStringInfoChar(&b, ']');
 	PG_RETURN_DATUM(DirectFunctionCall1(jsonb_in, CStringGetDatum(b.data)));
 }
 
@@ -764,7 +1130,15 @@ replace_aggs_mutator(Node *node, ReplaceCtx *ctx)
 		foreach(lc, ctx->aggs)
 		{
 			if (equal(lfirst(lc), node))
-				return copyObject(list_nth(ctx->replacements, i));
+			{
+				Node	   *r = list_nth(ctx->replacements, i);
+
+				/*
+				 * An aggregate kept as written stays the same node: a subquery inside it is a
+				 * block rewritten on its own, found again by its pointer.
+				 */
+				return r == node ? node : copyObject(r);
+			}
 			i++;
 		}
 		elog(ERROR, "isomer: aggregate not found while rewriting");
@@ -799,7 +1173,9 @@ only_fact(Node *expr, int fact)
 {
 	Bitmapset  *b = varnos_of(expr);
 
-	return bms_num_members(b) == 1 && bms_is_member(fact, b);
+	/* A condition on an outer query's row, or one with a subquery, can't be applied while folding. */
+	return bms_num_members(b) == 1 && bms_is_member(fact, b)
+		&& !has_outer_ref(expr) && !checkExprHasSubLink(expr);
 }
 
 /* Drop (or collect) the conjuncts that read only the fact relation, in WHERE and every ON. */
@@ -962,38 +1338,28 @@ column_var(Oid relid, int rti, const char *name)
 	return makeVar(rti, att, type, typmod, coll, 0);
 }
 
-Datum
-isomer_engine_sql(PG_FUNCTION_ARGS)
+/* How one block is rewritten: its fact, the relations swapped in, the aggregates' templates. */
+typedef struct BlockCfg
 {
-	char	   *sql = text_to_cstring(PG_GETARG_TEXT_PP(0));
-	char	   *mode = text_to_cstring(PG_GETARG_TEXT_PP(1));
-	int			fact = PG_ARGISNULL(2) ? 0 : PG_GETARG_INT32(2);
-	int			driving = PG_ARGISNULL(3) ? 0 : PG_GETARG_INT32(3);
-	Query	   *q = analyze_select(sql);
-	List	   *aggs = aggs_of(q);
-	Datum	   *rels = NULL;
-	bool	   *rels_null = NULL;
-	int			nrels = 0;
-	Datum	   *tmpls = NULL;
-	bool	   *tmpls_null = NULL;
-	int			ntmpls = 0;
-	Datum	   *fcols = NULL;
-	bool	   *fcols_null = NULL;
-	int			nfcols = 0;
+	int			fact;			/* range table index of the fact, or 0 */
+	Oid		   *rels;			/* [rti - 1]: the relation to read instead, or InvalidOid */
+	int			nrels;
+	char	  **tmpls;			/* per aggregate; NULL: kept as written */
+	int			ntmpls;
+	char	  **fcols;
+	int			nfcols;
+} BlockCfg;
+
+/* Swap relations for state or staging relations whose columns line up with them. */
+static void
+swap_rels(Query *q, BlockCfg *cfg)
+{
 	int			i;
 
-	if (!PG_ARGISNULL(4))
-		deconstruct_array_builtin(PG_GETARG_ARRAYTYPE_P(4), OIDOID, &rels, &rels_null, &nrels);
-	if (!PG_ARGISNULL(5))
-		deconstruct_array_builtin(PG_GETARG_ARRAYTYPE_P(5), TEXTOID, &tmpls, &tmpls_null, &ntmpls);
-	if (!PG_ARGISNULL(6))
-		deconstruct_array_builtin(PG_GETARG_ARRAYTYPE_P(6), TEXTOID, &fcols, &fcols_null, &nfcols);
-
-	/* Swap relations for state or staging relations whose columns line up with them. */
-	for (i = 0; i < nrels && i < list_length(q->rtable); i++)
+	for (i = 0; i < cfg->nrels && i < list_length(q->rtable); i++)
 	{
 		RangeTblEntry *rte = rt_fetch(i + 1, q->rtable);
-		Oid			relid = rels_null[i] ? InvalidOid : DatumGetObjectId(rels[i]);
+		Oid			relid = cfg->rels[i];
 
 		if (!OidIsValid(relid))
 			continue;
@@ -1002,182 +1368,547 @@ isomer_engine_sql(PG_FUNCTION_ARGS)
 		rte->relid = relid;
 		rte->relkind = get_rel_relkind(relid);
 	}
+}
 
+/*
+ * 'derive' (keys false): aggregates replaced by expressions over the fact's partial aggregates,
+ * and the fact's own filters dropped. 'keys': aggregates replaced by NULL and HAVING dropped; the
+ * fact's filters are dropped unless it drives. The query itself (top) loses its ORDER BY; a
+ * subquery keeps it, since it may pick rows with it (ORDER BY ... LIMIT 1).
+ */
+static void
+rewrite_block(Query *q, BlockCfg *cfg, bool keys, int driving, bool top)
+{
+	List	   *aggs = aggs_of(q);
+	ReplaceCtx	ctx;
+	ListCell   *lc;
+	int			i = 0;
+
+	group_dependent_columns(q);
+	ctx.aggs = aggs;
+	ctx.replacements = NIL;
+	foreach(lc, aggs)
+	{
+		Aggref	   *a = (Aggref *) lfirst(lc);
+
+		if (keys)
+			ctx.replacements = lappend(ctx.replacements, makeNullConst(a->aggtype, -1, a->aggcollid));
+		else
+		{
+			if (i >= cfg->ntmpls)
+				elog(ERROR, "isomer: no replacement given for aggregate %d", i);
+			/*
+			 * No template: the aggregate is kept as written. Its state is a copy of every fact
+			 * row it reads (the fact's key is among the kept columns), so it runs over the same
+			 * rows as over the tables.
+			 */
+			if (cfg->tmpls[i] == NULL)
+				ctx.replacements = lappend(ctx.replacements, a);
+			else
+				ctx.replacements = lappend(ctx.replacements,
+										   analyze_template(cfg->tmpls[i], rt_fetch(cfg->fact, q->rtable)->relid, cfg->fact));
+		}
+		i++;
+	}
+	q->targetList = (List *) replace_aggs_mutator((Node *) q->targetList, &ctx);
+	q->havingQual = keys ? NULL : replace_aggs_mutator(q->havingQual, &ctx);
+	if (top)
+		q->sortClause = NIL;
+	if (keys && driving > 0)
+		inner_where_nullable((Node *) q->jointree, driving);
+	/*
+	 * The fact's own filters were applied while folding it into state, so they are dropped
+	 * wherever the fact is read as state: always in 'derive', and in 'keys' unless its raw
+	 * changed rows are what drives the query.
+	 */
+	if (cfg->fact > 0 && (!keys || driving != cfg->fact))
+	{
+		List	   *taken = NIL;
+
+		split_fact_quals_from((Node *) q->jointree, cfg->fact, &taken);
+	}
+}
+
+/*
+ * The key is grouped, so filtering the rows by it before grouping gives the same groups for
+ * those keys: WHERE <key> = ANY ($1::<key type>[]).
+ */
+static void
+add_key_filter(Query *q, const char *key)
+{
+	Node	   *e = NULL;
+	Param	   *prm = makeNode(Param);
+	Node	   *arr;
+	Expr	   *cond;
+	ListCell   *lc;
+
+	foreach(lc, q->targetList)
+	{
+		TargetEntry *tle = (TargetEntry *) lfirst(lc);
+
+		if (!tle->resjunk && tle->resname && strcmp(tle->resname, key) == 0)
+			e = flatten_group(q, (Node *) tle->expr);
+	}
+	if (e == NULL)
+		elog(ERROR, "isomer: the query has no column %s", key);
+	prm->paramkind = PARAM_EXTERN;
+	prm->paramid = 1;
+	prm->paramtype = TEXTARRAYOID;
+	prm->paramtypmod = -1;
+	prm->paramcollid = DEFAULT_COLLATION_OID;
+	prm->location = -1;
+	arr = coerce_to_target_type(NULL, (Node *) prm, TEXTARRAYOID, get_array_type(exprType(e)), -1,
+								COERCION_EXPLICIT, COERCE_EXPLICIT_CAST, -1);
+	if (arr == NULL)
+		elog(ERROR, "isomer: the key %s can't be compared with text values", key);
+	cond = make_scalar_array_op(make_parsestate(NULL), list_make1(makeString("=")), true,
+								copyObject(e), arr, -1);
+	AddQual(q, (Node *) cond);
+}
+
+/*
+ * 'fact': a new single-relation query, SELECT <columns>, <args and filters>, <weight> FROM fact
+ * WHERE <the fact's own conjuncts>. Everything in it must read only the fact relation.
+ */
+static Query *
+fact_query(Query *q, BlockCfg *cfg)
+{
+	Query	   *fq = makeNode(Query);
+	List	   *aggs = aggs_of(q);
+	RangeTblEntry *rte;
+	List	   *quals = NIL;
+	List	   *tlist = NIL;
+	ListCell   *lc;
+	Oid			factrel;
+	AttrNumber	resno = 1;
+	Node	   *where;
+	int			fact = cfg->fact;
+	int			i;
+
+	if (fact <= 0)
+		elog(ERROR, "isomer: mode 'fact' needs the fact relation");
+	rte = copyObject(rt_fetch(fact, q->rtable));
+	factrel = rte->relid;
+	split_fact_quals_from((Node *) q->jointree, fact, &quals);
+
+	for (i = 0; i < cfg->nfcols; i++)
+		tlist = lappend(tlist, makeTargetEntry((Expr *) column_var(factrel, fact, cfg->fcols[i]), resno++,
+											   pstrdup(cfg->fcols[i]), false));
+	i = 0;
+	foreach(lc, aggs)
+	{
+		Aggref	   *a = (Aggref *) lfirst(lc);
+		Expr	   *arg = a->args != NIL ? ((TargetEntry *) linitial(a->args))->expr
+			: (Expr *) makeBoolConst(true, false);
+		Expr	   *filter = a->aggfilter ? a->aggfilter : (Expr *) makeBoolConst(true, false);
+		Node	   *bare = strip_relabel((Node *) arg);
+
+		/* An aggregate kept as written (a NULL template) needs no partial aggregate. */
+		if (i < cfg->ntmpls && cfg->tmpls[i] == NULL)
+		{
+			i++;
+			continue;
+		}
+
+		/*
+		 * count(t.*) counts the rows of t: a whole-row value is never null for a row that
+		 * exists, but IS NULL on a row tests every field, so count it as a constant.
+		 */
+		if (IsA(bare, Var) && ((Var *) bare)->varattno == InvalidAttrNumber)
+			arg = (Expr *) makeBoolConst(true, false);
+		tlist = lappend(tlist, makeTargetEntry(copyObject(arg), resno++, psprintf("__a%d", i), false));
+		tlist = lappend(tlist, makeTargetEntry(copyObject(filter), resno++, psprintf("__f%d", i), false));
+		i++;
+	}
+	if (get_attnum(factrel, "__w") != InvalidAttrNumber)
+		tlist = lappend(tlist, makeTargetEntry((Expr *) column_var(factrel, fact, "__w"), resno++,
+											   pstrdup("__w"), false));
+	else
+		tlist = lappend(tlist, makeTargetEntry((Expr *) makeConst(INT4OID, -1, InvalidOid, 4,
+																  Int32GetDatum(1), false, true),
+											   resno++, pstrdup("__w"), false));
+	where = quals == NIL ? NULL : (Node *) make_ands_explicit(quals);
+	{
+		Bitmapset  *used = bms_union(varnos_of((Node *) tlist), varnos_of(where));
+
+		if (!bms_is_empty(used) && !(bms_num_members(used) == 1 && bms_is_member(fact, used)))
+			ereport(ERROR, (errmsg("isomer: an aggregate reads more than the fact relation")));
+		if (has_outer_ref((Node *) tlist))
+			ereport(ERROR, (errmsg("isomer: an aggregate reads the row of an outer query")));
+	}
+	ChangeVarNodes((Node *) tlist, fact, 1, 0);
+	ChangeVarNodes(where, fact, 1, 0);
+
+	fq->commandType = CMD_SELECT;
+	fq->canSetTag = true;
+	fq->rtable = list_make1(rte);
+	rte->perminfoindex = 0;
+	fq->jointree = makeFromExpr(list_make1(makeNode(RangeTblRef)), where);
+	((RangeTblRef *) linitial(fq->jointree->fromlist))->rtindex = 1;
+	fq->targetList = tlist;
+	return fq;
+}
+
+Datum
+isomer_engine_sql(PG_FUNCTION_ARGS)
+{
+	char	   *sql = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	char	   *mode = text_to_cstring(PG_GETARG_TEXT_PP(1));
+	int			driving = PG_ARGISNULL(3) ? 0 : PG_GETARG_INT32(3);
+	Query	   *q = analyze_select(sql);
+	BlockCfg	cfg = {0};
+	Datum	   *vals;
+	bool	   *nulls;
+	int			n;
+	int			i;
+
+	cfg.fact = PG_ARGISNULL(2) ? 0 : PG_GETARG_INT32(2);
+	if (!PG_ARGISNULL(4))
+	{
+		deconstruct_array_builtin(PG_GETARG_ARRAYTYPE_P(4), OIDOID, &vals, &nulls, &n);
+		cfg.rels = palloc0(sizeof(Oid) * (n + 1));
+		for (i = 0; i < n; i++)
+			cfg.rels[i] = nulls[i] ? InvalidOid : DatumGetObjectId(vals[i]);
+		cfg.nrels = n;
+	}
+	if (!PG_ARGISNULL(5))
+	{
+		deconstruct_array_builtin(PG_GETARG_ARRAYTYPE_P(5), TEXTOID, &vals, &nulls, &n);
+		cfg.tmpls = palloc0(sizeof(char *) * (n + 1));
+		for (i = 0; i < n; i++)
+			cfg.tmpls[i] = nulls[i] ? NULL : TextDatumGetCString(vals[i]);
+		cfg.ntmpls = n;
+	}
+	if (!PG_ARGISNULL(6))
+	{
+		deconstruct_array_builtin(PG_GETARG_ARRAYTYPE_P(6), TEXTOID, &vals, &nulls, &n);
+		cfg.fcols = palloc0(sizeof(char *) * (n + 1));
+		for (i = 0; i < n; i++)
+			cfg.fcols[i] = nulls[i] ? NULL : TextDatumGetCString(vals[i]);
+		cfg.nfcols = n;
+	}
+
+	swap_rels(q, &cfg);
 	if (strcmp(mode, "derive") == 0 || strcmp(mode, "derive_keyed") == 0 || strcmp(mode, "keys") == 0)
 	{
-		ReplaceCtx	ctx;
-		ListCell   *lc;
-		bool		keys = strcmp(mode, "keys") == 0;
-		bool		keyed = strcmp(mode, "derive_keyed") == 0;
-
-		group_dependent_columns(q);
-		ctx.aggs = aggs;
-		ctx.replacements = NIL;
-		i = 0;
-		foreach(lc, aggs)
+		rewrite_block(q, &cfg, strcmp(mode, "keys") == 0, driving, true);
+		if (strcmp(mode, "derive_keyed") == 0)
 		{
-			Aggref	   *a = (Aggref *) lfirst(lc);
-
-			if (keys)
-				ctx.replacements = lappend(ctx.replacements,
-										   makeNullConst(a->aggtype, -1, a->aggcollid));
-			else
-			{
-				Oid			factrel;
-
-				if (i >= ntmpls)
-					elog(ERROR, "isomer: no replacement given for aggregate %d", i);
-				factrel = rt_fetch(fact, q->rtable)->relid;
-				/*
-				 * No template: the aggregate is kept as written. Its state is a copy of every fact
-				 * row it reads (the fact's key is among the kept columns), so it runs over the
-				 * same rows as over the tables.
-				 */
-				if (tmpls_null[i])
-					ctx.replacements = lappend(ctx.replacements, copyObject(a));
-				else
-					ctx.replacements = lappend(ctx.replacements,
-											   analyze_template(TextDatumGetCString(tmpls[i]), factrel, fact));
-			}
-			i++;
-		}
-		q->targetList = (List *) replace_aggs_mutator((Node *) q->targetList, &ctx);
-		q->havingQual = keys ? NULL : replace_aggs_mutator(q->havingQual, &ctx);
-		q->sortClause = NIL;
-		if (keys && driving > 0)
-			inner_where_nullable((Node *) q->jointree, driving);
-		/*
-		 * The fact's own filters were applied while folding it into state, so they are dropped
-		 * wherever the fact is read as state: always in 'derive', and in 'keys' unless its raw
-		 * changed rows are what drives the query.
-		 */
-		if (fact > 0 && (!keys || driving != fact))
-		{
-			List	   *taken = NIL;
-
-			split_fact_quals_from((Node *) q->jointree, fact, &taken);
-		}
-
-		/*
-		 * The key is grouped, so filtering the rows by it before grouping gives the same groups
-		 * for those keys: WHERE <key> = ANY ($1::<key type>[]).
-		 */
-		if (keyed)
-		{
-			char	   *key;
-			Node	   *e = NULL;
-			Param	   *prm = makeNode(Param);
-			Node	   *arr;
-			Expr	   *cond;
-
-			if (nfcols != 1 || fcols_null[0])
+			if (cfg.nfcols != 1 || cfg.fcols[0] == NULL)
 				elog(ERROR, "isomer: mode 'derive_keyed' needs the key column");
-			key = TextDatumGetCString(fcols[0]);
-			foreach(lc, q->targetList)
-			{
-				TargetEntry *tle = (TargetEntry *) lfirst(lc);
-
-				if (!tle->resjunk && tle->resname && strcmp(tle->resname, key) == 0)
-					e = flatten_group(q, (Node *) tle->expr);
-			}
-			if (e == NULL)
-				elog(ERROR, "isomer: the query has no column %s", key);
-			prm->paramkind = PARAM_EXTERN;
-			prm->paramid = 1;
-			prm->paramtype = TEXTARRAYOID;
-			prm->paramtypmod = -1;
-			prm->paramcollid = DEFAULT_COLLATION_OID;
-			prm->location = -1;
-			arr = coerce_to_target_type(NULL, (Node *) prm, TEXTARRAYOID, get_array_type(exprType(e)), -1,
-										COERCION_EXPLICIT, COERCE_EXPLICIT_CAST, -1);
-			if (arr == NULL)
-				elog(ERROR, "isomer: the key %s can't be compared with text values", key);
-			cond = make_scalar_array_op(make_parsestate(NULL), list_make1(makeString("=")), true,
-										copyObject(e), arr, -1);
-			AddQual(q, (Node *) cond);
+			add_key_filter(q, cfg.fcols[0]);
 		}
 	}
 	else if (strcmp(mode, "fact") == 0)
-	{
-		/*
-		 * A new single-relation query: SELECT <columns>, <args and filters>, <weight> FROM fact
-		 * WHERE <the fact's own conjuncts>. Everything in it must read only the fact relation.
-		 */
-		Query	   *fq = makeNode(Query);
-		RangeTblEntry *rte;
-		List	   *quals = NIL;
-		List	   *tlist = NIL;
-		ListCell   *lc;
-		Oid			factrel;
-		AttrNumber	resno = 1;
-		Node	   *where;
-
-		if (fact <= 0)
-			elog(ERROR, "isomer: mode 'fact' needs the fact relation");
-		rte = copyObject(rt_fetch(fact, q->rtable));
-		factrel = rte->relid;
-		split_fact_quals_from((Node *) q->jointree, fact, &quals);
-
-		for (i = 0; i < nfcols; i++)
-		{
-			char	   *name = TextDatumGetCString(fcols[i]);
-
-			tlist = lappend(tlist, makeTargetEntry((Expr *) column_var(factrel, fact, name), resno++,
-												   pstrdup(name), false));
-		}
-		i = 0;
-		foreach(lc, aggs)
-		{
-			Aggref	   *a = (Aggref *) lfirst(lc);
-			Expr	   *arg = a->args != NIL ? ((TargetEntry *) linitial(a->args))->expr
-				: (Expr *) makeBoolConst(true, false);
-			Expr	   *filter = a->aggfilter ? a->aggfilter : (Expr *) makeBoolConst(true, false);
-			Node	   *bare = strip_relabel((Node *) arg);
-
-			/* An aggregate kept as written (a NULL template) needs no partial aggregate. */
-			if (i < ntmpls && tmpls_null[i])
-			{
-				i++;
-				continue;
-			}
-
-			/*
-			 * count(t.*) counts the rows of t: a whole-row value is never null for a row that
-			 * exists, but IS NULL on a row tests every field, so count it as a constant.
-			 */
-			if (IsA(bare, Var) && ((Var *) bare)->varattno == InvalidAttrNumber)
-				arg = (Expr *) makeBoolConst(true, false);
-			tlist = lappend(tlist, makeTargetEntry(copyObject(arg), resno++, psprintf("__a%d", i), false));
-			tlist = lappend(tlist, makeTargetEntry(copyObject(filter), resno++, psprintf("__f%d", i), false));
-			i++;
-		}
-		if (get_attnum(factrel, "__w") != InvalidAttrNumber)
-			tlist = lappend(tlist, makeTargetEntry((Expr *) column_var(factrel, fact, "__w"), resno++,
-												   pstrdup("__w"), false));
-		else
-			tlist = lappend(tlist, makeTargetEntry((Expr *) makeConst(INT4OID, -1, InvalidOid, 4,
-																	  Int32GetDatum(1), false, true),
-												   resno++, pstrdup("__w"), false));
-		where = quals == NIL ? NULL : (Node *) make_ands_explicit(quals);
-		{
-			Bitmapset  *used = bms_union(varnos_of((Node *) tlist), varnos_of(where));
-
-			if (!bms_is_empty(used) && !(bms_num_members(used) == 1 && bms_is_member(fact, used)))
-				ereport(ERROR, (errmsg("isomer: an aggregate reads more than the fact relation")));
-		}
-		ChangeVarNodes((Node *) tlist, fact, 1, 0);
-		ChangeVarNodes(where, fact, 1, 0);
-
-		fq->commandType = CMD_SELECT;
-		fq->canSetTag = true;
-		fq->rtable = list_make1(rte);
-		rte->perminfoindex = 0;
-		fq->jointree = makeFromExpr(list_make1(makeNode(RangeTblRef)), where);
-		((RangeTblRef *) linitial(fq->jointree->fromlist))->rtindex = 1;
-		fq->targetList = tlist;
-		q = fq;
-	}
+		q = fact_query(q, &cfg);
 	else
+		elog(ERROR, "isomer: unknown mode %s", mode);
+
+	PG_RETURN_TEXT_P(cstring_to_text(pg_get_querydef(q, false)));
+}
+
+/* ── isomer._engine_sql_blocks ───────────────────────────────────────────── */
+
+static JsonbValue *
+jb_field(JsonbContainer *c, const char *key)
+{
+	JsonbValue	k;
+
+	k.type = jbvString;
+	k.val.string.val = (char *) key;
+	k.val.string.len = strlen(key);
+	return findJsonbValueFromContainer(c, JB_FOBJECT, &k);
+}
+
+static int64
+jb_int(JsonbValue *v)
+{
+	if (v == NULL || v->type != jbvNumeric)
+		return 0;
+	return DatumGetInt64(DirectFunctionCall1(numeric_int8, NumericGetDatum(v->val.numeric)));
+}
+
+/* An array of strings (null elements as NULL), or NULL if absent. */
+static char **
+jb_strings(JsonbValue *v, int *n)
+{
+	JsonbContainer *a;
+	char	  **out;
+	int			i;
+
+	*n = 0;
+	if (v == NULL || v->type != jbvBinary)
+		return NULL;
+	a = v->val.binary.data;
+	*n = JsonContainerSize(a);
+	out = palloc0(sizeof(char *) * (*n + 1));
+	for (i = 0; i < *n; i++)
+	{
+		JsonbValue *x = getIthJsonbValueFromContainer(a, i);
+
+		if (x != NULL && x->type == jbvString)
+			out[i] = pnstrdup(x->val.string.val, x->val.string.len);
+	}
+	return out;
+}
+
+/* {"fact": rti, "rels": [oid or 0 per rti], "templates": [text or null], "fact_columns": [text]} */
+static void
+read_cfg(JsonbContainer *c, BlockCfg *cfg)
+{
+	JsonbValue *v;
+
+	cfg->fact = (int) jb_int(jb_field(c, "fact"));
+	v = jb_field(c, "rels");
+	if (v != NULL && v->type == jbvBinary)
+	{
+		JsonbContainer *a = v->val.binary.data;
+		int			i;
+
+		cfg->nrels = JsonContainerSize(a);
+		cfg->rels = palloc0(sizeof(Oid) * (cfg->nrels + 1));
+		for (i = 0; i < cfg->nrels; i++)
+			cfg->rels[i] = (Oid) jb_int(getIthJsonbValueFromContainer(a, i));
+	}
+	cfg->tmpls = jb_strings(jb_field(c, "templates"), &cfg->ntmpls);
+	cfg->fcols = jb_strings(jb_field(c, "fact_columns"), &cfg->nfcols);
+}
+
+static bool
+mentions_sub_walker(Node *node, Query *sub)
+{
+	if (node == NULL)
+		return false;
+	if (IsA(node, SubLink) && ((SubLink *) node)->subselect == (Node *) sub)
+		return true;
+	if (IsA(node, Query))
+		return false;
+	return expression_tree_walker(node, mentions_sub_walker, sub);
+}
+
+/* Drop the conditions, in WHERE and every ON, that a subquery is part of. */
+static Node *
+drop_quals_with(Node *quals, Query *sub)
+{
+	List	   *keep = NIL;
+	ListCell   *lc;
+
+	foreach(lc, make_ands_implicit((Expr *) quals))
+	{
+		if (!mentions_sub_walker(lfirst(lc), sub))
+			keep = lappend(keep, lfirst(lc));
+	}
+	return keep == NIL ? NULL : (Node *) make_ands_explicit(keep);
+}
+
+static void
+drop_quals_with_from(Node *node, Query *sub)
+{
+	if (IsA(node, JoinExpr))
+	{
+		JoinExpr   *j = (JoinExpr *) node;
+
+		drop_quals_with_from(j->larg, sub);
+		drop_quals_with_from(j->rarg, sub);
+		j->quals = drop_quals_with(j->quals, sub);
+		if (j->quals == NULL)
+			j->quals = (Node *) makeBoolConst(true, false);
+	}
+	else if (IsA(node, FromExpr))
+	{
+		ListCell   *lc;
+
+		foreach(lc, ((FromExpr *) node)->fromlist)
+			drop_quals_with_from(lfirst(lc), sub);
+		((FromExpr *) node)->quals = drop_quals_with(((FromExpr *) node)->quals, sub);
+	}
+}
+
+static void
+add_where(Query *q, Node *qual)
+{
+	q->jointree->quals = (Node *) make_ands_explicit(lappend(make_ands_implicit((Expr *) q->jointree->quals), qual));
+	if (checkExprHasSubLink(qual))
+		q->hasSubLinks = true;
+}
+
+/* Every subquery in an expression (outside those nested in them) replaced by NULL. */
+static Node *
+null_sublinks_mutator(Node *node, void *ctx)
+{
+	if (node == NULL)
+		return NULL;
+	if (IsA(node, SubLink))
+		return (Node *) makeNullConst(exprType(node), exprTypmod(node), exprCollation(node));
+	if (IsA(node, Query))
+		return node;
+	return expression_tree_mutator(node, null_sublinks_mutator, ctx);
+}
+
+/* The output columns of a subquery, in place of the Params an IN (...) compares them through. */
+static Node *
+sublink_params_mutator(Node *node, List *tlist)
+{
+	if (node == NULL)
+		return NULL;
+	if (IsA(node, Param) && ((Param *) node)->paramkind == PARAM_SUBLINK)
+	{
+		ListCell   *lc;
+
+		foreach(lc, tlist)
+		{
+			TargetEntry *tle = (TargetEntry *) lfirst(lc);
+
+			if (!tle->resjunk && tle->resno == ((Param *) node)->paramid)
+				return (Node *) copyObject(tle->expr);
+		}
+		elog(ERROR, "isomer: a subquery's comparison refers to a column it doesn't have");
+	}
+	if (IsA(node, Query))
+		return node;
+	return expression_tree_mutator(node, sublink_params_mutator, tlist);
+}
+
+/*
+ * A block turned into the condition that it has a row correlated with the outer one, for
+ * finding keys: its output, aggregation, ordering and limit dropped (a changed row reaches the
+ * outer row whether or not it ends up among the rows the block returns).
+ */
+static void
+strip_to_exists(Query *q, BlockCfg *cfg, int driving)
+{
+	if (driving > 0)
+		inner_where_nullable((Node *) q->jointree, driving);
+	if (cfg->fact > 0 && driving != cfg->fact)
+	{
+		List	   *taken = NIL;
+
+		split_fact_quals_from((Node *) q->jointree, cfg->fact, &taken);
+	}
+	q->targetList = list_make1(makeTargetEntry((Expr *) makeConst(INT4OID, -1, InvalidOid, 4, Int32GetDatum(1), false, true),
+											   1, pstrdup("x"), false));
+	q->hasAggs = false;
+	q->hasWindowFuncs = false;
+	q->hasTargetSRFs = false;
+	q->groupClause = NIL;
+	q->groupingSets = NIL;
+	q->groupDistinct = false;
+	q->havingQual = NULL;
+	q->windowClause = NIL;
+	q->distinctClause = NIL;
+	q->hasDistinctOn = false;
+	q->sortClause = NIL;
+	q->limitCount = NULL;
+	q->limitOffset = NULL;
+}
+
+/*
+ * 'keys' for a relation of a subquery: which keys the changed rows of relation `driving` of
+ * block `b` reach. Each block on the way from b up to the query becomes EXISTS (a correlated
+ * row) in its parent, in place of the conditions it was part of there; an IN (...) keeps its
+ * comparison, inside. Blocks off that path are read as state, as in the derivation.
+ */
+static void
+keys_blocks(List *blocks, BlockCfg *cfgs, int b, int driving)
+{
+	int			nb = list_length(blocks);
+	bool	   *on_path = palloc0(sizeof(bool) * nb);
+	int			k;
+	int			i;
+	Query	   *top = ((Block *) linitial(blocks))->q;
+
+	for (k = b; k >= 0; k = ((Block *) list_nth(blocks, k))->parent)
+		on_path[k] = true;
+	/*
+	 * The query's output is not needed to find keys: its subqueries there become NULL, typed as
+	 * they are before any block below is changed.
+	 */
+	top->targetList = (List *) null_sublinks_mutator((Node *) top->targetList, NULL);
+	for (i = nb - 1; i >= 1; i--)
+	{
+		if (!on_path[i])
+			rewrite_block(((Block *) list_nth(blocks, i))->q, &cfgs[i], false, 0, false);
+	}
+	for (k = b; k > 0; k = ((Block *) list_nth(blocks, k))->parent)
+	{
+		Block	   *c = (Block *) list_nth(blocks, k);
+		Query	   *pq = ((Block *) list_nth(blocks, c->parent))->q;
+		SubLink    *link = c->link;
+		SubLink    *ex;
+
+		if (link->subLinkType == ANY_SUBLINK && link->testexpr != NULL
+			&& !c->q->hasAggs && c->q->groupClause == NIL && !c->q->hasWindowFuncs && !c->q->hasTargetSRFs)
+		{
+			Node	   *cond = copyObject(link->testexpr);
+			BooleanTest *bt = makeNode(BooleanTest);
+
+			IncrementVarSublevelsUp(cond, 1, 0);
+			cond = sublink_params_mutator(cond, c->q->targetList);
+			bt->arg = (Expr *) cond;
+			bt->booltesttype = IS_NOT_FALSE;
+			bt->location = -1;
+			add_where(c->q, (Node *) bt);
+		}
+		strip_to_exists(c->q, &cfgs[k], k == b ? driving : 0);
+		drop_quals_with_from((Node *) pq->jointree, c->q);
+		ex = makeNode(SubLink);
+		ex->subLinkType = EXISTS_SUBLINK;
+		ex->subLinkId = 0;
+		ex->testexpr = NULL;
+		ex->operName = NIL;
+		ex->subselect = (Node *) c->q;
+		ex->location = -1;
+		add_where(pq, (Node *) ex);
+	}
+	rewrite_block(top, &cfgs[0], true, b == 0 ? driving : 0, true);
+}
+
+/*
+ * isomer._engine_sql_blocks(query, mode, blocks jsonb, block, driving) -> text: _engine_sql for
+ * a query with subqueries, each block configured by its element of blocks (see read_cfg):
+ *   'derive'  every block rewritten as in _engine_sql's 'derive';
+ *   'keys'    the keys reached by the changed rows of relation `driving` of block `block`;
+ *   'fact'    the fact rows of block `block`;
+ *   'swap'    the query as written, only its relations swapped.
+ */
+Datum
+isomer_engine_sql_blocks(PG_FUNCTION_ARGS)
+{
+	char	   *sql = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	char	   *mode = text_to_cstring(PG_GETARG_TEXT_PP(1));
+	Jsonb	   *jb = PG_GETARG_JSONB_P(2);
+	int			b = PG_ARGISNULL(3) ? 0 : PG_GETARG_INT32(3);
+	int			driving = PG_ARGISNULL(4) ? 0 : PG_GETARG_INT32(4);
+	Query	   *q = analyze_select(sql);
+	List	   *blocks = blocks_of(q);
+	int			nb = list_length(blocks);
+	BlockCfg   *cfgs = palloc0(sizeof(BlockCfg) * nb);
+	int			i;
+
+	if (!JB_ROOT_IS_ARRAY(jb) || JB_ROOT_COUNT(jb) != nb)
+		elog(ERROR, "isomer: the query has %d blocks, and %d were configured", nb,
+			 JB_ROOT_IS_ARRAY(jb) ? JB_ROOT_COUNT(jb) : 0);
+	if (b < 0 || b >= nb)
+		elog(ERROR, "isomer: no block %d", b);
+	for (i = 0; i < nb; i++)
+	{
+		JsonbValue *e = getIthJsonbValueFromContainer(&jb->root, i);
+
+		if (e != NULL && e->type == jbvBinary)
+			read_cfg(e->val.binary.data, &cfgs[i]);
+		swap_rels(((Block *) list_nth(blocks, i))->q, &cfgs[i]);
+	}
+
+	if (strcmp(mode, "derive") == 0)
+	{
+		for (i = nb - 1; i >= 0; i--)
+			rewrite_block(((Block *) list_nth(blocks, i))->q, &cfgs[i], false, 0, i == 0);
+	}
+	else if (strcmp(mode, "keys") == 0)
+		keys_blocks(blocks, cfgs, b, driving);
+	else if (strcmp(mode, "fact") == 0)
+		q = fact_query(((Block *) list_nth(blocks, b))->q, &cfgs[b]);
+	else if (strcmp(mode, "swap") != 0)
 		elog(ERROR, "isomer: unknown mode %s", mode);
 
 	PG_RETURN_TEXT_P(cstring_to_text(pg_get_querydef(q, false)));

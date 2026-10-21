@@ -71,7 +71,8 @@ SELECT isomer.create_projection(
               'tier', (SELECT t.label FROM mn.tiers t WHERE t.tier = c.tier),
               'open', (SELECT count(*) FROM mn.orders o WHERE o.customer_id = c.customer_id AND o.status = 'open')) AS doc
               FROM mn.customers c $q$,
-  sources => '{"mn.customers": "customer_id", "mn.orders": "customer_id", "mn.tiers": null}');
+  sources => '{"mn.customers": "customer_id", "mn.orders": "customer_id", "mn.tiers": null}',
+  strategy => 'recompute');   -- maintained by key here; the cost model would pick incremental
 SQL
 expect "documents built from every node" "300" "$(mongo_eval 'print(db.getSiblingDB("mn").mn_customer.countDocuments())')"
 out=$($ISO -c "SELECT isomer.alter_projection('mn_customer', freshness => 'sync')" 2>&1 || true)

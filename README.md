@@ -203,6 +203,9 @@ SELECT isomer.create_projection(
                            FROM orders o WHERE o.customer_id = c.id)) AS doc
               FROM customers c $$,
   sources => '{"customers": "id", "orders": "customer_id"}');
+-- Given the mappings, each write re-derives the keys it maps to. Without them (or with
+-- strategy => 'incremental') the subquery keeps its own state, grouped by its correlation
+-- (o.customer_id), and a change to orders re-derives only the customers it is correlated with.
 
 -- Totals over a sharded table, through joins: no key mappings needed. The cost model picks
 -- incremental maintenance here: each change is folded into per-product partial sums, and only
@@ -351,7 +354,7 @@ coordinator, and on every node's clock. They have found and fixed three bugs so 
 
 | Area | Not built yet | PRD |
 |---|---|---|
-| Projections | Incremental maintenance of correlated subqueries: they are re-derived by key (the same document written with a join and `GROUP BY` is maintained incrementally) | FR-P6 |
+| Projections | Subqueries in analytics projections; distributing the state of a query with subqueries across the cluster (it is kept on the coordinator) | FR-P6 |
 | Adoption | Attach and cutover run against each real managed provider in CI: the provider check and a run as a non-superuser role are done, real providers need their accounts | FR-A11 |
 | Cloud | Charging cards (invoices are computed, collecting payment needs a payment provider account); regions in other clouds run for real | FR-CL1, CL2 |
 | Product | Trademark clearance, ParadeDB HA licensing, design partners | PRD §15 |
