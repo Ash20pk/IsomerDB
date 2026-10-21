@@ -122,6 +122,10 @@ expect "a renamed product shows two levels down" "t" \
 expect "the new gold discount reaches every gold customer" "15" "$($ISO -c "SELECT isomer.get('sq_doc', '1') ->> 'discount'")"
 expect "IN (...) follows a changed order" "true" "$($ISO -c "SELECT isomer.get('sq_doc', '21') ->> 'big_spender'")"
 
+# Analytics rows that differ from the query, once nothing is queued for the projection.
+adrift() {
+  $ISO -c "SELECT coalesce(isomer.analytics_differences('$1'), -1)"
+}
 # The keys one write reaches: written and folded in one transaction, then rolled back.
 reached() {
   $ISO -c "BEGIN" -c "$2" -c "SELECT isomer._engine_fold('$1')" \
@@ -145,15 +149,17 @@ contains "a subquery in a JOIN's ON" "it has a subquery in a JOIN's ON" \
   "$($ISO -c "SELECT reason FROM isomer.choose_strategy('SELECT c.id, count(*) AS value FROM sq.customers c JOIN sq.tags t ON t.customer_id = c.id AND EXISTS (SELECT 1 FROM sq.orders o WHERE o.customer_id = c.id) GROUP BY c.id', 'id', 'cache')")"
 contains "a refusal inside a subquery names its tables" "a subquery (sq.orders): it uses window functions" \
   "$($ISO -c "SELECT reason FROM isomer.choose_strategy('SELECT c.id, (SELECT o.id FROM sq.orders o WHERE o.customer_id = c.id ORDER BY rank() OVER (ORDER BY o.total) LIMIT 1) AS value FROM sq.customers c', 'id', 'cache')")"
-contains "a subquery in the WHERE of a query that aggregates" "has a subquery outside its aggregates" \
-  "$($ISO -c "SELECT reason FROM isomer.choose_strategy('SELECT o.customer_id, count(*) AS value FROM sq.orders o WHERE EXISTS (SELECT 1 FROM sq.lines l WHERE l.order_id = o.id) GROUP BY o.customer_id', 'customer_id', 'cache')")"
+contains "a subquery in the WHERE of a query that aggregates" "maintained incrementally" \
+  "$($ISO -c "SELECT isomer.create_projection('sq_with_lines', 'SELECT o.customer_id, count(*) AS value FROM sq.orders o WHERE EXISTS (SELECT 1 FROM sq.lines l WHERE l.order_id = o.id) GROUP BY o.customer_id', 'cache', 'customer_id')")"
+expect "it equals the query" "0" "$(drift sq_with_lines)"
+PFXW=$($ISO -c "SELECT isomer._engine_prefix('sq_with_lines')")
+expect "its partial counts are kept by order, the column the subquery reads" "$($ISO -c "SELECT count(*) FROM sq.orders")" \
+  "$($ISO -c "SELECT count(*) FROM isomer_state.${PFXW}_b0p")"
 contains "a subquery inside a sum: the sum is kept as written, over a copy of the orders" "maintained incrementally" \
   "$($ISO -c "SELECT isomer.create_projection('sq_line_count', 'SELECT o.customer_id, sum((SELECT count(*) FROM sq.lines l WHERE l.order_id = o.id)) AS value FROM sq.orders o GROUP BY o.customer_id', 'cache', 'customer_id')")"
 expect "it equals the query" "0" "$(drift sq_line_count)"
 contains "a subquery reading a table without a primary key, kept as written" "sq.notes has no primary key" \
   "$($ISO -c "SELECT reason FROM isomer.choose_strategy('SELECT c.id, (SELECT jsonb_agg(n.body) FROM sq.notes n WHERE n.customer_id = c.id) AS value FROM sq.customers c', 'id', 'cache')")"
-contains "subqueries in an analytics projection" "maintained incrementally in document and cache projections" \
-  "$($ISO -c "SELECT isomer._engine_shape('SELECT c.tier, count(*) AS n, (SELECT count(*) FROM sq.orders) AS all_orders FROM sq.customers c GROUP BY c.tier', 'tier', 'analytics') ->> 'reason'")"
 contains "still refused without any subquery or aggregate" "it has no aggregate" \
   "$($ISO -c "SELECT reason FROM isomer.choose_strategy('SELECT c.id, c.name AS value FROM sq.customers c', 'id', 'cache')")"
 
@@ -188,6 +194,40 @@ contains "created" "maintained incrementally" \
 expect "it equals the query" "0" "$(drift sq_tiers)"
 $ISO -c "INSERT INTO sq.orders VALUES (2002, 2, 5, 'open')" -c "UPDATE sq.customers SET tier = 'gold' WHERE id = 2" >/dev/null
 eventually "an order and a customer changing tier" "0" "drift sq_tiers"
+
+echo "== FR-P6 an analytics projection with subqueries"
+# Customers per tier who have a big order, not blocked, with their paid total.
+STATS='SELECT c.tier, count(*) AS customers, max(c.id) AS last_id,
+          sum((SELECT count(*) FROM sq.tags t WHERE t.customer_id = c.id)) AS tags
+        FROM sq.customers c
+        WHERE EXISTS (SELECT 1 FROM sq.orders o WHERE o.customer_id = c.id AND o.total > 100)
+          AND NOT EXISTS (SELECT 1 FROM sq.blocked b WHERE b.customer_id = c.id)
+        GROUP BY c.tier'
+$ISO -c "SELECT isomer.create_analytics_projection('sq_tier_rebuilt', \$q\$$STATS\$q\$)" >/dev/null
+expect "auto rebuilds it: the sum over a subquery keeps a copy of every customer" "recompute" \
+  "$($ISO -c "SELECT strategy FROM isomer.projections WHERE name = 'sq_tier_rebuilt'")"
+contains "and says why" "keep a copy of every row its sum read" \
+  "$($ISO -c "SELECT strategy_reason FROM isomer.projections WHERE name = 'sq_tier_rebuilt'")"
+contains "asked for, it is maintained incrementally" "maintained incrementally" \
+  "$($ISO -c "SELECT isomer.create_analytics_projection('sq_tier_stats', \$q\$$STATS\$q\$, strategy => 'incremental')")"
+expect "it equals the query" "0" "$(adrift sq_tier_stats)"
+WHERE_ONLY='SELECT c.tier, count(*) AS customers FROM sq.customers c
+             WHERE EXISTS (SELECT 1 FROM sq.orders o WHERE o.customer_id = c.id AND o.status = '"'"'open'"'"') GROUP BY c.tier'
+contains "without the sum, auto picks incremental" "maintained incrementally" \
+  "$($ISO -c "SELECT isomer.create_analytics_projection('sq_tier_open', \$q\$$WHERE_ONLY\$q\$)")"
+$ISO <<'SQL' >/dev/null
+INSERT INTO sq.orders VALUES (2101, 41, 200, 'open');                               -- a customer gets a big order
+UPDATE sq.orders SET total = 0, status = 'paid' WHERE customer_id = 30;            -- and one loses them all
+UPDATE sq.customers SET tier = 'gold' WHERE id = 41;                                -- a customer changes tier
+INSERT INTO sq.blocked VALUES (12);
+INSERT INTO sq.tags VALUES (41, 'big');
+SQL
+eventually "writes to the customers and both subqueries' tables reach the rows" "0" "adrift sq_tier_stats"
+eventually "and the open orders" "0" "adrift sq_tier_open"
+expect "each change reaches only its customer's tier" "[\"gold\"]" \
+  "$($ISO -c "BEGIN" -c "UPDATE sq.orders SET status = 'paid' WHERE id = 2101" -c "SELECT isomer._engine_fold('sq_tier_open')" \
+          -c "SELECT string_agg(key, ',') FROM isomer.pending WHERE projection = 'sq_tier_open'" -c "ROLLBACK" | tail -1)"
+$ISO -c "SELECT isomer.drop_projection('sq_tier_rebuilt')" >/dev/null
 
 echo "== switching strategy"
 contains "to key recompute, with mappings" "strategy recompute" \
@@ -230,6 +270,8 @@ eventually "after 600 concurrent transactions, every document equals the query" 
 eventually "and the sync cache" "0" "drift sq_spend" 60
 eventually "and the grouped query" "0" "drift sq_tiers" 60
 eventually "and the sum over a subquery" "0" "drift sq_line_count" 60
+eventually "and the count behind a WHERE subquery" "0" "drift sq_with_lines" 60
+eventually "and the analytics projection" "0" "adrift sq_tier_stats" 60
 eventually "and the uncorrelated total" "0" "drift sq_share" 60
 
 echo "== TRUNCATE, the auditor and repair"
@@ -276,6 +318,18 @@ eventually "writes on every shard, and to the reference table, reach it" "0" "dr
 expect "a line on another shard than its order reaches the order's customer" \
   "$($ISO -c "SELECT sum(l.qty) FROM sq.d_lines l WHERE l.order_id = 5001")" \
   "$($ISO -c "SELECT o ->> 'units' FROM jsonb_array_elements(isomer.get('sq_sharded', '55') -> 'orders') o WHERE o ->> 'id' = '5001'")"
+DSTATS='SELECT t.name AS tier, count(*) AS customers, max(c.id) AS last_id
+  FROM sq.d_customers c JOIN sq.d_tiers t ON t.id = c.tier_id
+  WHERE EXISTS (SELECT 1 FROM sq.d_orders o WHERE o.customer_id = c.id
+                AND EXISTS (SELECT 1 FROM sq.d_lines l WHERE l.order_id = o.id AND l.qty > 3))
+  GROUP BY t.name'
+contains "an analytics projection over the sharded tables, two subqueries deep" "maintained incrementally" \
+  "$($ISO -c "SELECT isomer.create_analytics_projection('sq_sharded_stats', \$q\$$DSTATS\$q\$)")"
+expect "it equals the query" "0" "$(adrift sq_sharded_stats)"
+$ISO -c "INSERT INTO sq.d_lines VALUES (7001, 1, 9)" -c "INSERT INTO sq.d_orders VALUES (7001, 61, 5)" \
+     -c "INSERT INTO sq.d_customers VALUES (61, 'new', 2)" -c "UPDATE sq.d_lines SET qty = 0 WHERE order_id % 5 = 0" \
+     -c "UPDATE sq.d_tiers SET name = 'silver' WHERE id = 1" >/dev/null
+eventually "a line, its order and its customer, written on different shards, reach it" "0" "adrift sq_sharded_stats" 60
 if [ "$MULTI" = "t" ]; then
   contains "its state can't be distributed: it is kept on the coordinator" "kept on the coordinator" \
     "$($ISO_NOFAIL -c "SELECT isomer.alter_projection('sq_sharded', state => 'distributed')" 2>&1)"

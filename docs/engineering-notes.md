@@ -45,6 +45,30 @@ opt-in setting.
    unmodified as its own import commit on a branch, then re-apply our changes. Update the tables
    above in the same change.
 
+## 2026-10-21 — Subqueries in analytics projections, and in the WHERE of a query that aggregates (FR-P6)
+
+`tests/subqueries.sh` passes on the three-node cluster (isomer 0.23.0).
+
+0.22.0 refused a subquery outside the aggregates of a block that aggregates, which left analytics
+projections with little to use: they almost always group, and their subqueries are conditions
+(`WHERE EXISTS (...) GROUP BY region`). Such a condition doesn't need the fact's rows while
+folding. It is not one of the fact's own filters (`only_fact` already said so), so the columns it
+reads stay in the fact's partial aggregates, the correlation among them, and the condition is
+applied to those partial rows when deriving. Every fact row folded into a partial row has the same
+values in those columns, so the condition passes or fails the partial row as a whole, and summing
+the partials that pass gives the same counts and sums as the query. The cost is state: one partial
+row per distinct correlation, a customer for `EXISTS (... o.customer_id = c.id)`.
+
+Nothing else changed for keys: a changed row of the subquery's table becomes `EXISTS (a correlated
+changed row)` in the block above, as it does for a block that doesn't aggregate.
+
+Analytics with subqueries go through the same compile. Two things read the query as written and
+had to read `truth_query` instead: the base table built from the tables, and
+`analytics_differences`. Over sharded tables that are not co-located, Citus can't plan the
+correlated subquery once it is wrapped in `CREATE TABLE AS` or compared with `EXCEPT ALL` (see
+below). `auto` looks at every block's aggregates, not only the query's, to decide whether
+incremental state would keep a copy of every row.
+
 ## 2026-10-18 — Correlated subqueries maintained incrementally (FR-P6)
 
 `tests/subqueries.sh` passes on one node and on the three-node cluster (isomer 0.22.0), and

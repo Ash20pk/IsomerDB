@@ -262,6 +262,12 @@ SELECT * FROM isomer.changes_since('order_events', 0);
 SELECT isomer.create_analytics_projection('daily_revenue',
   $$ SELECT date_trunc('day', o.created_at) AS day, sum(o.total) AS revenue FROM orders o GROUP BY 1 $$,
   refresh => '5 minutes');
+-- Subqueries too: the condition is applied to partial counts kept per customer, and a new order
+-- rewrites only its customer's region.
+SELECT isomer.create_analytics_projection('paying_by_region',
+  $$ SELECT c.region, count(*) AS customers FROM customers c
+     WHERE EXISTS (SELECT 1 FROM orders o WHERE o.customer_id = c.id AND o.status = 'paid')
+     GROUP BY c.region $$);
 
 -- Before attaching a managed database: which provider it is, and what to change there
 SELECT * FROM isomer.provider_check('host=... dbname=... user=... password=...');
@@ -354,7 +360,7 @@ coordinator, and on every node's clock. They have found and fixed three bugs so 
 
 | Area | Not built yet | PRD |
 |---|---|---|
-| Projections | Subqueries in analytics projections; distributing the state of a query with subqueries across the cluster (it is kept on the coordinator) | FR-P6 |
+| Projections | Distributing the state of a query with subqueries across the cluster (it is kept on the coordinator) | FR-P6 |
 | Adoption | Attach and cutover run against each real managed provider in CI: the provider check and a run as a non-superuser role are done, real providers need their accounts | FR-A11 |
 | Cloud | Charging cards (invoices are computed, collecting payment needs a payment provider account); regions in other clouds run for real | FR-CL1, CL2 |
 | Product | Trademark clearance, ParadeDB HA licensing, design partners | PRD §15 |
