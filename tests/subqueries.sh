@@ -340,11 +340,37 @@ $ISO -c "INSERT INTO sq.d_lines VALUES (7001, 1, 9)" -c "INSERT INTO sq.d_orders
 eventually "a line, its order and its customer, written on different shards, reach it" "0" "adrift sq_sharded_stats" 60
 if [ "$MULTI" = "t" ]; then
   echo "== FR-P6 the state of a query with subqueries, distributed across the cluster"
-  contains "lines are correlated with an order, not with the customer the orders are sharded by" \
-    "not correlated with its outer row through the column that row is sharded by" \
-    "$($ISO_NOFAIL -c "SELECT isomer.alter_projection('sq_sharded', state => 'distributed')" 2>&1)"
   contains "an analytics projection keeps its state on the coordinator" "its state stays on the coordinator" \
     "$($ISO_NOFAIL -c "SELECT isomer.alter_projection('sq_sharded_stats', state => 'distributed')" 2>&1)"
+  echo "== FR-P6 anchored: an order's lines inside a customer's document, distributed"
+  contains "lines are correlated with an order, the orders sharded by customer: anchored" "state on the cluster" \
+    "$($ISO -c "SELECT isomer.alter_projection('sq_sharded', state => 'distributed')")"
+  expect "it equals the query" "0" "$(drift sq_sharded)"
+  APFX=$($ISO -c "SELECT isomer._engine_prefix('sq_sharded')")
+  expect "the lines' partial sums sit with their orders and customers" "1" \
+    "$($ISO -c "SELECT count(DISTINCT colocationid) FROM pg_dist_partition WHERE logicalrelid::text LIKE 'isomer_state.${APFX}%' AND partmethod = 'h'")"
+  contains "the certificate names the anchored table" "sq.d_lines by the shard value of the row it is correlated with (anchored)" \
+    "$($ISO -c "SELECT r FROM jsonb_array_elements_text(isomer.certificate('sq_sharded') -> 'rules') r WHERE r LIKE 'distributed state:%'")"
+  $ISO -c "INSERT INTO sq.d_lines VALUES (7777, 1, 4)" >/dev/null
+  eventually "a line whose order doesn't exist yet waits on the coordinator" "1" \
+    "$ISO -c \"SELECT count(*) FROM isomer_state.${APFX}_b4po WHERE order_id = 7777\""
+  $ISO -c "INSERT INTO sq.d_orders VALUES (7777, 8, 3)" >/dev/null
+  eventually "and joins its customer when the order arrives" "4" \
+    "$ISO -c \"SELECT o ->> 'units' FROM jsonb_array_elements(isomer.get('sq_sharded', '8') -> 'orders') o WHERE o ->> 'id' = '7777'\""
+  $ISO -c "BEGIN" -c "DELETE FROM sq.d_orders WHERE id = 7777" -c "INSERT INTO sq.d_orders VALUES (7777, 9, 3)" -c "COMMIT" >/dev/null
+  eventually "an order moving to another customer takes its lines with it" "4" \
+    "$ISO -c \"SELECT o ->> 'units' FROM jsonb_array_elements(isomer.get('sq_sharded', '9') -> 'orders') o WHERE o ->> 'id' = '7777'\""
+  # The delete and the insert are captured on different workers, and reach the coordinator apart.
+  eventually "and leaves the first customer" "0" \
+    "$ISO -c \"SELECT count(*) FROM jsonb_array_elements(coalesce(isomer.get('sq_sharded', '8') -> 'orders', '[]')) o WHERE o ->> 'id' = '7777'\""
+  $ISO -c "INSERT INTO sq.d_orders VALUES (7777, 10, 1)" -c "UPDATE sq.d_lines SET qty = 6 WHERE order_id = 7777" >/dev/null
+  eventually "two orders with one id, under two customers, each have the line" "6|6" \
+    "$ISO -c \"SELECT (SELECT o ->> 'units' FROM jsonb_array_elements(isomer.get('sq_sharded', '9') -> 'orders') o WHERE o ->> 'id' = '7777') || '|' || (SELECT o ->> 'units' FROM jsonb_array_elements(isomer.get('sq_sharded', '10') -> 'orders') o WHERE o ->> 'id' = '7777')\""
+  $ISO -c "DELETE FROM sq.d_orders WHERE id = 7777" -c "UPDATE sq.d_lines SET qty = 1 WHERE order_id = 7777" >/dev/null
+  eventually "orders gone, the line waits again, still changing" "0" "drift sq_sharded" 60
+  expect "on the coordinator" "1" "$($ISO -c "SELECT count(*) FROM isomer_state.${APFX}_b4po WHERE order_id = 7777")"
+  contains "min or max over anchored lines is refused, with the reason" "takes min or max over sq.d_lines" \
+    "$($ISO_NOFAIL -c "SELECT isomer.create_projection('sq_bad', 'SELECT c.id, (SELECT jsonb_agg((SELECT max(l.qty) FROM sq.d_lines l WHERE l.order_id = o.id)) FROM sq.d_orders o WHERE o.customer_id = c.id) AS value FROM sq.d_customers c', 'cache', 'id', state => 'distributed')" 2>&1)"
   DIST='SELECT c.id, jsonb_build_object('"'"'tier'"'"', (SELECT t.name FROM sq.d_tiers t WHERE t.id = c.tier_id),
       '"'"'spent'"'"', (SELECT sum(o.total) FROM sq.d_orders o WHERE o.customer_id = c.id),
       '"'"'biggest'"'"', (SELECT max(o.total) FROM sq.d_orders o WHERE o.customer_id = c.id),
@@ -379,14 +405,22 @@ if [ "$MULTI" = "t" ]; then
 CREATE OR REPLACE PROCEDURE public.sq_dwriter(seed int, n int) LANGUAGE plpgsql AS $$
 DECLARE
     c bigint;
+    o bigint;
+    t numeric;
 BEGIN
     PERFORM setseed(seed / 100.0);
     FOR i IN 1 .. n LOOP
         c := 1 + (random() * 69)::int;
-        CASE (random() * 3)::int
+        o := 1 + (random() * 599)::int;
+        CASE (random() * 6)::int
             WHEN 0 THEN INSERT INTO sq.d_orders VALUES (200000 + seed * 10000 + i, c, i % 90);
             WHEN 1 THEN UPDATE sq.d_orders SET total = total + 7 WHERE customer_id = c AND id % 3 = i % 3;
             WHEN 2 THEN DELETE FROM sq.d_orders WHERE customer_id = c AND id % 5 = i % 5;
+            WHEN 3 THEN UPDATE sq.d_lines SET qty = qty + 1 WHERE order_id = o;
+            WHEN 4 THEN INSERT INTO sq.d_lines VALUES (o, 100 + i, 2) ON CONFLICT DO NOTHING;
+            WHEN 5 THEN  -- an order moves to another customer, with its lines
+                DELETE FROM sq.d_orders WHERE id = o RETURNING total INTO t;
+                IF FOUND THEN INSERT INTO sq.d_orders VALUES (o, c, t) ON CONFLICT DO NOTHING; END IF;
             ELSE UPDATE sq.d_customers SET tier_id = 1 + i % 2 WHERE id = c;
         END CASE;
         COMMIT;
@@ -397,6 +431,7 @@ SQL
   for w in 1 2 3 4; do $ISO -c "CALL public.sq_dwriter($w, 100)" >/dev/null & pids+=($!); done
   for pid in "${pids[@]}"; do wait "$pid" || fail "a writer failed" "exit 0" "exit $?"; done
   eventually "after 400 concurrent transactions across the shards, it equals the query" "0" "drift sq_dist" 90
+  eventually "and the document with anchored lines" "0" "drift sq_sharded" 90
   DSHARE='SELECT c.id, round((SELECT coalesce(sum(o.total), 0) FROM sq.d_orders o WHERE o.customer_id = c.id)
                          / nullif((SELECT sum(o.total) FROM sq.d_orders o), 0), 6) AS value FROM sq.d_customers c'
   contains "a share of an uncorrelated total, distributed" "its state distributed across the cluster" \

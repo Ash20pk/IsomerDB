@@ -1536,6 +1536,9 @@ typedef struct BlockCfg
 	int			ntmpls;
 	char	  **fcols;
 	int			nfcols;
+	char	   *anchor_col;		/* the fact's state column holding its parent's shard value, or NULL */
+	int			anchor_outer_rti;	/* the parent's sharded relation */
+	char	   *anchor_outer_col;	/* and its shard column */
 } BlockCfg;
 
 /* Swap relations for state or staging relations whose columns line up with them. */
@@ -1840,7 +1843,10 @@ jb_strings(JsonbValue *v, int *n)
 	return out;
 }
 
-/* {"fact": rti, "rels": [oid or 0 per rti], "templates": [text or null], "fact_columns": [text]} */
+/*
+ * {"fact": rti, "rels": [oid or 0 per rti], "templates": [text or null], "fact_columns": [text],
+ *  "anchor": {"col", "outer_rti", "outer_col"} (optional)}
+ */
 static void
 read_cfg(JsonbContainer *c, BlockCfg *cfg)
 {
@@ -1860,6 +1866,18 @@ read_cfg(JsonbContainer *c, BlockCfg *cfg)
 	}
 	cfg->tmpls = jb_strings(jb_field(c, "templates"), &cfg->ntmpls);
 	cfg->fcols = jb_strings(jb_field(c, "fact_columns"), &cfg->nfcols);
+	v = jb_field(c, "anchor");
+	if (v != NULL && v->type == jbvBinary)
+	{
+		JsonbValue *col = jb_field(v->val.binary.data, "col");
+		JsonbValue *ocol = jb_field(v->val.binary.data, "outer_col");
+
+		if (col == NULL || col->type != jbvString || ocol == NULL || ocol->type != jbvString)
+			elog(ERROR, "isomer: an anchor needs \"col\", \"outer_rti\" and \"outer_col\"");
+		cfg->anchor_col = pnstrdup(col->val.string.val, col->val.string.len);
+		cfg->anchor_outer_rti = (int) jb_int(jb_field(v->val.binary.data, "outer_rti"));
+		cfg->anchor_outer_col = pnstrdup(ocol->val.string.val, ocol->val.string.len);
+	}
 }
 
 static bool
@@ -2052,6 +2070,29 @@ keys_blocks(List *blocks, BlockCfg *cfgs, int b, int driving)
 }
 
 /*
+ * An anchored block's state is sharded by its parent's shard value, kept in a column of its own
+ * (__a: the customer of a line's order), so the cluster runs the subquery on the shard holding
+ * the parent row only if it is told the two are equal: <fact>.__a = <parent's relation>.<shard
+ * column>, a condition of the block on its parent's row.
+ */
+static void
+add_anchor(List *blocks, BlockCfg *cfgs, int k)
+{
+	Block	   *blk = (Block *) list_nth(blocks, k);
+	BlockCfg   *cfg = &cfgs[k];
+	Query	   *pq = ((Block *) list_nth(blocks, blk->parent))->q;
+	Var		   *in;
+	Var		   *out;
+
+	if (cfg->anchor_col == NULL || cfg->fact <= 0)
+		return;
+	in = column_var(rt_fetch(cfg->fact, blk->q->rtable)->relid, cfg->fact, cfg->anchor_col);
+	out = column_var(rt_fetch(cfg->anchor_outer_rti, pq->rtable)->relid, cfg->anchor_outer_rti, cfg->anchor_outer_col);
+	out->varlevelsup = 1;
+	add_where(blk->q, (Node *) make_op(make_parsestate(NULL), list_make1(makeString("=")), (Node *) in, (Node *) out, NULL, -1));
+}
+
+/*
  * isomer._engine_sql_blocks(query, mode, blocks jsonb, block, driving) -> text: _engine_sql for
  * a query with subqueries, each block configured by its element of blocks (see read_cfg):
  *   'derive'  every block rewritten as in _engine_sql's 'derive';
@@ -2087,6 +2128,11 @@ isomer_engine_sql_blocks(PG_FUNCTION_ARGS)
 		if (e != NULL && e->type == jbvBinary)
 			read_cfg(e->val.binary.data, &cfgs[i]);
 		swap_rels(((Block *) list_nth(blocks, i))->q, &cfgs[i]);
+	}
+	if (strcmp(mode, "derive") == 0 || strcmp(mode, "derive_keyed") == 0 || strcmp(mode, "keys") == 0)
+	{
+		for (i = 1; i < nb; i++)
+			add_anchor(blocks, cfgs, i);
 	}
 
 	if (strcmp(mode, "derive") == 0 || strcmp(mode, "derive_keyed") == 0)

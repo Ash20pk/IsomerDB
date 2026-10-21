@@ -45,6 +45,42 @@ opt-in setting.
    unmodified as its own import commit on a branch, then re-apply our changes. Update the tables
    above in the same change.
 
+## 2026-10-21 — Anchored subqueries: an order's lines, distributed (FR-P6)
+
+`tests/subqueries.sh` passes on the cluster (isomer 0.26.0), and Jepsen's `subqueries` workload
+now has each order's lines in the document.
+
+0.24.0 refused to distribute a customer's document with each order's lines in it: the lines are
+correlated with `o.id`, the orders are sharded by `customer_id`, and Citus runs a correlated
+subquery shard by shard only when both sides are sharded by the columns it is correlated
+through. A line has no customer. So its state is given one: the lines block's partial aggregates
+carry `__anchor`, the customer of the line's order, are sharded by it, co-located with the orders
+and customers, and the subquery is generated with `l.__anchor = o.customer_id` added (the
+`anchor` of a block's config; `add_anchor` in the engine). The cluster then runs it on the shard
+holding the order.
+
+Where an anchor comes from, and when it changes:
+
+- **A map on the coordinator**, `(order id, customer)` with a count, kept from the orders' own
+  deltas and built from the orders table. It counts every order row, whatever the orders
+  subquery filters: a line anchored under an order the subquery leaves out is never read, and
+  keeping the map independent of the parent's filters keeps it simple.
+- **Partial rows are folded under every anchor of their order id.** A sharded table can't make
+  `id` unique on its own (its unique keys hold the shard column), so two orders can share an id
+  under two customers; the query correlates the line with both, and it is kept under both.
+- **Orphans.** A line whose order doesn't exist yet has no anchor and can't be in a sharded table
+  (a shard column can't be NULL); its partial rows wait in a coordinator table until the order
+  appears.
+- **Moves.** Before each fold, the parent's changed rows update the map, and the partial rows of
+  every order id whose anchors changed are read, deleted and written again under its anchors now
+  (or to the orphans). Only then are the batch's own rows folded, under the anchors as they now
+  are. An order moving to another customer is a delete and an insert, and its lines follow it.
+- **Keys.** The lines' changed rows are kept on every node, not sharded: they carry no anchor,
+  and a correlated subquery from the sharded orders into a reference table runs fine.
+
+Left out of this first version, refused with the reason: min and max in an anchored subquery
+(their multisets would need anchoring and orphans too), and an anchored subquery inside another.
+
 ## 2026-10-21 — Projections of queries that read the clock are refused
 
 isomer 0.25.0. `create_projection('recent', 'SELECT ... WHERE o.created_at > now() - interval
