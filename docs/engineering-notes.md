@@ -45,6 +45,64 @@ opt-in setting.
    unmodified as its own import commit on a branch, then re-apply our changes. Update the tables
    above in the same change.
 
+## 2026-10-21 — The state of a query with subqueries, distributed (FR-P6)
+
+`tests/subqueries.sh` passes on the cluster (isomer 0.24.0), its distributed section with a shard
+rebalance running underneath.
+
+What Citus will run decides the design. We tried each shape the derivation and the key queries
+produce, on the cluster:
+
+| Shape | Citus |
+|---|---|
+| sharded outer, correlated subquery over a co-located sharded table | runs, shard by shard |
+| the same, two levels deep, correlated on the same value | runs |
+| sharded outer, subquery over a reference table (a lookup) | runs |
+| sharded outer, uncorrelated subquery over a sharded table | runs (an intermediate result) |
+| reference table outer, correlated subquery over a sharded table | "correlated subqueries are not supported when the FROM clause contains a reference table" |
+| a coordinator-local table on either side of a correlated subquery with a sharded table | "direct joins between distributed and local tables are not supported" |
+
+So the query's relation is sharded by the column its subqueries are correlated with (`c.id`), and
+each subquery correlated with that column by equality keeps its state sharded by its own side
+(`o.customer_id`), co-located. Placement goes down the blocks, parents first
+(`_engine_placement`): a subquery takes its parent's shard value through an equality it has in
+its WHERE (or an `IN (...)`'s comparison); one that doesn't aggregate and is correlated some other
+way reads reference tables; one correlated with nothing outside it keeps its partial aggregates
+sharded by group. Each table gets one placement, and two subqueries wanting it sharded by
+different columns, or one sharded and one by another column, block distribution with that reason.
+So does a subquery that aggregates and is correlated through another column: the lines of an order
+inside a customer's document are correlated with `o.id`, the orders are sharded by
+`customer_id`, and nothing makes them co-located. The C side reports each block's equalities with
+its parent (`correlation`), and whether it reads a row two levels up (`deep_outer`).
+
+Things that had to follow:
+
+- **Staging tables go where their table's state goes.** The key queries run the subqueries over
+  the changed rows; with the staging tables on the coordinator they were the local table in the
+  second failing row above. They are sharded the same way (or reference tables), filled from the
+  deltas as a parameter.
+- **Unique keys hold the shard column.** Citus allows no other, so partial aggregates are keyed by
+  `(customer_id, __h)` (the hash is still unique on its own), the min/max multisets gain the shard
+  column and the fold's `UPDATE ... (SELECT min(value) ...)` matches on it to stay on one shard,
+  and a copy's primary key gains it. A row moving to another customer is a delete and an insert in
+  the deltas already, so a key with the shard column in it still nets correctly.
+- **Copies are written from a parameter**, as reference tables were in 0.21.0, and the rows checked
+  for having left are the ones in that parameter, not the whole table.
+- **`derive_keyed` for blocks**: the key filter on the query itself, so a shard filters by the key
+  before it runs the subqueries for its rows.
+
+Found along the way, from a full run: `drop_projection` of an event projection was cancelled as
+a distributed deadlock, once in three runs of `test-all.sh`. A fold deletes the projection's
+deltas, then inserts rows that reference the projection (`isomer.changes` for events,
+`isomer.pending` for the engine), which takes a share lock on its row; dropping the projection
+deletes that row and cascades to the same deltas. The drop now takes both folds' advisory locks
+first. That the failure is gone can't be shown by one green run; the cycle is in the code.
+
+Also from 0.21.0: `alter_projection(strategy => ...)` or `(state => ...)` on an
+analytics projection recompiled its plan without the analytics keys and rebuilt it as documents,
+failing half way. It now refuses both: an analytics projection's strategy is chosen when it is
+created and its state stays on the coordinator.
+
 ## 2026-10-21 — Subqueries in analytics projections, and in the WHERE of a query that aggregates (FR-P6)
 
 `tests/subqueries.sh` passes on the three-node cluster (isomer 0.23.0).

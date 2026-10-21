@@ -227,6 +227,9 @@ eventually "and the open orders" "0" "adrift sq_tier_open"
 expect "each change reaches only its customer's tier" "[\"gold\"]" \
   "$($ISO -c "BEGIN" -c "UPDATE sq.orders SET status = 'paid' WHERE id = 2101" -c "SELECT isomer._engine_fold('sq_tier_open')" \
           -c "SELECT string_agg(key, ',') FROM isomer.pending WHERE projection = 'sq_tier_open'" -c "ROLLBACK" | tail -1)"
+contains "its strategy is chosen when it is created, not changed after" "its strategy is chosen when it is created" \
+  "$($ISO_NOFAIL -c "SELECT isomer.alter_projection('sq_tier_open', strategy => 'recompute')" 2>&1)"
+expect "and it is still maintained incrementally" "incremental" "$($ISO -c "SELECT strategy FROM isomer.projections WHERE name = 'sq_tier_open'")"
 $ISO -c "SELECT isomer.drop_projection('sq_tier_rebuilt')" >/dev/null
 
 echo "== switching strategy"
@@ -331,11 +334,87 @@ $ISO -c "INSERT INTO sq.d_lines VALUES (7001, 1, 9)" -c "INSERT INTO sq.d_orders
      -c "UPDATE sq.d_tiers SET name = 'silver' WHERE id = 1" >/dev/null
 eventually "a line, its order and its customer, written on different shards, reach it" "0" "adrift sq_sharded_stats" 60
 if [ "$MULTI" = "t" ]; then
-  contains "its state can't be distributed: it is kept on the coordinator" "kept on the coordinator" \
+  echo "== FR-P6 the state of a query with subqueries, distributed across the cluster"
+  contains "lines are correlated with an order, not with the customer the orders are sharded by" \
+    "not correlated with its outer row through the column that row is sharded by" \
     "$($ISO_NOFAIL -c "SELECT isomer.alter_projection('sq_sharded', state => 'distributed')" 2>&1)"
+  contains "an analytics projection keeps its state on the coordinator" "its state stays on the coordinator" \
+    "$($ISO_NOFAIL -c "SELECT isomer.alter_projection('sq_sharded_stats', state => 'distributed')" 2>&1)"
+  DIST='SELECT c.id, jsonb_build_object('"'"'tier'"'"', (SELECT t.name FROM sq.d_tiers t WHERE t.id = c.tier_id),
+      '"'"'spent'"'"', (SELECT sum(o.total) FROM sq.d_orders o WHERE o.customer_id = c.id),
+      '"'"'biggest'"'"', (SELECT max(o.total) FROM sq.d_orders o WHERE o.customer_id = c.id),
+      '"'"'orders'"'"', (SELECT jsonb_agg(o.id ORDER BY o.id) FROM sq.d_orders o WHERE o.customer_id = c.id),
+      '"'"'latest'"'"', (SELECT o.id FROM sq.d_orders o WHERE o.customer_id = c.id ORDER BY o.id DESC LIMIT 1)) AS doc
+    FROM sq.d_customers c WHERE EXISTS (SELECT 1 FROM sq.d_orders o WHERE o.customer_id = c.id AND o.total > 10)'
+  contains "a document of correlated subqueries, its state distributed" "its state distributed across the cluster" \
+    "$($ISO -c "SELECT isomer.create_projection('sq_dist', \$q\$$DIST\$q\$, 'document', 'id', state => 'distributed')")"
+  expect "it equals the query" "0" "$(drift sq_dist)"
+  expect "the certificate holds, every state table distributed" "true|true" \
+    "$($ISO -c "SELECT (isomer.certificate('sq_dist') ->> 'valid') || '|' || (c ->> 'passed') FROM jsonb_array_elements(isomer.certificate('sq_dist') -> 'checks') c WHERE c ->> 'check' = 'state distributed'")"
+  contains "customers sharded by id, the orders' state by customer_id, the tiers on every node" \
+    "sq.d_customers by id, sq.d_orders by customer_id), so a correlated subquery runs on the shard holding its outer row; kept on every node: sq.d_tiers" \
+    "$($ISO -c "SELECT r FROM jsonb_array_elements_text(isomer.certificate('sq_dist') -> 'rules') r WHERE r LIKE 'distributed state:%'")"
+  DPFX=$($ISO -c "SELECT isomer._engine_prefix('sq_dist')")
+  expect "the sharded parts are co-located" "1" \
+    "$($ISO -c "SELECT count(DISTINCT colocationid) FROM pg_dist_partition WHERE logicalrelid::text LIKE 'isomer_state.${DPFX}%' AND partmethod = 'h'")"
+  written() { $ISO -c "SELECT documents_written FROM isomer.projection_stats WHERE projection = '$1'"; }
+  before=$(written sq_dist)
+  $ISO -c "UPDATE sq.d_orders SET total = total + 1 WHERE id = (SELECT min(id) FROM sq.d_orders WHERE customer_id = 3)" >/dev/null
+  eventually "a changed order is folded on its shard" "0" "drift sq_dist" 60
+  expect "and re-derives its customer's document only" "1" "$(( $(written sq_dist) - before ))"
+  $ISO -c "INSERT INTO sq.d_orders VALUES (9001, 3, 99), (9002, 3, 5)" \
+       -c "DELETE FROM sq.d_orders WHERE id = 9001" -c "INSERT INTO sq.d_orders VALUES (9001, 4, 99)" \
+       -c "DELETE FROM sq.d_orders WHERE customer_id = 7" \
+       -c "DELETE FROM sq.d_orders WHERE customer_id = 9 AND total = (SELECT max(total) FROM sq.d_orders WHERE customer_id = 9)" \
+       -c "UPDATE sq.d_tiers SET name = 'diamond' WHERE id = 2" -c "UPDATE sq.d_customers SET tier_id = 1 WHERE id = 5" \
+       -c "INSERT INTO sq.d_customers VALUES (70, 'new', 2)" -c "INSERT INTO sq.d_orders VALUES (9003, 70, 500)" >/dev/null
+  eventually "orders moving, leaving, a maximum leaving, a lookup renamed, a new customer" "0" "drift sq_dist" 60
+  expect "a customer without a big order is gone" "t" "$($ISO -c "SELECT isomer.get('sq_dist', '7') IS NULL")"
+  $ISO <<'SQL' >/dev/null
+CREATE OR REPLACE PROCEDURE public.sq_dwriter(seed int, n int) LANGUAGE plpgsql AS $$
+DECLARE
+    c bigint;
+BEGIN
+    PERFORM setseed(seed / 100.0);
+    FOR i IN 1 .. n LOOP
+        c := 1 + (random() * 69)::int;
+        CASE (random() * 3)::int
+            WHEN 0 THEN INSERT INTO sq.d_orders VALUES (200000 + seed * 10000 + i, c, i % 90);
+            WHEN 1 THEN UPDATE sq.d_orders SET total = total + 7 WHERE customer_id = c AND id % 3 = i % 3;
+            WHEN 2 THEN DELETE FROM sq.d_orders WHERE customer_id = c AND id % 5 = i % 5;
+            ELSE UPDATE sq.d_customers SET tier_id = 1 + i % 2 WHERE id = c;
+        END CASE;
+        COMMIT;
+    END LOOP;
+END $$;
+SQL
+  pids=()
+  for w in 1 2 3 4; do $ISO -c "CALL public.sq_dwriter($w, 100)" >/dev/null & pids+=($!); done
+  for pid in "${pids[@]}"; do wait "$pid" || fail "a writer failed" "exit 0" "exit $?"; done
+  eventually "after 400 concurrent transactions across the shards, it equals the query" "0" "drift sq_dist" 90
+  DSHARE='SELECT c.id, round((SELECT coalesce(sum(o.total), 0) FROM sq.d_orders o WHERE o.customer_id = c.id)
+                         / nullif((SELECT sum(o.total) FROM sq.d_orders o), 0), 6) AS value FROM sq.d_customers c'
+  contains "a share of an uncorrelated total, distributed" "its state distributed across the cluster" \
+    "$($ISO -c "SELECT isomer.create_projection('sq_dist_share', \$q\$$DSHARE\$q\$, 'cache', 'id', state => 'distributed')")"
+  expect "it equals the query" "0" "$(drift sq_dist_share)"
+  $ISO -c "INSERT INTO sq.d_orders VALUES (9100, 12, 80)" >/dev/null
+  eventually "an order changes every customer's share" "0" "drift sq_dist_share" 60
+  contains "back to the coordinator" "state on the coordinator" "$($ISO -c "SELECT isomer.alter_projection('sq_dist', state => 'coordinator')")"
+  expect "no state left on the cluster" "0" \
+    "$($ISO -c "SELECT count(*) FROM pg_dist_partition WHERE logicalrelid::text LIKE 'isomer_state.${DPFX}%'")"
+  expect "it equals the query" "0" "$(drift sq_dist)"
+  contains "and distributed again" "state on the cluster" "$($ISO -c "SELECT isomer.alter_projection('sq_dist', state => 'distributed')")"
+  $ISO -c "DELETE FROM sq.d_orders WHERE id = 9003" >/dev/null
+  eventually "it is maintained again" "0" "drift sq_dist" 60
+  expect "repair rebuilds the distributed state" "0" "$($ISO -c "SELECT isomer.repair('sq_dist', ARRAY['3', '4'])" >/dev/null && drift sq_dist)"
 fi
 
 echo "== dropping removes the state"
-$ISO -c "SELECT isomer.drop_projection(name) FROM isomer.projections WHERE name LIKE 'sq\_%'" -c "DROP PROCEDURE public.sq_writer(int, int)" >/dev/null
+$ISO -c "SELECT isomer.drop_projection(name) FROM isomer.projections WHERE name LIKE 'sq\_%'" -c "DROP PROCEDURE public.sq_writer(int, int)" \
+     -c "DROP PROCEDURE IF EXISTS public.sq_dwriter(int, int)" >/dev/null
 expect "no state left" "0" "$($ISO -c "SELECT count(*) FROM pg_class WHERE relnamespace = 'isomer_state'::regnamespace")"
+if [ "$MULTI" = "t" ]; then
+  expect "none on the workers, nor in the cluster's metadata" "0|0" \
+    "$($ISO -c "SELECT (SELECT coalesce(sum(result::int), 0) FROM run_command_on_workers(\$\$SELECT count(*) FROM pg_class WHERE relnamespace = 'isomer_state'::regnamespace\$\$)) || '|' || (SELECT count(*) FROM pg_dist_partition WHERE logicalrelid::text LIKE 'isomer\_state.%')")"
+fi
 echo "subqueries: all checks passed"

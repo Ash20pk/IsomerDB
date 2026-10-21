@@ -43,8 +43,9 @@
  *
  *   isomer._engine_sql_blocks(query, mode, blocks, block, driving) -> text
  *     _engine_sql for such a query, each block configured on its own: 'derive' rewrites every
- *     block; 'keys' turns the subqueries above the driving relation into EXISTS in their parents;
- *     'fact' is one block's fact rows; 'swap' only swaps relations.
+ *     block; 'derive_keyed' also filters the query by the keys in $1; 'keys' turns the
+ *     subqueries above the driving relation into EXISTS in their parents; 'fact' is one block's
+ *     fact rows; 'swap' only swaps relations.
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
@@ -1065,10 +1066,109 @@ sublink_type_name(int type)
 	return NULL;
 }
 
+/* Does a block read the row of a query more than one level above it? */
+static bool
+deep_outer_walker(Node *node, int *depth)
+{
+	if (node == NULL)
+		return false;
+	if (IsA(node, Var))
+		return ((Var *) node)->varlevelsup > *depth + 1;
+	if (IsA(node, Aggref) && ((Aggref *) node)->agglevelsup > *depth + 1)
+		return true;
+	if (IsA(node, Query))
+	{
+		bool		r;
+
+		(*depth)++;
+		r = query_tree_walker((Query *) node, deep_outer_walker, depth, QTW_IGNORE_RT_SUBQUERIES | QTW_IGNORE_JOINALIASES);
+		(*depth)--;
+		return r;
+	}
+	return expression_tree_walker(node, deep_outer_walker, depth);
+}
+
+static void
+json_correlation_one(StringInfo b, bool *first, Query *q, Var *in, Query *pq, Var *out)
+{
+	if (colname(q, in) == NULL || colname(pq, out) == NULL)
+		return;
+	if (!*first)
+		appendStringInfoChar(b, ',');
+	*first = false;
+	appendStringInfo(b, "{\"rti\":%d,\"col\":", in->varno);
+	json_str(b, colname(q, in));
+	appendStringInfo(b, ",\"outer_rti\":%d,\"outer_col\":", out->varno);
+	json_str(b, colname(pq, out));
+	appendStringInfoChar(b, '}');
+}
+
+/*
+ * How a subquery is correlated with its parent's row by equality: a condition in its WHERE
+ * between one of its columns and one of the parent's (o.customer_id = c.id), or an IN (...)
+ * comparing one of the parent's columns with its output column. A state sharded by those
+ * columns on both sides is co-located, which is what lets a cluster run the subquery shard by
+ * shard.
+ */
+static void
+json_correlation(StringInfo b, Block *k, Query *pq)
+{
+	Query	   *q = k->q;
+	bool		first = true;
+	ListCell   *lc;
+
+	appendStringInfoString(b, ",\"correlation\":[");
+	foreach(lc, make_ands_implicit((Expr *) q->jointree->quals))
+	{
+		OpExpr	   *op = lfirst(lc);
+		Node	   *a;
+		Node	   *c;
+
+		if (!IsA(op, OpExpr) || list_length(op->args) != 2)
+			continue;
+		a = strip_relabel(linitial(op->args));
+		c = strip_relabel(lsecond(op->args));
+		if (!IsA(a, Var) || !IsA(c, Var)
+			|| (!op_mergejoinable(op->opno, exprType(a)) && !op_hashjoinable(op->opno, exprType(a))))
+			continue;
+		if (((Var *) a)->varlevelsup == 0 && ((Var *) c)->varlevelsup == 1)
+			json_correlation_one(b, &first, q, (Var *) a, pq, (Var *) c);
+		else if (((Var *) c)->varlevelsup == 0 && ((Var *) a)->varlevelsup == 1)
+			json_correlation_one(b, &first, q, (Var *) c, pq, (Var *) a);
+	}
+	if (k->link && k->link->subLinkType == ANY_SUBLINK && k->link->testexpr && IsA(k->link->testexpr, OpExpr))
+	{
+		OpExpr	   *op = (OpExpr *) k->link->testexpr;
+		Node	   *a = list_length(op->args) == 2 ? strip_relabel(linitial(op->args)) : NULL;
+		Node	   *p = list_length(op->args) == 2 ? strip_relabel(lsecond(op->args)) : NULL;
+
+		if (a && p && IsA(a, Var) && ((Var *) a)->varlevelsup == 0 && IsA(p, Param)
+			&& ((Param *) p)->paramkind == PARAM_SUBLINK
+			&& (op_mergejoinable(op->opno, exprType(a)) || op_hashjoinable(op->opno, exprType(a))))
+		{
+			foreach(lc, q->targetList)
+			{
+				TargetEntry *tle = (TargetEntry *) lfirst(lc);
+				Node	   *in = strip_relabel((Node *) tle->expr);
+
+				if (!tle->resjunk && tle->resno == ((Param *) p)->paramid
+					&& IsA(in, Var) && ((Var *) in)->varlevelsup == 0)
+					json_correlation_one(b, &first, q, (Var *) in, pq, (Var *) a);
+			}
+		}
+	}
+	appendStringInfoString(b, "],\"deep_outer\":");
+	appendStringInfoString(b, query_tree_walker(q, deep_outer_walker, &(int){0},
+												QTW_IGNORE_RT_SUBQUERIES | QTW_IGNORE_JOINALIASES)
+						   ? "true" : "false");
+}
+
 /*
  * isomer._engine_blocks(query text) -> jsonb: each block, the query first, as
  *   {"block": n, "parent": n|null, "type": "expr"|"exists"|"any"|..., "place": "target"|"agg"|...,
- *    "agg": n|null, "analysis": <what _engine_analyze says of that block>}
+ *    "agg": n|null, "analysis": <what _engine_analyze says of that block>,
+ *    "correlation": [{"rti", "col", "outer_rti", "outer_col"}], "deep_outer": bool}
+ * (correlation and deep_outer for subqueries only).
  */
 Datum
 isomer_engine_blocks(PG_FUNCTION_ARGS)
@@ -1103,6 +1203,8 @@ isomer_engine_blocks(PG_FUNCTION_ARGS)
 			appendStringInfo(&b, "%d", k->agg);
 		appendStringInfoString(&b, ",\"analysis\":");
 		analyze_query(k->q, &b);
+		if (k->parent >= 0)
+			json_correlation(&b, k, ((Block *) list_nth(blocks, k->parent))->q);
 		appendStringInfoChar(&b, '}');
 	}
 	appendStringInfoChar(&b, ']');
@@ -1867,6 +1969,8 @@ keys_blocks(List *blocks, BlockCfg *cfgs, int b, int driving)
  * isomer._engine_sql_blocks(query, mode, blocks jsonb, block, driving) -> text: _engine_sql for
  * a query with subqueries, each block configured by its element of blocks (see read_cfg):
  *   'derive'  every block rewritten as in _engine_sql's 'derive';
+ *   'derive_keyed'  the same, with the query filtered by the keys in $1 (text[]): the key column
+ *             is "key" in the query's block;
  *   'keys'    the keys reached by the changed rows of relation `driving` of block `block`;
  *   'fact'    the fact rows of block `block`;
  *   'swap'    the query as written, only its relations swapped.
@@ -1899,10 +2003,20 @@ isomer_engine_sql_blocks(PG_FUNCTION_ARGS)
 		swap_rels(((Block *) list_nth(blocks, i))->q, &cfgs[i]);
 	}
 
-	if (strcmp(mode, "derive") == 0)
+	if (strcmp(mode, "derive") == 0 || strcmp(mode, "derive_keyed") == 0)
 	{
 		for (i = nb - 1; i >= 0; i--)
 			rewrite_block(((Block *) list_nth(blocks, i))->q, &cfgs[i], false, 0, i == 0);
+		/* The keys in $1 as a condition of the query itself, so each shard filters by them. */
+		if (strcmp(mode, "derive_keyed") == 0)
+		{
+			JsonbValue *e = getIthJsonbValueFromContainer(&jb->root, 0);
+			JsonbValue *k = e != NULL && e->type == jbvBinary ? jb_field(e->val.binary.data, "key") : NULL;
+
+			if (k == NULL || k->type != jbvString)
+				elog(ERROR, "isomer: derive_keyed needs the key column, as \"key\" of the query's block");
+			add_key_filter(q, pnstrdup(k->val.string.val, k->val.string.len));
+		}
 	}
 	else if (strcmp(mode, "keys") == 0)
 		keys_blocks(blocks, cfgs, b, driving);
