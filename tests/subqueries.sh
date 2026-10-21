@@ -227,9 +227,14 @@ eventually "and the open orders" "0" "adrift sq_tier_open"
 expect "each change reaches only its customer's tier" "[\"gold\"]" \
   "$($ISO -c "BEGIN" -c "UPDATE sq.orders SET status = 'paid' WHERE id = 2101" -c "SELECT isomer._engine_fold('sq_tier_open')" \
           -c "SELECT string_agg(key, ',') FROM isomer.pending WHERE projection = 'sq_tier_open'" -c "ROLLBACK" | tail -1)"
-contains "its strategy is chosen when it is created, not changed after" "its strategy is chosen when it is created" \
-  "$($ISO_NOFAIL -c "SELECT isomer.alter_projection('sq_tier_open', strategy => 'recompute')" 2>&1)"
-expect "and it is still maintained incrementally" "incremental" "$($ISO -c "SELECT strategy FROM isomer.projections WHERE name = 'sq_tier_open'")"
+contains "its strategy changes: built again as a columnar table rebuilt when sources change" "columnar; read it as public.sq_tier_open" \
+  "$($ISO -c "SELECT isomer.alter_projection('sq_tier_open', strategy => 'rebuild')")"
+expect "rebuilt, from the same definition" "recompute|0" \
+  "$($ISO -c "SELECT strategy || '|' || isomer.analytics_differences('sq_tier_open') FROM isomer.projections WHERE name = 'sq_tier_open'")"
+contains "and back to incremental" "maintained incrementally" \
+  "$($ISO -c "SELECT isomer.alter_projection('sq_tier_open', strategy => 'incremental')")"
+$ISO -c "INSERT INTO sq.orders VALUES (2102, 42, 10, 'open')" >/dev/null
+eventually "maintained incrementally again" "0" "adrift sq_tier_open"
 $ISO -c "SELECT isomer.drop_projection('sq_tier_rebuilt')" >/dev/null
 
 echo "== switching strategy"

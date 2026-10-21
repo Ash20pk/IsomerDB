@@ -362,7 +362,7 @@ coordinator, and on every node's clock. They have found and fixed three bugs so 
 
 | Area | Not built yet | PRD |
 |---|---|---|
-| Projections | Distributing the state of a subquery correlated through another column than its parent's shard column (an order's lines inside a customer's document stay on the coordinator); changing an analytics projection's strategy after it is created | FR-P6 |
+| Projections | Distributing the state of a subquery correlated through another column than its parent's shard column (an order's lines inside a customer's document stay on the coordinator) | FR-P6 |
 | Adoption | Attach and cutover run against each real managed provider in CI: the provider check and a run as a non-superuser role are done, real providers need their accounts | FR-A11 |
 | Cloud | Charging cards (invoices are computed, collecting payment needs a payment provider account); regions in other clouds run for real | FR-CL1, CL2 |
 | Product | Trademark clearance, ParadeDB HA licensing, design partners | PRD §15 |

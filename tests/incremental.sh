@@ -96,6 +96,15 @@ contains "but not over a table with no primary key to tell its rows apart" "ic.n
   "$($ISO -c "SELECT reason FROM isomer.choose_strategy('SELECT n.customer_id, jsonb_build_object(''notes'', jsonb_agg(n.body)) AS doc FROM ic.notes n GROUP BY n.customer_id', 'customer_id', 'document')")"
 contains "a volatile grouping expression is refused" "groups by a volatile expression" \
   "$($ISO -c "SELECT reason FROM isomer.choose_strategy('SELECT (random() * 3)::int AS b, count(*) AS value FROM ic.orders o GROUP BY 1', 'b', 'cache')")"
+contains "a query on the clock can't be kept, by any strategy, and the functions are named" "reads now(), current_date(), whose result changes with no table changing" \
+  "$($ISO_NOFAIL -c "SELECT isomer.create_projection('ic_bad', 'SELECT o.customer_id, count(*) AS value FROM ic.orders o WHERE o.total > extract(epoch FROM now()) - 1e10 OR date ''2026-01-01'' + o.id::int = current_date GROUP BY 1', 'cache', 'customer_id', strategy => 'recompute')" 2>&1)"
+contains "nor one calling a volatile function, in a subquery" "reads random()" \
+  "$($ISO_NOFAIL -c "SELECT isomer.create_projection('ic_bad', 'SELECT c.id, jsonb_build_object(''lucky'', (SELECT count(*) FROM ic.orders o WHERE o.customer_id = c.id AND random() < 0.5)) AS doc FROM ic.customers c', 'document', 'id')" 2>&1)"
+contains "nor an analytics projection" "reads age()" \
+  "$($ISO_NOFAIL -c "SELECT isomer.create_analytics_projection('ic_bad', 'SELECT o.customer_id, max(age(timestamp ''2026-01-01'' + o.id * interval ''1 day'')) AS oldest FROM ic.orders o GROUP BY 1')" 2>&1)"
+contains "stable functions that depend only on settings are fine" "ic_fmt" \
+  "$($ISO -c "SELECT isomer.create_projection('ic_fmt', 'SELECT o.customer_id, to_char(max(o.total), ''FM999990.00'') AS value FROM ic.orders o GROUP BY 1', 'cache', 'customer_id')")"
+$ISO -c "SELECT isomer.drop_projection('ic_fmt')" >/dev/null
 contains "a join landing on a non-unique column is refused, with the reason" "not a unique key there" \
   "$($ISO_NOFAIL -c "SELECT isomer.create_projection('ic_bad', 'SELECT p.category_id, sum(p.id) AS value FROM ic.products p JOIN ic.lines l ON l.product_id = p.id GROUP BY p.category_id', 'cache', 'category_id', strategy => 'incremental')" 2>&1)"
 contains "sync and incremental: refused over sharded tables, with the reason" "a statement across its shards runs their triggers over parallel connections" \

@@ -41,6 +41,10 @@
  *     A query with subqueries, as blocks: the query and each subquery in it, each with its own
  *     analysis and where it sits in its parent. Each block keeps its own state.
  *
+ *   isomer._engine_clock(query text) -> text[]
+ *     The functions in a query whose result changes with no table changing: those that read the
+ *     clock, and volatile ones. A projection of such a query can't be kept.
+ *
  *   isomer._engine_sql_blocks(query, mode, blocks, block, driving) -> text
  *     _engine_sql for such a query, each block configured on its own: 'derive' rewrites every
  *     block; 'derive_keyed' also filters the query by the keys in $1; 'keys' turns the
@@ -55,6 +59,7 @@
 #include "catalog/namespace.h"
 #include "catalog/pg_aggregate.h"
 #include "catalog/pg_collation_d.h"
+#include "catalog/pg_proc.h"
 #include "catalog/pg_type_d.h"
 #include "fmgr.h"
 #include "lib/stringinfo.h"
@@ -74,6 +79,7 @@
 #include "rewrite/rewriteManip.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
+#include "utils/fmgroids.h"
 #include "utils/json.h"
 #include "utils/jsonb.h"
 #include "utils/lsyscache.h"
@@ -85,6 +91,7 @@ PG_FUNCTION_INFO_V1(isomer_engine_analyze);
 PG_FUNCTION_INFO_V1(isomer_engine_sql);
 PG_FUNCTION_INFO_V1(isomer_engine_blocks);
 PG_FUNCTION_INFO_V1(isomer_engine_sql_blocks);
+PG_FUNCTION_INFO_V1(isomer_engine_clock);
 
 /* ── parsing ─────────────────────────────────────────────────────────────── */
 
@@ -1209,6 +1216,85 @@ isomer_engine_blocks(PG_FUNCTION_ARGS)
 	}
 	appendStringInfoChar(&b, ']');
 	PG_RETURN_DATUM(DirectFunctionCall1(jsonb_in, CStringGetDatum(b.data)));
+}
+
+/* ── isomer._engine_clock ────────────────────────────────────────────────── */
+
+/*
+ * A projection holds what its query returned when its rows were last written. A query whose
+ * result changes with no table changing can't be held that way: one that reads the clock
+ * (now(), current_date, age(t)), or calls a volatile function (random(), clock_timestamp()). Stable
+ * functions that depend only on settings (to_char, jsonb_build_object) are fine.
+ */
+static bool
+clock_func(Oid funcid, void *context)
+{
+	List	  **names = (List **) context;
+
+	if (funcid == F_NOW || funcid == F_TRANSACTION_TIMESTAMP || funcid == F_STATEMENT_TIMESTAMP
+		|| funcid == F_AGE_TIMESTAMP || funcid == F_AGE_TIMESTAMPTZ
+		|| func_volatile(funcid) == PROVOLATILE_VOLATILE)
+		*names = list_append_unique(*names, makeString(get_func_name(funcid)));
+	return false;
+}
+
+static bool
+clock_walker(Node *node, List **names)
+{
+	if (node == NULL)
+		return false;
+	if (IsA(node, SQLValueFunction))
+	{
+		switch (((SQLValueFunction *) node)->op)
+		{
+			case SVFOP_CURRENT_DATE:
+				*names = list_append_unique(*names, makeString("current_date"));
+				break;
+			case SVFOP_CURRENT_TIME:
+			case SVFOP_CURRENT_TIME_N:
+				*names = list_append_unique(*names, makeString("current_time"));
+				break;
+			case SVFOP_CURRENT_TIMESTAMP:
+			case SVFOP_CURRENT_TIMESTAMP_N:
+				*names = list_append_unique(*names, makeString("current_timestamp"));
+				break;
+			case SVFOP_LOCALTIME:
+			case SVFOP_LOCALTIME_N:
+				*names = list_append_unique(*names, makeString("localtime"));
+				break;
+			case SVFOP_LOCALTIMESTAMP:
+			case SVFOP_LOCALTIMESTAMP_N:
+				*names = list_append_unique(*names, makeString("localtimestamp"));
+				break;
+			default:
+				break;			/* current_user and the like: fixed for a session */
+		}
+		return false;
+	}
+	check_functions_in_node(node, clock_func, names);
+	if (IsA(node, Query))
+		return query_tree_walker((Query *) node, clock_walker, names, 0);
+	return expression_tree_walker(node, clock_walker, names);
+}
+
+/*
+ * isomer._engine_clock(query text) -> text[]: the functions in the query, at any depth, whose
+ * result changes with no table changing; empty when there are none.
+ */
+Datum
+isomer_engine_clock(PG_FUNCTION_ARGS)
+{
+	char	   *sql = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	List	   *names = NIL;
+	ArrayBuildState *astate = NULL;
+	ListCell   *lc;
+
+	query_tree_walker(analyze_select(sql), clock_walker, &names, 0);
+	foreach(lc, names)
+		astate = accumArrayResult(astate, CStringGetTextDatum(strVal(lfirst(lc))), false, TEXTOID, CurrentMemoryContext);
+	if (astate == NULL)
+		PG_RETURN_ARRAYTYPE_P(construct_empty_array(TEXTOID));
+	PG_RETURN_DATUM(makeArrayResult(astate, CurrentMemoryContext));
 }
 
 /* ── isomer._engine_sql ──────────────────────────────────────────────────── */

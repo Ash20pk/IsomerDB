@@ -45,6 +45,30 @@ opt-in setting.
    unmodified as its own import commit on a branch, then re-apply our changes. Update the tables
    above in the same change.
 
+## 2026-10-21 — Projections of queries that read the clock are refused
+
+isomer 0.25.0. `create_projection('recent', 'SELECT ... WHERE o.created_at > now() - interval
+''1 day'' ...')` was accepted, and wrong from the first day: a projection holds what its query
+returned when its rows were last written, and nothing writes a row again because a day passed.
+Incremental state folded the condition once, at write time; key recompute re-derived only keys
+that a write reached. The auditor, running the query later, saw the difference on every pass
+and repaired it forever.
+
+No strategy can keep such a query, so creation refuses it and names the functions
+(`isomer._engine_clock`, a walk over the parse tree at every depth): the clock (`now()`,
+`transaction_timestamp()`, `statement_timestamp()`, `current_date` and the other SQL time
+keywords, one-argument `age()`) and every volatile function (`random()`, `clock_timestamp()`,
+`nextval()`). Stable functions that depend only on settings, `to_char` or `jsonb_build_object`,
+are left alone; refusing every non-immutable function would refuse every document. Event
+projections are exempt: their rules run once per change, so `now()` there is the event's time.
+The hint says what works instead: apply the time when reading, or store it in a column when the
+row is written.
+
+In the same release `alter_projection(strategy => ...)` changes an analytics projection's
+strategy: it is dropped and created again from its stored definition (query, refresh, schema)
+in one transaction, so readers see the old columnar table until the new one commits. 0.24.0 had
+refused it, after finding it broken since 0.21.0.
+
 ## 2026-10-21 — The state of a query with subqueries, distributed (FR-P6)
 
 `tests/subqueries.sh` passes on the cluster (isomer 0.24.0), its distributed section with a shard
