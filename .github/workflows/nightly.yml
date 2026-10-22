@@ -1,0 +1,50 @@
+# Every night, and on demand: the three-node cluster suites, then every Jepsen workload with
+# faults on the workers. Slower than CI, so not on every pull request.
+name: Nightly
+
+on:
+  schedule:
+    - cron: "17 2 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  cluster:
+    name: Cluster suites and Jepsen
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+      - name: Make room for the builds
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL && df -h /
+      - uses: docker/setup-buildx-action@v3
+      - name: Build the images
+        uses: docker/bake-action@v6
+        with:
+          source: .
+          files: docker-compose.yml
+          targets: db,api,embedder
+          load: true
+          set: |
+            db.cache-from=type=gha,scope=db
+            api.cache-from=type=gha,scope=api
+            embedder.cache-from=type=gha,scope=embedder
+      - name: Cluster suites
+        env:
+          ISOMER_SKIP_BUILD: "1"
+        run: ./scripts/test-all.sh cluster
+      - name: Jepsen
+        run: ./tests/jepsen.sh
+      - name: Jepsen results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: jepsen-store
+          path: jepsen/store/
+          if-no-files-found: ignore
+          retention-days: 14
+      - name: Logs on failure
+        if: failure()
+        run: docker compose --profile cluster logs --tail 200
