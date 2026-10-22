@@ -30,6 +30,9 @@ services:
       db:
         condition: service_healthy
     command: ["documentdb_gateway", "/etc/isomerdb/gateway.json"]
+    environment:
+      # 1: a read of a projection waits for the client's gossiped $clusterTime (implicit causal reads).
+      ISOMER_IMPLICIT_CAUSAL: ${ISOMER_IMPLICIT_CAUSAL:-0}
     volumes:
       - pgsocket:/var/run/postgresql
     ports:
@@ -49,6 +52,8 @@ services:
       ISOMER_DATABASE_URL: host=/var/run/postgresql user=postgres dbname=postgres
       MOCKAI_KEY: test-key
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      # Provider batches are checked every 30 seconds by default; tests want answers sooner.
+      ISOMER_BATCH_POLL_SECONDS: ${ISOMER_BATCH_POLL_SECONDS:-2}
     volumes:
       - pgsocket:/var/run/postgresql
 
@@ -64,6 +69,11 @@ services:
         condition: service_healthy
     environment:
       ISOMER_DATABASE_URL: host=/var/run/postgresql user=postgres dbname=postgres
+      ISOMER_CLUSTER_NAME: local
+      ISOMER_ALERT_INTERVAL_SECS: "5"
+      # Secrets alert channels name (isomer.add_alert_channel(..., secret_env => ...)); test values.
+      HOOK_TOKEN: ${HOOK_TOKEN:-test-hook-token}
+      PD_ROUTING_KEY: ${PD_ROUTING_KEY:-test-routing-key}
     volumes:
       - pgsocket:/var/run/postgresql
     ports:
@@ -78,6 +88,44 @@ services:
       RATE_LIMIT_EVERY: "3"
     volumes:
       - ./tests/mockai/server.py:/srv/server.py:ro
+
+  # Records webhook, Slack and PagerDuty deliveries for the alert tests.
+  mockhooks:
+    image: python:3.12-alpine
+    profiles: ["test"]
+    command: ["python", "/srv/server.py"]
+    ports:
+      - "8090:8090"
+    volumes:
+      - ./tests/mockhooks/server.py:/srv/server.py:ro
+
+  # An edge replica: projections served from memory, fed by the API's change feed, kept on disk
+  # across restarts, over HTTP (8081) and MongoDB (27018, the API key as the password with
+  # authMechanism=PLAIN; set ISOMER_EDGE_TLS_CERT/KEY for TLS). Projections it serves need history
+  # on (isomer.set_history), and ISOMER_EDGE_KEY an API key that may read them:
+  #   ISOMER_EDGE_KEY=... ISOMER_EDGE_PROJECTIONS=customer_card docker compose --profile edge up -d edge
+  edge:
+    build:
+      context: .
+      dockerfile: services/edge/Dockerfile
+    image: isomer-edge:dev
+    profiles: ["edge"]
+    depends_on: [api]
+    environment:
+      ISOMER_ORIGIN: http://api:8080
+      ISOMER_ORIGIN_KEY: ${ISOMER_EDGE_KEY:-}
+      ISOMER_EDGE_PROJECTIONS: ${ISOMER_EDGE_PROJECTIONS:-}
+      ISOMER_EDGE_DATA_DIR: /var/lib/isomer-edge
+      ISOMER_EDGE_MONGO_LISTEN: 0.0.0.0:27017
+      ISOMER_EDGE_TLS_CERT: ${ISOMER_EDGE_TLS_CERT:-}
+      ISOMER_EDGE_TLS_KEY: ${ISOMER_EDGE_TLS_KEY:-}
+      # Local development only: without TLS, API keys cross the network in the clear.
+      ISOMER_EDGE_MONGO_PLAINTEXT: ${ISOMER_EDGE_MONGO_PLAINTEXT:-1}
+    volumes:
+      - edgedata:/var/lib/isomer-edge
+    ports:
+      - "8081:8081"
+      - "27018:27017"
 
   # Citus worker nodes, for multi-node clusters:
   #   docker compose --profile cluster up -d   then   SELECT isomer.add_node('worker1');
@@ -132,3 +180,4 @@ volumes:
   pgsocket:
   worker1data:
   worker2data:
+  edgedata:

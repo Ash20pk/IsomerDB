@@ -71,7 +71,8 @@ SELECT isomer.create_projection(
               'tier', (SELECT t.label FROM mn.tiers t WHERE t.tier = c.tier),
               'open', (SELECT count(*) FROM mn.orders o WHERE o.customer_id = c.customer_id AND o.status = 'open')) AS doc
               FROM mn.customers c $q$,
-  sources => '{"mn.customers": "customer_id", "mn.orders": "customer_id", "mn.tiers": null}');
+  sources => '{"mn.customers": "customer_id", "mn.orders": "customer_id", "mn.tiers": null}',
+  strategy => 'recompute');   -- maintained by key here; the cost model would pick incremental
 SQL
 expect "documents built from every node" "300" "$(mongo_eval 'print(db.getSiblingDB("mn").mn_customer.countDocuments())')"
 out=$($ISO -c "SELECT isomer.alter_projection('mn_customer', freshness => 'sync')" 2>&1 || true)
@@ -94,12 +95,29 @@ SQL
   expect "a write to a key on $(node_of "$k") is read back after wait_for" "renamed on $(node_of "$k")" \
     "$(mongo_eval "print(db.getSiblingDB(\"mn\").mn_customer.findOne({_id: $k}).name)")"
 done
+# The write token reaches the session even when the write's trigger ran on a worker (it used to
+# be set only in the worker's backend, so read_after did not wait). Found by Jepsen's ryw workload.
+expect "a write to a worker's shard gives the session a write token" "t" \
+  "$($ISO -c "UPDATE mn.customers SET name = name WHERE customer_id = $k_worker" -c "SELECT isomer.last_write_token() IS NOT NULL")"
+expect "and read_after with it waits for the write" "token on worker1" \
+  "$($ISO -c "UPDATE mn.customers SET name = 'token on worker1' WHERE customer_id = $k_worker" \
+          -c "SELECT set_config('isomer.read_after', isomer.last_write_token()::text, false)" \
+          -c "SELECT isomer.get('mn_customer', '$k_worker') ->> 'name'" | tail -1)"
 # Customers with even ids are gold; pick one whose shard is on the worker.
 k_gold=""; for k in $(seq 2 2 80); do [ "$(node_of "$k")" = "worker1" ] && { k_gold=$k; break; }; done
 $ISO -c "UPDATE mn.tiers SET label = 'GOLD' WHERE tier = 'gold'" -c "SELECT isomer.wait_for(isomer.last_write_token(), 'mn_customer', '15 seconds') IS NOT NULL" >/dev/null
 expect "a reference-table change re-derives documents on every node" "GOLD" \
   "$(mongo_eval "print(db.getSiblingDB(\"mn\").mn_customer.findOne({_id: $k_gold}).tier)")"
 expect "and the whole projection equals recomputation" "0" "$($ISO -c "SELECT count(*) FROM isomer.verify('mn_customer')")"
+
+# A fresh session whose first statement is a multi-shard INSERT ... SELECT: the capture triggers on
+# the coordinator's own shards run while COPYs to the workers are open. Nothing may start a
+# subtransaction there (Citus would send SAVEPOINT down those busy connections).
+$ISO -c "INSERT INTO mn.customers (customer_id, name, tier) SELECT g, 'bulk ' || g, 'silver' FROM generate_series(5001, 5200) g"
+pass "a bulk insert from a fresh session into a table behind a projection succeeds"
+$ISO -c "SELECT isomer.wait_for(isomer.current_token(), 'mn_customer', '20 seconds')" >/dev/null
+expect "and every new row reaches the projection" "200" \
+  "$(mongo_eval 'print(db.getSiblingDB("mn").mn_customer.countDocuments({name: /^bulk /}))')"
 
 echo "== FR-P5 add a node online"
 if [ "$($ISO -c "SELECT count(*) FROM pg_dist_node WHERE nodename = 'worker2'")" = "0" ]; then

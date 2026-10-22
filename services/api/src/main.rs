@@ -7,6 +7,10 @@
 //!   GET /v1/projections/{name}/snapshot               all documents plus the feed cursor they are as of
 //!   GET /v1/projections/{name}/changes?after=&limit=  the change feed, in commit order, gap-free
 //!   GET /v1/projections/{name}/live?after=            the same feed as server-sent events
+//!   GET /v1/projections/{name}/cursor                 the newest feed cursor (after X-Isomer-After: the
+//!                                                     cursor that reflects that write, for edge replicas)
+//!   /v1/admin/...                                     operator endpoints for the console and CLI (admin.rs)
+//!   GET /console/                                     the console (static files)
 //!
 //! Every request carries `Authorization: Bearer <key>` (from `isomer.create_api_key`). A key acts
 //! as a Postgres role and reads a projection only where `isomer.can_read` allows it: the role can
@@ -22,6 +26,11 @@
 //!   ISOMER_API_LISTEN    address to listen on (default 0.0.0.0:8080)
 //!   ISOMER_API_POOL      database connections (default 16)
 //!   ISOMER_API_WAIT_MS   longest wait for X-Isomer-After (default 5000)
+//!   ISOMER_CONSOLE_DIR   the built console (default /usr/share/isomer/console)
+//!   ISOMER_ALERT_INTERVAL_SECS, ISOMER_CLUSTER_NAME   alert delivery (alerts.rs)
+
+mod admin;
+mod alerts;
 
 use std::convert::Infallible;
 use std::sync::Arc;
@@ -31,7 +40,7 @@ use anyhow::{Context, Result};
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
-use axum::response::{IntoResponse, Response};
+use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::get;
 use axum::{Json, Router};
 use deadpool_postgres::{Manager, ManagerConfig, Pool, RecyclingMethod};
@@ -40,6 +49,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::sync::broadcast;
 use tokio_postgres::{AsyncMessage, NoTls};
+use tower_http::services::{ServeDir, ServeFile};
 use tracing::{error, info, warn};
 
 struct App {
@@ -47,6 +57,8 @@ struct App {
     /// Projection names from NOTIFY isomer_changes.
     changes: broadcast::Sender<String>,
     wait_ms: u64,
+    /// Data requests per role since the last flush to isomer.usage (metering, FR-CL2).
+    requests: std::sync::Mutex<std::collections::HashMap<String, i64>>,
 }
 
 type Shared = Arc<App>;
@@ -66,7 +78,14 @@ async fn main() -> Result<()> {
     let (changes, _) = broadcast::channel(1024);
     tokio::spawn(listen_for_changes(url.clone(), changes.clone()));
 
-    let app = Arc::new(App { pool, changes, wait_ms: env_or("ISOMER_API_WAIT_MS", 5000) });
+    let app = Arc::new(App {
+        pool,
+        changes,
+        wait_ms: env_or("ISOMER_API_WAIT_MS", 5000),
+        requests: Default::default(),
+    });
+    tokio::spawn(flush_usage(app.clone()));
+    tokio::spawn(alerts::deliver_loop(app.clone()));
     let router = Router::new()
         .route("/healthz", get(healthz))
         .route("/v1/projections", get(list_projections))
@@ -75,7 +94,16 @@ async fn main() -> Result<()> {
         .route("/v1/projections/:name/snapshot", get(get_snapshot))
         .route("/v1/projections/:name/changes", get(get_changes))
         .route("/v1/projections/:name/live", get(live))
+        .route("/v1/projections/:name/cursor", get(get_cursor))
+        .merge(admin::routes())
         .with_state(app);
+    let console = std::env::var("ISOMER_CONSOLE_DIR").unwrap_or_else(|_| "/usr/share/isomer/console".into());
+    let router = router
+        .route("/", get(|| async { Redirect::temporary("/console/") }))
+        .nest_service(
+            "/console",
+            ServeDir::new(&console).fallback(ServeFile::new(format!("{console}/index.html"))),
+        );
     let socket = tokio::net::TcpListener::bind(&listen).await?;
     info!(%listen, "isomer api listening");
     axum::serve(socket, router)
@@ -86,6 +114,40 @@ async fn main() -> Result<()> {
 
 fn env_or<T: std::str::FromStr>(name: &str, default: T) -> T {
     std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+}
+
+/// Count a data request (projection reads, not the admin API) for metering.
+fn count_request(app: &App, role: &str) {
+    if let Ok(mut m) = app.requests.lock() {
+        *m.entry(role.to_string()).or_insert(0) += 1;
+    }
+}
+
+/// Every 15 seconds, add the counted requests to isomer.usage. Counts that fail to write are kept
+/// for the next attempt.
+async fn flush_usage(app: Shared) {
+    loop {
+        tokio::time::sleep(Duration::from_secs(15)).await;
+        let batch: Vec<(String, i64)> = match app.requests.lock() {
+            Ok(mut m) => m.drain().collect(),
+            Err(_) => continue,
+        };
+        for (role, n) in batch {
+            let ok = match app.pool.get().await {
+                Ok(db) => db
+                    .execute("SELECT isomer.record_usage('api_requests', $1, $2::bigint)", &[&role, &n])
+                    .await
+                    .is_ok(),
+                Err(_) => false,
+            };
+            if !ok {
+                warn!(%role, n, "could not record API usage yet; keeping it");
+                if let Ok(mut m) = app.requests.lock() {
+                    *m.entry(role).or_insert(0) += n;
+                }
+            }
+        }
+    }
 }
 
 /// One connection LISTENs for isomer_changes and fans the projection names out to live streams.
@@ -202,7 +264,11 @@ async fn authorize(app: &App, headers: &HeaderMap, projection: &str) -> ApiResul
         .query_one("SELECT isomer.can_read($1::text::name, $2)", &[&role, &projection])
         .await?
         .get(0);
-    if ok { Ok(role) } else { Err(ApiError::not_found(projection)) }
+    if !ok {
+        return Err(ApiError::not_found(projection));
+    }
+    count_request(app, &role);
+    Ok(role)
 }
 
 /// Honour X-Isomer-After: wait until the projection reflects that write.
@@ -239,12 +305,14 @@ async fn healthz(State(app): State<Shared>) -> ApiResult<&'static str> {
 
 async fn list_projections(State(app): State<Shared>, headers: HeaderMap) -> ApiResult<Json<Value>> {
     let role = role_of(&app, &headers).await?;
+    count_request(&app, &role);
     let db = app.pool.get().await?;
     let row = db
         .query_one(
-            "SELECT coalesce(jsonb_agg(jsonb_build_object('name', name, 'kind', kind, 'freshness', freshness,
-                                                          'history', history::text)), '[]')
-             FROM isomer.api_projections($1::text::name)",
+            "SELECT coalesce(jsonb_agg(jsonb_build_object('name', a.name, 'kind', a.kind, 'freshness', a.freshness,
+                                                          'history', a.history::text, 'database', p.mongo_database,
+                                                          'history_since', p.history_since) ORDER BY a.name), '[]')
+             FROM isomer.api_projections($1::text::name) a JOIN isomer.projections p ON p.name = a.name",
             &[&role],
         )
         .await?;
@@ -299,6 +367,19 @@ async fn get_snapshot(State(app): State<Shared>, headers: HeaderMap, Path(name):
     let db = app.pool.get().await?;
     let row = db.query_one("SELECT cursor, docs FROM isomer.snapshot($1)", &[&name]).await?;
     Ok(Json(json!({ "cursor": row.get::<_, i64>(0), "docs": row.get::<_, Value>(1) })))
+}
+
+/// The newest change in the projection's feed. With X-Isomer-After it is taken once the projection
+/// reflects that write, so any change up to it, the write's included, is at or before it: an edge
+/// replica that has applied the feed this far can answer a read that must see the write.
+async fn get_cursor(State(app): State<Shared>, headers: HeaderMap, Path(name): Path<String>) -> ApiResult<Json<Value>> {
+    authorize(&app, &headers, &name).await?;
+    wait_after(&app, &headers, &name).await?;
+    let db = app.pool.get().await?;
+    let row = db
+        .query_one("SELECT coalesce(max(id), 0) FROM isomer.changes WHERE projection = $1", &[&name])
+        .await?;
+    Ok(Json(json!({ "cursor": row.get::<_, i64>(0) })))
 }
 
 #[derive(Deserialize)]

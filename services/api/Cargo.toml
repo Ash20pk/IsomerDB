@@ -2,6 +2,7 @@
 name = "isomer-api"
 version = "0.1.0"
 edition = "2021"
+license = "AGPL-3.0-only"
 description = "Serves IsomerDB projections over HTTP: key lookup, time travel, change feeds and live streams"
 publish = false
 
@@ -11,10 +12,12 @@ async-stream = "0.3"
 axum = "0.7"
 deadpool-postgres = "0.14"
 futures-util = "0.3"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "sync", "signal", "net"] }
 tokio-postgres = { version = "0.7", features = ["with-serde_json-1"] }
+tower-http = { version = "0.5", features = ["fs"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 

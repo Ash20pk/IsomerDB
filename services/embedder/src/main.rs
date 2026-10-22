@@ -5,14 +5,19 @@
 //! rate-limits per model, calls the provider, and hands results back through
 //! `isomer.embed_complete`, which only writes a result whose text hash still matches. Failures go
 //! through `isomer.embed_failed` (backoff, `Retry-After`, dead letter). Query-time requests from
-//! `isomer.embed()` are answered first.
+//! `isomer.embed()` are answered first. A large backfill for a model registered with
+//! `batch_api` goes through the provider's Batch API instead (`batch.rs`).
 //!
 //! Configuration (environment):
 //!   ISOMER_DATABASE_URL   libpq-style connection string (default: local Unix socket as postgres)
 //!   ISOMER_WORKERS        concurrent batch loops (default 2)
 //!   ISOMER_LEASE_SECONDS  how long a claimed batch stays invisible to other workers (default 60)
+//!   ISOMER_BATCH_POLL_SECONDS  how often provider batches are started and checked (default 30)
+//!   ISOMER_BATCH_MAX_ITEMS     the most items one provider batch carries (default 50000)
 //!   <api_key_env>         per model, the variable named in isomer.embedding_models.api_key_env
 
+mod batch;
+mod local;
 mod providers;
 mod ratelimit;
 
@@ -84,6 +89,19 @@ async fn main() -> Result<()> {
         client.batch_execute("LISTEN isomer_embed").await?;
         // Keep the client alive for the lifetime of the process.
         std::mem::forget(client);
+    }
+
+    // One more connection drives provider batches for large backfills.
+    {
+        let (client, connection) = connect_with_retry(&url).await?;
+        tokio::spawn(async move {
+            if let Err(e) = connection.await {
+                error!("batch connection lost: {e}");
+                std::process::exit(1);
+            }
+        });
+        let shared = shared.clone();
+        tokio::spawn(async move { batch_loop(client, shared).await });
     }
 
     info!(workers, "embedder started");
@@ -159,7 +177,7 @@ async fn load_models(client: &Client) -> Result<HashMap<String, Model>> {
     let rows = client
         .query(
             "SELECT name, provider, endpoint, model, dimensions, api_key_env, max_batch_tokens,
-                    max_batch_items, requests_per_min, tokens_per_min
+                    max_batch_items, requests_per_min, tokens_per_min, batch_api, batch_min_items
              FROM isomer.embedding_models",
             &[],
         )
@@ -178,6 +196,8 @@ async fn load_models(client: &Client) -> Result<HashMap<String, Model>> {
                 max_batch_items: r.get::<_, i32>(7) as i64,
                 requests_per_min: r.get::<_, i32>(8) as f64,
                 tokens_per_min: r.get::<_, i32>(9) as f64,
+                batch_api: r.get(10),
+                batch_min_items: r.get::<_, i32>(11) as i64,
             };
             (m.name.clone(), m)
         })
@@ -252,7 +272,8 @@ async fn embed_jobs(client: &Client, shared: &Shared, model: &Model, jobs: &[Job
 
 /// Claim ready jobs for a model, steady-state work before backfill, packed so the batch stays
 /// within the model's token and item limits. Leasing pushes `not_before` forward, so if this
-/// worker dies the jobs become visible again when the lease expires.
+/// worker dies the jobs become visible again when the lease expires. For a model with a Batch
+/// API, a backfill big enough for a provider batch is left to the batch loop.
 async fn lease_jobs(client: &Client, model: &Model, lease_seconds: i64) -> Result<Vec<Job>> {
     let rows = client
         .query(
@@ -261,6 +282,9 @@ async fn lease_jobs(client: &Client, model: &Model, lease_seconds: i64) -> Resul
                  FROM isomer.embed_jobs j
                  JOIN isomer.projections p ON p.name = j.projection AND p.status = 'active'
                  WHERE j.model = $1 AND j.not_before <= now()
+                   AND NOT (j.phase = 'backfill' AND $5
+                            AND (SELECT count(*) FROM isomer.embed_jobs b
+                                 WHERE b.model = $1 AND b.phase = 'backfill' AND b.batch_id IS NULL) >= $6)
                  ORDER BY (j.phase = 'backfill'), j.enqueued_at, j.key
                  LIMIT $2
                  FOR UPDATE OF j SKIP LOCKED),
@@ -275,7 +299,8 @@ async fn lease_jobs(client: &Client, model: &Model, lease_seconds: i64) -> Resul
              FROM chosen c
              WHERE j.projection = c.projection AND j.key = c.key AND j.model = c.model
              RETURNING c.projection, c.key, c.model, c.source_hash, c.input, c.tokens_est, c.phase",
-            &[&model.name, &model.max_batch_items, &model.max_batch_tokens, &(lease_seconds as f64)],
+            &[&model.name, &model.max_batch_items, &model.max_batch_tokens, &(lease_seconds as f64),
+              &model.batch_api, &model.batch_min_items],
         )
         .await
         .context("leasing jobs")?;
@@ -381,4 +406,104 @@ async fn answer_queries(client: &Client, shared: &Shared, models: &HashMap<Strin
         }
     }
     Ok(true)
+}
+
+// ── Provider batches (FR-V1a) ────────────────────────────────────────────────
+
+async fn batch_loop(client: Client, shared: Arc<Shared>) {
+    let every = Duration::from_secs(env_or("ISOMER_BATCH_POLL_SECONDS", 30));
+    loop {
+        if let Err(e) = batch_pass(&client, &shared).await {
+            error!("batches: {e:#}");
+        }
+        tokio::time::sleep(every).await;
+    }
+}
+
+/// Check every open batch, then start new ones where a model has enough backfill waiting.
+async fn batch_pass(client: &Client, shared: &Shared) -> Result<()> {
+    let models = load_models(client).await?;
+    for row in client
+        .query("SELECT id, model, status, provider_batch_id FROM isomer.embed_batches_open()", &[])
+        .await?
+    {
+        let (id, model_name, status, provider_id): (i64, String, String, Option<String>) =
+            (row.get(0), row.get(1), row.get(2), row.get(3));
+        let Some(model) = models.get(&model_name) else { continue };
+        let Some(provider_id) = provider_id.filter(|_| status == "submitted") else {
+            // Leased but never submitted: this process stopped in between. Give the jobs back.
+            client
+                .execute("SELECT isomer.embed_batch_finished($1, 'failed', NULL, 'not submitted: the embedder stopped first')", &[&id])
+                .await?;
+            continue;
+        };
+        if let Err(e) = check_batch(client, shared, model, id, &provider_id).await {
+            warn!(model = %model.name, batch = id, "checking batch: {e:#}");
+        }
+    }
+    let max_items: i32 = env_or("ISOMER_BATCH_MAX_ITEMS", 50_000);
+    for model in models.values().filter(|m| m.batch_api) {
+        let rows = client
+            .query("SELECT batch_id, item, input FROM isomer.embed_batch_lease($1, $2)", &[&model.name, &max_items])
+            .await?;
+        if rows.is_empty() {
+            continue;
+        }
+        let id: i64 = rows[0].get(0);
+        let items: Vec<(i32, String)> = rows.iter().map(|r| (r.get(1), r.get(2))).collect();
+        match batch::submit(&shared.http, model, &items).await {
+            Ok(s) => {
+                client
+                    .execute("SELECT isomer.embed_batch_submitted($1, $2, $3)", &[&id, &s.batch_id, &s.input_file_id])
+                    .await?;
+                info!(model = %model.name, batch = id, provider_batch = %s.batch_id, items = items.len(), "submitted backfill batch");
+            }
+            Err(e) => {
+                let message = e.to_string();
+                client
+                    .execute("SELECT isomer.embed_batch_finished($1, 'failed', NULL, $2)", &[&id, &message])
+                    .await?;
+                warn!(model = %model.name, batch = id, "submitting batch failed, items go back to ordinary requests: {message}");
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn check_batch(client: &Client, shared: &Shared, model: &Model, id: i64, provider_id: &str) -> Result<()> {
+    let st = batch::status(&shared.http, model, provider_id).await.map_err(|e| anyhow::anyhow!("{e}"))?;
+    if !matches!(st.status.as_str(), "completed" | "failed" | "expired" | "cancelled") {
+        client.execute("UPDATE isomer.embed_batches SET last_checked_at = clock_timestamp() WHERE id = $1", &[&id]).await?;
+        return Ok(());
+    }
+    // Results (all of them when completed; what finished before an expiry or cancellation).
+    let mut tokens: i64 = 0;
+    let (mut written, mut failed) = (0usize, 0usize);
+    for file_id in [st.output_file_id.as_deref(), st.error_file_id.as_deref()].into_iter().flatten() {
+        let text = batch::file(&shared.http, model, file_id).await.map_err(|e| anyhow::anyhow!("{e}"))?;
+        for r in batch::parse(&text) {
+            tokens += r.tokens;
+            match r.embedding.filter(|v| v.len() == model.dimensions) {
+                Some(v) => {
+                    let applied: bool = client
+                        .query_one("SELECT isomer.embed_batch_result($1, $2, $3)", &[&id, &r.item, &providers::to_pgvector(&v)])
+                        .await?
+                        .get(0);
+                    written += applied as usize;
+                }
+                None => {
+                    let message = r.error.unwrap_or_else(|| format!("wrong number of dimensions (registered {})", model.dimensions));
+                    client.execute("SELECT isomer.embed_batch_item_failed($1, $2, $3)", &[&id, &r.item, &message]).await?;
+                    failed += 1;
+                }
+            }
+        }
+    }
+    let left: i32 = client
+        .query_one("SELECT isomer.embed_batch_finished($1, $2, $3, $4)", &[&id, &st.status, &tokens, &st.error])
+        .await?
+        .get(0);
+    info!(model = %model.name, batch = id, status = %st.status, written, failed, back_to_ordinary = left, tokens, "batch finished");
+    shared.wake.notify_waiters();
+    Ok(())
 }

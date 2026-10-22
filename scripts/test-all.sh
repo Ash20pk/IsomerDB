@@ -23,12 +23,14 @@ healthy() {
 }
 
 docker compose --profile attach --profile test --profile cluster down -v --remove-orphans
+(cd clients && npm ci --silent && npm run build --silent >/dev/null && npm test --silent) || { echo "### clients: FAILED"; exit 1; }
 docker compose --profile attach --profile test build
 docker compose --profile attach --profile test up -d
 healthy
 sleep 5
 for t in scripts/smoke.sh tests/phase0.sh tests/phase1.sh tests/phase2.sh tests/phase3.sh tests/native.sh \
-         tests/routing.sh tests/history.sh; do
+         tests/routing.sh tests/history.sh tests/freshness.sh tests/console.sh tests/local_model.sh tests/metering.sh tests/alerts.sh tests/cutover_plan.sh \
+         tests/incremental.sh tests/subqueries.sh tests/embed_batch.sh tests/edge.sh tests/managed_source.sh tests/events_analytics.sh; do
   run "$t"
 done
 
@@ -40,6 +42,10 @@ if [ "${1:-all}" = "all" ]; then
   run tests/multinode.sh
   run tests/routing.sh
   run tests/history.sh
+  run tests/freshness.sh
+  run tests/incremental.sh
+  run tests/subqueries.sh
+  run tests/events_analytics.sh
 fi
 
 if [ ${#failed[@]} -eq 0 ]; then echo "### all checks passed"; else echo "### failed: ${failed[*]}"; exit 1; fi

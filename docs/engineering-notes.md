@@ -2,6 +2,1113 @@
 
 Things we learned building the stack that are not obvious from the upstream docs. Newest first.
 
+## Upstream code in `extensions/`
+
+Not dated: reference for anyone changing or updating `extensions/sharding`, `documents` or `ivm`.
+Public attribution is in the root `NOTICE` file.
+
+| Directory | Project | Version | Commit | Import | License |
+|---|---|---|---|---|---|
+| `extensions/sharding/` | [Citus](https://github.com/citusdata/citus) | v14.2.0 | `58702e722c6efbae45e3cade885b476e4fddc7e1` | `6366877` | AGPL-3.0 |
+| `extensions/documents/` | [DocumentDB](https://github.com/documentdb/documentdb) | v0.117-0 | `28cc012070ce798361ed265251ec159180b7889f` | `85f8a2e` | MIT |
+| `extensions/ivm/` | [pg_trickle](https://github.com/trickle-labs/pg-trickle) | v0.108.3 | `ce709f06327b4801f79fc48934bc96107b450907` | `51c92ee` | Apache-2.0 |
+
+DocumentDB v0.117-0 builds against Citus commit `fe25f68`, which v14.2.0 includes (41 commits
+ahead, 0 behind).
+
+### Our changes
+
+| Project | Change | Why |
+|---|---|---|
+| pg_trickle | CDC triggers are created `ENABLE ALWAYS` (`cdc/mod.rs`, `cdc/rebuild.rs`, `api/helpers.rs`) | Logical-replication apply workers only fire `ALWAYS`/`REPLICA` triggers, so stream tables over attached tables never updated |
+| pg_trickle | The DDL tracker treats `ENABLE [ALWAYS\|REPLICA] TRIGGER` as harmless (`hooks.rs`) | Otherwise enabling a trigger suspends every stream table on that source |
+| pg_trickle | The "logical replication target" warning only fires in statement-level CDC mode (`api/helpers.rs`) | With row-level CDC and `ALWAYS` triggers, replicated changes are captured |
+| DocumentDB gateway | New `isomer` module (`documentdb_gateway_core/src/isomer.rs`), called from `processor/process.rs` before each request | Reads with `readConcern.afterClusterTime` on an IsomerDB projection wait for it (`isomer.wait_for`); writes to projection collections are refused with code 166, as for a MongoDB view |
+| DocumentDB gateway | `isomer::after_request`, called from `processor/process.rs` after each successful request | Writes return `operationTime` and `$clusterTime`; projection reads return their freshness as `operationTime` (FR-R4a, FR-R5) |
+| DocumentDB gateway | `isomer::stamp_handshake`, called from `processor/ismaster.rs` | With `ISOMER_IMPLICIT_CAUSAL=1`, hello returns a zero `$clusterTime` so drivers gossip session cluster time on every connection |
+
+All are marked `IsomerDB:` in the source. The pg_trickle changes are worth proposing upstream as an
+opt-in setting.
+
+### Rules
+
+1. **Each import is its own unmodified commit.** The directories have since moved (from
+   `vendor/<project>/`), so to see everything we have changed, diff across the move:
+   `git diff 51c92ee:vendor/pg_trickle HEAD:extensions/ivm` (import commits are in the table above).
+2. **Keep every upstream LICENSE and NOTICE file.** Never remove or edit them.
+3. **Mark our changes** with a short `IsomerDB:` comment at each change site.
+4. **AGPL boundary.** Changes inside `extensions/sharding` are AGPL-3.0 and must be published if we
+   offer them as a service. Keep IsomerDB's own code in `isomer/` and `isomer_router/`, talking to
+   the sharding layer through hooks and SQL rather than by editing it, unless there is no other
+   way. See PRD §13.
+5. **Updating to a new upstream version:** copy the new tag into a scratch checkout, commit it
+   unmodified as its own import commit on a branch, then re-apply our changes. Update the tables
+   above in the same change.
+
+## 2026-10-22 — Anchored min and max, and anchored subqueries inside anchored ones (FR-P6)
+
+`tests/subqueries.sh` passes on the cluster (isomer 0.27.0, upgraded in place from 0.26.0), with a
+document of each order's largest and smallest line and each line's marks inside the order's
+lines, under 400 concurrent transactions that also move orders between customers.
+
+- **min and max.** Their multisets are anchored like the partial rows: each value row carries
+  `__anchor`, keyed `(__anchor, __h, value)`, sharded co-located, and an orphan's multiset waits
+  in a coordinator table of its own (`_b<n>pom<i>`). A fold takes each partial row's min or max
+  again from the multiset under the same anchor. A move reads one copy of each moved partial
+  row's values (`DISTINCT ON (__h, value)`: they are the same under every anchor) and writes them
+  under the anchors of the partial row's correlation value.
+- **A subquery anchored below an anchored one** (marks correlated with `l.order_id, l.line`, the
+  lines anchored by order) takes its anchors from the parent's anchored partial rows, not from a
+  table: a mark is kept under every customer with a partial row of its line. Its map is built
+  from the parent's partial rows, and kept after each fold. The parent's partial rows the fold
+  reached or moved are noted (`isomer_anchor_touched`, a temp table), and each nested block, top
+  down, recomputes its map for those values from the parent's partial rows and moves the values
+  whose anchors changed. That runs after the facts are folded, not before like the first level,
+  because the anchors are the parent's state as this fold leaves it. A block folded before its
+  parent in the same fold is anchored by the old map and then moved, so the order of the folds
+  doesn't matter.
+- **Which correlation.** With several equalities, the nested block prefers the column its parent
+  is anchored by (`k.order_id = l.order_id` over `k.line = l.line`). Through the line number,
+  every mark would be kept under nearly every customer: right, and very wide.
+- **Key queries.** A key query driven by the anchored parent's changed rows reads them from a
+  reference table, which has no `__anchor`, so the anchor of the blocks below is left out there.
+  That's safe only because finding keys drops the parent's output, where those blocks are. One in
+  the parent's WHERE would stay, as a correlated subquery over sharded rows from a reference
+  table, which Citus refuses. So a subquery in the WHERE of an anchored one is refused, with the
+  reason.
+
+## 2026-10-21 — Anchored subqueries: an order's lines, distributed (FR-P6)
+
+`tests/subqueries.sh` passes on the cluster (isomer 0.26.0), and Jepsen's `subqueries` workload
+now has each order's lines in the document.
+
+0.24.0 refused to distribute a customer's document with each order's lines in it: the lines are
+correlated with `o.id`, the orders are sharded by `customer_id`, and Citus runs a correlated
+subquery shard by shard only when both sides are sharded by the columns it is correlated
+through. A line has no customer. So its state is given one: the lines block's partial aggregates
+carry `__anchor`, the customer of the line's order, are sharded by it, co-located with the orders
+and customers, and the subquery is generated with `l.__anchor = o.customer_id` added (the
+`anchor` of a block's config; `add_anchor` in the engine). The cluster then runs it on the shard
+holding the order.
+
+Where an anchor comes from, and when it changes:
+
+- **A map on the coordinator**, `(order id, customer)` with a count, kept from the orders' own
+  deltas and built from the orders table. It counts every order row, whatever the orders
+  subquery filters: a line anchored under an order the subquery leaves out is never read, and
+  keeping the map independent of the parent's filters keeps it simple.
+- **Partial rows are folded under every anchor of their order id.** A sharded table can't make
+  `id` unique on its own (its unique keys hold the shard column), so two orders can share an id
+  under two customers; the query correlates the line with both, and it is kept under both.
+- **Orphans.** A line whose order doesn't exist yet has no anchor and can't be in a sharded table
+  (a shard column can't be NULL); its partial rows wait in a coordinator table until the order
+  appears.
+- **Moves.** Before each fold, the parent's changed rows update the map, and the partial rows of
+  every order id whose anchors changed are read, deleted and written again under its anchors now
+  (or to the orphans). Only then are the batch's own rows folded, under the anchors as they now
+  are. An order moving to another customer is a delete and an insert, and its lines follow it.
+- **Keys.** The lines' changed rows are kept on every node, not sharded: they carry no anchor,
+  and a correlated subquery from the sharded orders into a reference table runs fine.
+
+Left out of this first version, refused with the reason: min and max in an anchored subquery
+(their multisets would need anchoring and orphans too), and an anchored subquery inside another.
+
+## 2026-10-21 — Projections of queries that read the clock are refused
+
+isomer 0.25.0. `create_projection('recent', 'SELECT ... WHERE o.created_at > now() - interval
+''1 day'' ...')` was accepted, and wrong from the first day: a projection holds what its query
+returned when its rows were last written, and nothing writes a row again because a day passed.
+Incremental state folded the condition once, at write time; key recompute re-derived only keys
+that a write reached. The auditor, running the query later, saw the difference on every pass
+and repaired it forever.
+
+No strategy can keep such a query, so creation refuses it and names the functions
+(`isomer._engine_clock`, a walk over the parse tree at every depth): the clock (`now()`,
+`transaction_timestamp()`, `statement_timestamp()`, `current_date` and the other SQL time
+keywords, one-argument `age()`) and every volatile function (`random()`, `clock_timestamp()`,
+`nextval()`). Stable functions that depend only on settings, `to_char` or `jsonb_build_object`,
+are left alone; refusing every non-immutable function would refuse every document. Event
+projections are exempt: their rules run once per change, so `now()` there is the event's time.
+The hint says what works instead: apply the time when reading, or store it in a column when the
+row is written.
+
+In the same release `alter_projection(strategy => ...)` changes an analytics projection's
+strategy: it is dropped and created again from its stored definition (query, refresh, schema)
+in one transaction, so readers see the old columnar table until the new one commits. 0.24.0 had
+refused it, after finding it broken since 0.21.0.
+
+## 2026-10-21 — The state of a query with subqueries, distributed (FR-P6)
+
+`tests/subqueries.sh` passes on the cluster (isomer 0.24.0), its distributed section with a shard
+rebalance running underneath.
+
+What Citus will run decides the design. We tried each shape the derivation and the key queries
+produce, on the cluster:
+
+| Shape | Citus |
+|---|---|
+| sharded outer, correlated subquery over a co-located sharded table | runs, shard by shard |
+| the same, two levels deep, correlated on the same value | runs |
+| sharded outer, subquery over a reference table (a lookup) | runs |
+| sharded outer, uncorrelated subquery over a sharded table | runs (an intermediate result) |
+| reference table outer, correlated subquery over a sharded table | "correlated subqueries are not supported when the FROM clause contains a reference table" |
+| a coordinator-local table on either side of a correlated subquery with a sharded table | "direct joins between distributed and local tables are not supported" |
+
+So the query's relation is sharded by the column its subqueries are correlated with (`c.id`), and
+each subquery correlated with that column by equality keeps its state sharded by its own side
+(`o.customer_id`), co-located. Placement goes down the blocks, parents first
+(`_engine_placement`): a subquery takes its parent's shard value through an equality it has in
+its WHERE (or an `IN (...)`'s comparison); one that doesn't aggregate and is correlated some other
+way reads reference tables; one correlated with nothing outside it keeps its partial aggregates
+sharded by group. Each table gets one placement, and two subqueries wanting it sharded by
+different columns, or one sharded and one by another column, block distribution with that reason.
+So does a subquery that aggregates and is correlated through another column: the lines of an order
+inside a customer's document are correlated with `o.id`, the orders are sharded by
+`customer_id`, and nothing makes them co-located. The C side reports each block's equalities with
+its parent (`correlation`), and whether it reads a row two levels up (`deep_outer`).
+
+Things that had to follow:
+
+- **Staging tables go where their table's state goes.** The key queries run the subqueries over
+  the changed rows; with the staging tables on the coordinator they were the local table in the
+  second failing row above. They are sharded the same way (or reference tables), filled from the
+  deltas as a parameter.
+- **Unique keys hold the shard column.** Citus allows no other, so partial aggregates are keyed by
+  `(customer_id, __h)` (the hash is still unique on its own), the min/max multisets gain the shard
+  column and the fold's `UPDATE ... (SELECT min(value) ...)` matches on it to stay on one shard,
+  and a copy's primary key gains it. A row moving to another customer is a delete and an insert in
+  the deltas already, so a key with the shard column in it still nets correctly.
+- **Copies are written from a parameter**, as reference tables were in 0.21.0, and the rows checked
+  for having left are the ones in that parameter, not the whole table.
+- **`derive_keyed` for blocks**: the key filter on the query itself, so a shard filters by the key
+  before it runs the subqueries for its rows.
+
+Found along the way, from a full run: `drop_projection` of an event projection was cancelled as
+a distributed deadlock, once in three runs of `test-all.sh`. A fold deletes the projection's
+deltas, then inserts rows that reference the projection (`isomer.changes` for events,
+`isomer.pending` for the engine), which takes a share lock on its row; dropping the projection
+deletes that row and cascades to the same deltas. The drop now takes both folds' advisory locks
+first. That the failure is gone can't be shown by one green run; the cycle is in the code.
+
+Also from 0.21.0: `alter_projection(strategy => ...)` or `(state => ...)` on an
+analytics projection recompiled its plan without the analytics keys and rebuilt it as documents,
+failing half way. It now refuses both: an analytics projection's strategy is chosen when it is
+created and its state stays on the coordinator.
+
+## 2026-10-21 — Subqueries in analytics projections, and in the WHERE of a query that aggregates (FR-P6)
+
+`tests/subqueries.sh` passes on the three-node cluster (isomer 0.23.0).
+
+0.22.0 refused a subquery outside the aggregates of a block that aggregates, which left analytics
+projections with little to use: they almost always group, and their subqueries are conditions
+(`WHERE EXISTS (...) GROUP BY region`). Such a condition doesn't need the fact's rows while
+folding. It is not one of the fact's own filters (`only_fact` already said so), so the columns it
+reads stay in the fact's partial aggregates, the correlation among them, and the condition is
+applied to those partial rows when deriving. Every fact row folded into a partial row has the same
+values in those columns, so the condition passes or fails the partial row as a whole, and summing
+the partials that pass gives the same counts and sums as the query. The cost is state: one partial
+row per distinct correlation, a customer for `EXISTS (... o.customer_id = c.id)`.
+
+Nothing else changed for keys: a changed row of the subquery's table becomes `EXISTS (a correlated
+changed row)` in the block above, as it does for a block that doesn't aggregate.
+
+Analytics with subqueries go through the same compile. Two things read the query as written and
+had to read `truth_query` instead: the base table built from the tables, and
+`analytics_differences`. Over sharded tables that are not co-located, Citus can't plan the
+correlated subquery once it is wrapped in `CREATE TABLE AS` or compared with `EXCEPT ALL` (see
+below). `auto` looks at every block's aggregates, not only the query's, to decide whether
+incremental state would keep a copy of every row.
+
+## 2026-10-18 — Correlated subqueries maintained incrementally (FR-P6)
+
+`tests/subqueries.sh` passes on one node and on the three-node cluster (isomer 0.22.0), and
+`tests/incremental.sh` and `tests/events_analytics.sh` still pass on both.
+
+A query with subqueries is compiled as **blocks**: the query itself and each subquery in it, in
+the order `isomer._engine_blocks` walks the parse tree (`_engine_sql_blocks` walks it the same way,
+so a block number means the same thing in both). Each block keeps its own state, the way a whole
+projection did:
+
+- **A block that aggregates** keeps its fact's partial aggregates, grouped by the columns its
+  conditions on the outer row read. `(SELECT count(*) FROM orders o WHERE o.customer_id = c.id)`
+  is one partial row per customer, however many orders each has; a filter on orders alone is
+  applied while folding. An aggregate that reads the outer row, or holds a subquery, is kept as
+  written, which is how nesting works: `jsonb_agg(... (SELECT jsonb_agg(...) FROM lines l WHERE
+  l.order_id = o.id) ...)` runs over a copy of the orders with each order's lines block beneath it.
+- **A block that doesn't aggregate** (`EXISTS`, `IN`, `ARRAY(SELECT ...)`, a lookup, `ORDER BY ...
+  LIMIT 1`) keeps copies of the columns it reads. Its derivation runs it as written over them, so
+  ORDER BY, LIMIT and DISTINCT are fine there.
+- A table read by several blocks has one staging table and, where some block joins it without
+  aggregating it, one copy holding every column any of them reads.
+
+**Deriving** a key runs the query as written with every block reading its state: a correlated
+subquery runs once per outer row, over that row's partial aggregates (indexed by the correlation
+column). **Keys**: for each relation of each block, the subqueries on the way up from that block
+become `EXISTS (a correlated changed row)` in their parents, in place of the conditions they were
+part of; `IN (...)` keeps its comparison inside (`(c.id = o.customer_id) IS NOT FALSE`), so a big
+order reaches its own customer, not all of them. Output subqueries of the query become NULL,
+typed before anything below is changed. An uncorrelated subquery reaches every key, as it should.
+
+Not maintained this way, with the reason given: a subquery in ON, GROUP BY, HAVING or LIMIT; a
+subquery outside the aggregates of a block that aggregates (in its WHERE: the filter would depend
+on another table while folding); subqueries in analytics projections; distributing the state of a
+query with subqueries (it stays on the coordinator).
+
+A materialized view declared with correlated subqueries (`tests/native.sh`) now gets incremental
+maintenance from the cost model, where it used to fall back to key recompute; its lookup-table
+notice is for key recompute only, so it is checked on a view that asks for that.
+
+Things that bit us:
+
+- **The auditor's reference over sharded tables.** Citus runs a correlated subquery between tables
+  that are not co-located on its own, but not once the query is filtered, compared (`EXCEPT ALL`)
+  or joined with anything ("complex joins are only supported when all distributed tables are
+  co-located"), not even inside a `MATERIALIZED` CTE. Reading each Citus table through a view
+  `SELECT ... FROM t OFFSET 0` makes it plan each one as an intermediate result on the
+  coordinator, after which the query runs anywhere. That is the projection's `truth_query`.
+- **An EXPLAIN poisons the transaction for documentdb.** `_key_cost` (the cost model) runs
+  `EXPLAIN` over plain tables. After any EXPLAIN, even `EXPLAIN SELECT 1`, Citus sends that
+  transaction's later queries on reference tables to this node over a connection, which can't see
+  what the transaction wrote: `create_projection(..., strategy => 'auto')` over plain tables
+  failed writing to its new collection ("Collection not found ... metadata sync issue", or
+  "cannot execute a distributed query from a query on a shard"). The existing tests only used
+  sharded tables there. The EXPLAIN now runs in a subtransaction that is rolled back (its plan is
+  kept in a variable).
+- **drop_projection left Citus metadata behind.** It runs with DDL propagation off, and a
+  documentdb collection dropped that way keeps its Citus table's shard and `pg_dist_partition`
+  entry, the table itself gone. The next `citus_add_node` failed ("cache lookup failed for
+  relation"), so a node that had ever dropped a document projection could not grow into a
+  cluster. `test-all.sh` recreates volumes between the single-node and cluster stages, so it never
+  saw it. The collection is now dropped with propagation on, and the 0.22.0 upgrade removes what
+  earlier drops left behind, the way Citus's drop trigger would have.
+- **Every fold scanned all its state.** Emptied groups, multiset values and joined rows were
+  deleted with `DELETE ... WHERE __n = 0` over the whole table. A correlated subquery's state has a
+  partial row per outer row, so with 200,000 customers a one-row write folded in 170-860 ms. Only
+  the groups a fold reached can empty, so the deletes are now limited to those: the same write
+  folds in about 4 ms, for a customer with 8 orders or 500,000.
+- **The auditor and trigger DDL deadlocked.** Creating or dropping a projection's capture
+  triggers locks every shard of its tables, and the auditor's reference queries lock shards too,
+  across nodes and in another order (a repartition join reads them in stages). On a cluster
+  Citus's distributed deadlock detector cancelled the DDL: `drop_projection` and
+  `alter_projection` failed now and then in `incremental.sh`, more often the slower the auditor
+  ran (a kind cluster alongside made it 10-60 s). Trigger DDL now takes an advisory lock before it
+  locks anything, waiting for a running audit, and an audit that finds the lock taken skips its
+  round (`audit` and `_create/_drop_source_triggers` are wrappers over the earlier functions).
+- `tests/multinode.sh` declares a projection with correlated subqueries and a lookup table, which
+  the cost model now maintains incrementally; that suite tests key recompute across nodes, so it
+  asks for it.
+
+## 2026-10-14 — Incremental state distributed across the cluster (FR-P6)
+
+`tests/incremental.sh` passes on the three-node cluster with a projection whose state is
+distributed, through concurrent writers, a switch to the coordinator and back, and repair; on one
+node it is refused ("no worker nodes").
+
+`create_projection(..., state => 'distributed')` (or `alter_projection(name, state => ...)`):
+
+- **Placement.** The aggregated table's partial aggregates, and the multisets behind min and max,
+  are Citus tables distributed by the group's hash (`__h`), co-located with each other; the joined
+  tables' kept columns are reference tables, on every node. The coordinator keeps only the
+  staging tables a fold passes through. The certificate names the rule and checks the
+  distribution.
+- **Folding** writes each group on the node holding its shard (INSERT ... ON CONFLICT from the
+  coordinator's staging rows). A reference table can't be updated from a table on the coordinator
+  alone, so the joined tables' netted rows are read on the coordinator first and written from a
+  parameter (`jsonb_to_recordset` with the column types spelled out: the staging table's row type
+  doesn't exist on the workers).
+- **Deriving a key** is a distributed query: the pushed-down join of partial aggregates with the
+  reference tables, aggregated on each shard and combined on the coordinator. The derivation
+  filtered from outside (`SELECT ... FROM (derive) q WHERE q.key = ...`) made Citus compute every
+  group as an intermediate result and filter after, so a fold's few keys cost a scan of the whole
+  state. The compiler now writes a keyed derivation (`_engine_sql(..., 'derive_keyed')`) with
+  `key = ANY ($1)` in its WHERE clause: the key is grouped, so filtering rows before grouping gives
+  the same groups, and every shard filters before it aggregates. Every aggregate kind derives the
+  same through Citus (jsonb_agg with ORDER BY, DISTINCT, percentiles were checked).
+
+Things that bit us:
+
+- **Citus couldn't read what it had just written.** A fold writes the distributed state over
+  several connections per node, then reads it in a join with the coordinator's staging tables
+  ("cannot perform query with placements that were modified over multiple connections").
+  Transactions that write a distributed state use one connection per node
+  (`citus.multi_shard_modify_mode = sequential`), set before anything else in the transaction:
+  Citus refuses to switch, or to distribute a table in sequential mode, once a parallel query
+  has run.
+- **Dropping the state left tables on the workers.** The engine drops its state with DDL
+  propagation off (its other relations are the coordinator's alone), which for a Citus table
+  dropped the coordinator's copy only; distributing again failed with "relation already exists"
+  on a worker. Citus tables are now dropped with propagation on.
+
+## 2026-10-13 — Analytics projections maintained incrementally (roadmap)
+
+`tests/events_analytics.sh` passes on one node and on the three-node cluster (isomer 0.21.0).
+
+An analytics projection whose query the engine can maintain (`create_analytics_projection(...,
+strategy => 'incremental')`, or `'auto'`) keeps the engine's state like a document projection, and
+its rows in two tables:
+
+- **a columnar table** (the base), each row tagged with its key `__k`: the jsonb array of the
+  query's grouped output columns (`[]` for a single aggregate row). A query whose rows can't be
+  told apart by their columns (it groups by something it doesn't return) isn't maintained this
+  way;
+- **a heap of changed rows** (`<name>_changes`): each key the deltas reach is re-derived from the
+  state there, or marked deleted when the query no longer returns it. The derivation is filtered
+  by each key column's values, so the planner pushes the filter below the grouping and derives
+  only those keys, then by the whole key.
+
+The view is the base with its changed rows replaced (an anti-join on `__k`, hashed: the changes
+are few). At most every refresh interval the two are merged into a new columnar table, without
+running the query; the changes table is locked against writes for the merge, readers are not.
+`refresh_analytics(name, force => true)` builds everything again from the tables. A TRUNCATE of a
+source rebuilds the state and the base.
+
+`'auto'` picks incremental maintenance when the query fits and none of its aggregates is kept as
+written (a percentile would keep a copy of every row it reads, larger than the table it
+produces); `'rebuild'` is how 0.20 kept every analytics projection.
+
+`analytics_differences` checks an incremental one in one statement, so the tables, the rows and
+the queues are seen at one moment: with nothing queued, every committed change is in the rows. On
+a cluster, deltas still on a worker are outside that moment, so they are checked before and after.
+
+Also: `dump_projections` wrote every projection as `create_projection(...)`, which refuses the
+analytics and event kinds, so a dump of a database with either failed on restore. It now writes
+them with their own functions; event projections record their rules (one created before 0.21.0
+kept only its compiled form, and is listed as a comment).
+
+## 2026-10-13 — Incremental maintenance for more queries: nested documents, DISTINCT, grouping expressions, sync (FR-P6)
+
+`tests/incremental.sh` passes on one node and on the three-node cluster (isomer 0.21.0).
+
+- **Aggregates kept as written.** jsonb_agg, string_agg, array_agg, ordered aggregates,
+  percentiles: anything that doesn't decompose into sums, counts or a multiset. The aggregated
+  table's primary key and every column the aggregate reads become grouped columns of its partial
+  aggregates, so the state holds one row per row of that table, and the derivation runs the
+  aggregate as written over the same rows the tables would give (`_engine_sql` keeps an aggregate
+  whose template is NULL, and leaves it out of the fact statements). It may read the joined
+  tables: an order's lines with each product's title and category, kept from the joined tables'
+  state. The state is as large as the rows the aggregate reads, which is what the documents hold
+  anyway. A table with no primary key is refused with that reason.
+- **DISTINCT.** count, sum and avg (DISTINCT c) over a column of the aggregated table add c to the
+  grouped columns, so each partial row is one value of c in its group, counting while any row holds
+  it: `count(DISTINCT c) FILTER (WHERE __cN > 0)` over the partial rows. Over a joined table's
+  column they are kept as written (which is decided once the aggregated table is known).
+- **Grouping expressions** (`GROUP BY upper(status)`, `date_trunc(...)`): the columns they read are
+  grouped columns of the partial aggregates, and the derivation groups by the expression. Volatile
+  ones are refused.
+- **Sync** (`freshness => 'sync', strategy => 'incremental'`): a statement-level trigger folds the
+  statement's deltas and applies the keys they reach before the statement returns. Folds of one
+  projection are serialised by a lock held to commit, so writers to its tables take turns. The
+  tables must be plain tables: a statement across a sharded table's shards runs their triggers
+  over parallel connections of one distributed transaction, which can't take turns on one state
+  (each waits for the others to commit; Citus cancelled it as a distributed deadlock, found by the
+  test's statement across every shard), and on a cluster the shards' deltas reach the coordinator
+  only after they commit. Tables Citus manages on the coordinator alone are fine.
+
+Things that bit us:
+
+- **Grouped columns inside a grouping expression were added to GROUP BY.** The compiler adds
+  columns that are functionally dependent on a grouped primary key, since the state relations have
+  none. It looked at the flattened target list, where the column inside `date_trunc('day',
+  placed_at)` looked ungrouped, so the derivation grouped by placed_at too and returned a row per
+  timestamp. On Postgres 18 a grouped expression in the target list is a reference to the grouping
+  step; only bare table columns are read without being grouped.
+
+Not changed: correlated subqueries (`(SELECT jsonb_agg(...) FROM orders o WHERE o.customer_id =
+c.id)`) are re-derived by key. Re-deriving one customer's orders reads only that customer's rows,
+so key recompute is already the cheap strategy for them; the same document written with a join
+and GROUP BY is maintained incrementally.
+
+## 2026-10-13 — Edge replicas: a copy on disk, and MongoDB (README roadmap)
+
+`tests/edge.sh` passes, with the new checks below.
+
+- **A copy on disk** (`ISOMER_EDGE_DATA_DIR`, `services/edge/src/store.rs`). Each projection has
+  `snapshot.json` (every document and the cursor they are as of) and `log.jsonl` (each change
+  applied since). A change is appended as it is applied and the log is synced once per batch the
+  origin sends. A crash that loses the log's tail only moves the cursor back, and changes are
+  keyed upserts and deletes, so applying them again is harmless; a torn last line is cut off on
+  restore. Once the log holds 10,000 changes and more than the snapshot has documents, it is
+  folded into a new snapshot (written aside, then renamed over the old). A restarted edge serves
+  the copy at once and resumes the feed from its cursor: the test stops it, writes, starts it, and
+  sees the write arrive without a new snapshot.
+- **Which copy is valid.** A feed cursor means nothing across incarnations of a projection: one
+  dropped and created again keeps its name but starts a new history, and the old cursor would
+  replay the new feed on top of stale documents that are never deleted. The snapshot records the
+  origin and when the projection's history was turned on (`history_since`, now in the API's
+  projection listing, with the MongoDB database); a copy from anything else is discarded. The
+  test recreates the projection with fewer rows while the edge is down, and the rows that are
+  gone are gone at the edge too.
+- **MongoDB** (`ISOMER_EDGE_MONGO_LISTEN`, `services/edge/src/mongo.rs`, `query.rs`). The edge
+  speaks the wire protocol (OP_MSG, and OP_QUERY for the legacy handshake) as a read-only
+  standalone server. find (filters, sort, skip, limit, projection, batches and getMore), count,
+  distinct, aggregate ($match, $sort, $skip, $limit, $project, $count, $group with $sum, $avg,
+  $min, $max, $first, $last, $push, $addToSet), listCollections, listDatabases. Filters follow
+  MongoDB's semantics over the JSON documents: arrays match by element, numbers by value whatever
+  their width, comparisons only within a type, `{f: null}` matches a missing field; $eq, $ne, $gt,
+  $gte, $lt, $lte, $in, $nin, $exists, $regex, $size, $all, $elemMatch, $not, $and, $or, $nor. A
+  filter on `_id` is a lookup by key. Anything else is refused with "send this query to the
+  origin" rather than answered differently; writes are refused naming the origin.
+- **Authentication is the origin's.** The password is an IsomerDB API key, sent with SASL PLAIN
+  (`authMechanism=PLAIN&authSource=$external`), checked against the origin like a bearer token;
+  a collection is visible only if the key's role may read the projection. SCRAM can't work: the
+  edge never holds a password's verifier, and a client that tries it is told what to use. PLAIN
+  sends the key as it is, so the listener takes TLS and refuses to start without it unless
+  `ISOMER_EDGE_MONGO_PLAINTEXT=1` (compose sets it for local development).
+- **Read your writes over MongoDB.** A causally consistent session sends
+  `readConcern.afterClusterTime`. The edge turns the timestamp back into the write token
+  (the inverse of `isomer.token_to_mongo_timestamp`) and waits as `X-Isomer-After` does. The test
+  writes at the origin, advances a session to the write's timestamp, and reads it back at the
+  edge three times in a row.
+- Events (event projections) in the feed only move the cursor; they were stored as documents
+  before.
+
+Not built: the edge keeps no key's access on disk, so after a restart it serves only once the
+origin's API answers who a key is; that is deliberate (a revoked key must stop working).
+
+## 2026-10-13 — The sign-up page (FR-CL1)
+
+The control plane serves a page at `/`: a team signs up or logs in, creates a cluster in a region
+on a plan (the plan's size and its monthly price as created are shown before creating), reads its
+connection strings once it is ready, scales it, deletes it after typing its name, and sees this
+month's invoice. It is plain JavaScript in `controlplane/web`, compiled into the binary with
+`go:embed`, on the API's own origin, so it calls the same public API and needs no CORS. It builds
+the page from text nodes only, never HTML from the server, under a content security policy that
+allows nothing but its own origin.
+
+- **The token** is kept in `sessionStorage` and revoked on log out (`DELETE /v1/tokens/current`,
+  new), so closing the tab or logging out ends it.
+- **Sign-up and log-in are rate limited** per client address: a burst of 10, then one every 6
+  seconds. Behind a proxy, `CP_CLIENT_IP_HEADER` names the header carrying the client's address.
+- Checked in Chrome through Playwright against the control plane on kind: sign up, create and
+  delete a cluster, log out, a wrong password, log back in, at desktop and phone widths, light and
+  dark. `tests/controlplane.sh` checks the page is served under its policy, that log out revokes,
+  and that a burst of failed log-ins is cut off.
+
+What bit us: **a `pattern` attribute is compiled with the `v` flag,** under which an unescaped `-`
+at the end of a character class is a syntax error; the name field's pattern escapes it.
+
+Not built: email verification (it needs a mail provider), and the console's operator views are
+still a separate app (`clients/console`) run against a cluster's own API.
+
+## 2026-10-12 — Jepsen: coordinator faults, clock skew, MongoDB, incremental projections (FR-K4)
+
+`tests/jepsen.sh` now covers what the first Jepsen entry below left out:
+
+- **Faults on any node.** `--fault-nodes` (or `FAULT_NODES=db,worker1`) picks where the nemesis
+  pauses, kills and cuts off; the coordinator is one of them. Clients reconnect and retry, so a
+  kill of the coordinator shows up as indeterminate operations, not as a crashed run.
+- **Clock skew.** `SKEW=1` runs the cluster on an image with libfaketime preloaded for the
+  `postgres` user. The nemesis writes an offset of 5 to 60 seconds, forwards or backwards, to a
+  file the library rereads every second, and clears it on heal.
+- **MongoDB.** The `mongo` workload is read-your-writes through the gateway with the MongoDB Java
+  driver: a causally consistent session increments, then reads the projection and must see it.
+- **Incremental projections.** The `incremental` workload writes order lines under sales by
+  category, kept by the incremental engine across a reference table, a distributed table and one
+  not co-located with it: inserts, updates, voids, deletes, products moved between categories, and
+  statements across every shard. At the end the projection must equal recomputation, no deltas
+  may be left on the workers, no pull left prepared, and the certificate must hold.
+- **A report per release.** `./tests/jepsen.sh report` runs every workload with faults on the
+  workers, on the coordinator, and with skew on every node, and writes the matrix to
+  `docs/jepsen/isomer-<version>.md`. Elle checks append for G0, G1a, G1b and G1c, with 30
+  seconds to search for cycles (the default ran out and answered "unknown"). It checked internal
+  consistency too, until the 0.21.0 report flagged it in every run, clock skew alone included:
+  Elle's internal check expects a transaction's later read to equal its earlier one plus its own
+  appends, but the client runs READ COMMITTED, where each statement rightly sees what others
+  committed meanwhile (`[1]`, then `[1 2 … 15 8]` with its own 8 last). The database did what READ
+  COMMITTED promises; the check asked for more. All 12 runs of the 0.21.0 report are valid.
+  One earlier report run hung for 40 minutes in the incremental workload's setup, dropping the
+  previous run's projection after the coordinator had been killed in the run before; it did not
+  happen again in that sequence or in the full matrix, with lock waits watched for.
+
+It found a third bug, fixed:
+
+- **Read-your-writes on a cluster assumed no clock steps back.** `wait_for` took every node's
+  `clock_timestamp()` as the barrier and waited for queued changes enqueued before it. A worker
+  whose clock was ahead when a write queued, then stepped back, left that write stamped after the
+  barrier, so the read didn't wait for it: stale reads under skew only. Queued changes already
+  carry the Citus cluster clock of the node that queued them, which never goes back (the larger of
+  a logical clock and the wall clock, persisted across restarts). The barrier is now that token:
+  the largest of every node's cluster clock and every token already queued. `wait_for` waits
+  until nothing at or below it is queued anywhere, asking the workers before the coordinator so a
+  change moving between them is seen in one place or the other, and counting a worker that
+  doesn't answer as still busy.
+
+Things that bit us: libfaketime keeps its state in shared-memory semaphores that only the user who
+created them can open, so the server must run as `postgres` from the start (`user: postgres` in
+`jepsen/compose.skew.yml`). A `FAKETIME` variable overrides the timestamp file, so the image sets
+none. MongoDB counters come back as 32-bit integers.
+
+## 2026-10-12 — Event and analytics projections (roadmap)
+
+`tests/events_analytics.sh` passes on one node and on the cluster (isomer 0.20.0).
+
+- **Event projections** turn row changes into domain events:
+  `isomer.create_event_projection('order_events', 'shop.orders', events => '{"order_paid": {"when":
+  "new.status = ''paid'' AND old.status IS DISTINCT FROM ''paid''", "payload": "..."}}')`. Each
+  rule is a condition and a payload over the old and new row. Capture is the incremental engine's:
+  the old and new images are recorded together in the writing transaction, on the node holding the
+  row, and reach the coordinator exactly once. The drain turns them into events and appends them to
+  the projection's feed under its feed lock, so ids follow commit order and one row's events keep
+  theirs. Consumers read them with `isomer.changes_since`, or over HTTP from `/changes` and
+  `/live`, as `op: event`. Past retention, events go (a document's history keeps each key's version
+  at the cutoff; an event log keeps nothing older). A TRUNCATE makes no events.
+- **Analytics projections** keep a query as a columnar table (Citus columnar),
+  `isomer.create_analytics_projection(name, query, refresh => '5 minutes')`, read through a view.
+  It is rebuilt into a new table and swapped in, in one transaction, when the sources have changed,
+  at most once per refresh. Changes are noticed from the tables' own statistics on every shard
+  (rows inserted, updated, deleted, and the file a TRUNCATE replaces), so it needs no triggers and
+  follows attached tables. `isomer.analytics_differences` compares it with the query while the
+  sources are unchanged; the certificate runs it.
+
+Things that bit us:
+
+- **A missing row is a row of nulls,** not NULL, once it comes from `jsonb_populate_record`, so
+  `coalesce(new, old)` picked an empty `new` for a delete. `CASE WHEN new IS NULL` is right: a row
+  of nulls IS NULL.
+- **`run_command_on_shards` fills in one `%s`.** A command using the shard's name twice needs
+  `%1$s`.
+- **Columnar storage is its own extension** (`citus_columnar`), which `CREATE EXTENSION citus` no
+  longer creates. New nodes create it; `isomer.control` requires it; an older cluster is told to.
+
+## 2026-10-12 — Managed Postgres providers (FR-A11)
+
+`tests/managed_source.sh` passes. Attach and cutover now run, and are tested, as an ordinary role
+holding only what managed providers grant: it owns its database and tables and may replicate, and
+is not a superuser. `isomer.provider_check(conninfo)` (isomer 0.19.0) recognises the provider from
+the roles each one creates (RDS and Aurora, Cloud SQL, Azure Flexible Server, Supabase, Neon,
+AlloyDB, Crunchy Bridge, and Tiger Cloud, which it refuses), and checks what attach needs there:
+logical decoding on, a role that may replicate (on RDS, membership of `rds_replication`), a free
+slot and WAL sender, the right to create the publication, and, for cutover, ownership of the
+database. A failed check says what to change in that provider's terms (the parameter group on RDS,
+the database flag on Cloud SQL, the project setting on Neon). `isomer.attach` runs it first and
+refuses before creating anything.
+
+Not done, because it needs accounts: running attach and cutover against each real provider in CI
+(Tier 1 is "CI-tested" in the PRD). The test recognises providers by creating their roles on plain
+Postgres; their real limits (RDS's parameter groups, Neon's suspended computes dropping slots) are
+only known from running there.
+
+## 2026-10-12 — Edge replicas (README roadmap)
+
+`tests/edge.sh` passes. `services/edge` (Rust) serves projections from memory, close to users,
+fed by the origin's change feed: it follows `/v1/projections/{name}/live` (the snapshot, then each
+change in commit order), resumes with `Last-Event-ID` after a disconnect, and takes a new snapshot
+if the origin has pruned past its cursor.
+
+- **Access is the origin's.** A client's API key is checked against the origin (the projections
+  its role may read) and cached for 30 seconds, so the edge never widens what a key can read.
+- **Read your writes at the edge.** With `X-Isomer-After: <token>` the edge asks the origin for the
+  feed cursor that reflects the write (`/v1/projections/{name}/cursor`, new: it waits for the token,
+  then returns the newest change id, and the write's change is at or before it because changes are
+  logged in the transaction that applies them), and answers once it has applied the feed that far.
+  The test writes and reads back through the edge five times in a row.
+- The projections need history on: the feed is what the edge follows.
+
+Persistence across restarts and MongoDB were added on 2026-10-13 (below).
+
+## 2026-10-12 — Embedding backfills through provider batch APIs, and bundled models (FR-V1a, FR-V1b)
+
+`tests/embed_batch.sh` passes, against the mock provider's new Batch API (isomer 0.18.0).
+
+- **Batches.** A model registered with `batch_api => true` sends a backfill of at least
+  `batch_min_items` jobs to the provider's Batch API (`/v1/files`, `/v1/batches`): one JSONL file
+  of embedding requests, processed within 24 hours at half price at OpenAI and outside the rate
+  limits. `isomer.embed_batch_lease` claims the jobs into a batch and numbers them; the embedder
+  uploads, polls, and hands each result back through `embed_batch_result`; items the provider
+  rejects, and items a failed or expired batch never returned, go back to ordinary requests.
+  Steady-state work never waits for a batch, and the ordinary workers leave a backfill big enough
+  for a batch to it.
+- **A row that changes while its old text is in a batch** must not get the old text's embedding.
+  The job records the hash it was batched with; a result for a job whose hash has moved on is
+  dropped, and the new text goes by ordinary request (it was made ready again by the change).
+- **Bundled models** run on IsomerDB's own key: usage is billed at list price times
+  (1 + `markup`), after the cluster's one-time free allowance (`bundled.free_tokens`).
+  `embedding_usage.billed_usd` is what the customer owes, `cost_usd` what the provider charges;
+  monthly caps count what the customer pays. Metered hourly as `embedding_billed_usd`, which the
+  control plane passes onto invoices.
+
+What bit us: **Postgres takes no row locks in a query with window functions** ("FOR UPDATE is not
+allowed with window functions"), which the first lease did to number the items: it locks first
+now, and numbers after.
+
+## 2026-10-12 — The cloud control plane (FR-CL1, FR-CL2)
+
+`tests/controlplane.sh` passes on kind. `controlplane/` is the managed service on top of the
+operator, in Go: a team signs up, creates a cluster in a region on a plan, reads its credentials,
+scales it within the plan, sees its usage and its invoice, and deletes it.
+
+- **Clusters are IsomerCluster resources** in a namespace per organisation
+  (`isomer-org-<id>`), in the Kubernetes cluster that serves the region. The operator does the
+  rest: provisioning, failover, backups, upgrades. A region is a kubeconfig (empty: the cluster the
+  control plane runs in); a plan is a size (workers, standbys, storage, CPU, memory, the most
+  workers it may scale to) and two prices.
+- **Pricing follows the PRD:** compute by the node-hour and storage by the GB-month, the same
+  units as the database (decision 6). Standbys, which the database can't see, are billed one per
+  node on plans that have them. Embeddings on bundled models pass through at what the cluster's
+  own metering bills; embeddings on the customer's own keys bill nothing here.
+- **Usage comes from each cluster's own metering:** every five minutes the collector reads
+  `isomer.usage_report` for the last two days, hour by hour, and replaces those hours, so
+  collecting twice never counts twice. A deleted cluster is read one last time first, and the time
+  it ran stays on the invoice.
+- **Accounts:** passwords under bcrypt, API tokens stored only as SHA-256 hashes. Every query is
+  scoped to the caller's organisation: another team's cluster is a 404, as one that doesn't exist.
+  `/v1/admin/collect` takes a separate admin token.
+- **Its own Postgres** holds organisations, users, tokens, clusters and collected usage
+  (`controlplane/config`, with development secrets to replace).
+
+What bit us: **macOS's `/bin/bash` 3.2 mangles escaped quotes nested inside `"$( )"`.** The test's
+second sign-up arrived as a JSON string instead of an object. Request bodies are now built with
+`printf` first.
+
+Not built: payment collection (invoices are computed; charging a card needs a payment provider
+account), and regions in other clouds (any kubeconfig works, none has been run).
+
+## 2026-10-12 — Incremental maintenance across shards (FR-P6, FR-S5) and the strategy chooser (FR-S7)
+
+`tests/incremental.sh` passes on one node and on the three-node cluster. A projection that
+aggregates a sharded table through joins (sales per category from order lines, through products
+and a reference table of categories) is kept from row deltas instead of by re-deriving keys from
+the tables, with no key mappings declared (isomer 0.17.0).
+
+Why: re-deriving a key re-reads its whole group, and for a key the table only reaches through a
+join (lines reach a category only through products) every write re-derived every key. On the
+cluster, re-deriving one category's sales is a repartition join across every shard. Folding a
+write costs the same however large its group is.
+
+How it works:
+
+- **Capture.** Each write records row images, -1 for the old row and +1 for the new, in the
+  writing transaction, on the node holding the row (`isomer.deltas` on the coordinator,
+  `isomer.node_deltas` on workers). An update that changes none of the columns the projection
+  reads records nothing. A reference table's change runs on every node holding a copy; only the
+  copy in the lowest node group records it.
+- **Exactly once.** Deltas are counted, not just noted, so a duplicate is wrong where a duplicated
+  key was harmless. `isomer.pull_node_deltas` takes a worker's deltas in a prepared transaction
+  there, commits them on the coordinator together with the pull's id (`isomer.delta_pulls`), then
+  commits the worker's. A pull left prepared is finished the way the ledger says: recorded means
+  commit, absent means roll back. Pulls are serialised; a second puller could otherwise roll back a
+  pull the first has not recorded yet. Worker rows are inserted in the worker's order, so changes
+  to one row keep theirs.
+- **The compiler** works on Postgres's own parse tree (`isomer_router/isomer_engine.c`):
+  `isomer._engine_analyze` reports relations, joins, conjuncts, aggregates and grouping;
+  `isomer._engine_sql` rewrites the analysed query and deparses it back with `pg_get_querydef`.
+  State relations line up with the source tables attribute by attribute (dropped columns
+  included), so the rewrite only swaps a relation's oid and every Var stays valid.
+- **The rule it checks** (`isomer._engine_shape`): one table, the fact, holds every aggregate's
+  input, and every join leading away from it lands on a unique key. Each fact row then joins at
+  most one row of the rest, so its aggregates can be kept per group of the columns it is joined
+  and grouped by, before the join. sum, count, avg, min, max, bool_and and bool_or, with FILTER;
+  inner joins, and a LEFT JOIN with the fact alone on the optional side; HAVING; a global
+  aggregate under a constant key. Anything else is refused with the reason.
+- **State,** in `isomer_state`: the fact's partial aggregates per group (count, and a sum and
+  count per aggregate; min and max as multisets of values with multiplicities), and for each
+  joined table the columns the query reads, keyed like the table. Folding is commutative, so
+  deltas from different nodes can arrive in any order and the state still converges.
+- **Which keys to re-derive.** A key's value can change only if a delta of one input reaches it
+  through the state of the others, before or after the fold. For each relation with deltas, the
+  query with that relation swapped for its staged rows (and everything else for state) gives the
+  keys it reaches; that runs before and after folding, and the union is queued like any other
+  key. The drain then derives those keys from the state (`projections.derive_query`), through
+  the same apply path as before, so history, the change feed, MongoDB and HTTP reads are
+  unchanged.
+- **Proof that it holds.** At creation the derivation from the state must equal the query over
+  the tables row for row, or creation fails. The auditor keeps recomputing samples from the
+  tables. `isomer.certificate` names the rules relied on and re-checks the unique keys, the
+  triggers on every placement and the state.
+- **Strategy (FR-S7).** `create_projection(strategy => 'auto')`, now the default, asks
+  `isomer.choose_strategy`: incremental when the query fits the rule and the cost of re-deriving
+  one key is high, or the query maps sources to nothing, or the cluster can't run it at all;
+  key recompute otherwise (a key on its own shard costs one small read and keeps no state).
+  The cost comes from where Citus keeps each table and how the joins connect them: a key on one
+  shard, every shard, or a repartition. `isomer.strategy_advice()` says what it would pick for
+  each projection now; `alter_projection(name, strategy => ...)` switches, in one transaction.
+- **Queries the cluster can't run as written.** Citus refuses an outer join between tables that
+  are not co-located (customers with their order counts, sharded differently). Neither key
+  recompute nor the auditor could run that query, but the engine reads one table at a time, so it
+  maintains it. The auditor then checks against `truth_query`: the same derivation over partial
+  aggregates computed afresh from the table (forced to be computed first with `OFFSET 0`), joined
+  with the tables themselves.
+
+Measured on the dev stack: folding 2,450 deltas and applying the keys they reach takes about 70
+ms; a write is applied about 0.7 s after it commits (the drain runs every second), within the 2 s
+budget. The checks in the test take longer only because `verify` re-runs the original query, a
+repartition join, each time.
+
+Things that bit us:
+
+- **A functionally dependent column broke the derivation.** `GROUP BY c.id` with `c.name` in the
+  output is valid because `c.id` is the table's primary key; the state relation has none, so the
+  rewritten query failed. The compiler now groups such columns explicitly, which changes nothing.
+- **Planning a repartition join changes the rest of the transaction.** After Citus has planned
+  one (even for EXPLAIN), later statements that mix local tables with distributed subqueries go
+  over its own connections, which can't see the state tables just created in the transaction. So
+  nothing in the create path plans the original query: whether the cluster can run it, and what a
+  key costs, are worked out from metadata (`isomer._shard_groups`, `_runnable`, `_key_cost`).
+- **Explaining over a second connection deadlocks itself.** An early version asked the shards to
+  explain through a separate connection; inside `alter_projection`, which had already locked the
+  sources, that connection waited for our own locks forever.
+- **`count(t.*)` counts rows.** IS NULL on a whole row tests every field, so a row with any null
+  field looked absent. A whole-row argument is counted as a constant.
+- **`CREATE OR REPLACE FUNCTION` resets SECURITY DEFINER.** `freshness` had been made one with
+  ALTER FUNCTION in 0.3.0; redefining it without the clause made the MongoDB gateway's
+  `isomer.freshness` call fail with "permission denied". Everything this version adds is revoked
+  from PUBLIC.
+- **Citus refuses volatile functions inside writes to distributed tables,** so the test's random
+  writers pick their values first.
+- **A lock race in `alter_projection`, older than this work, found by the full suite.** It took
+  `FOR UPDATE` on the projection's row, then needed an exclusive lock on the source table to swap
+  triggers. The auditor runs every projection in one transaction: having read the table, it
+  inserted a suspect row whose foreign key takes KEY SHARE on the same projection row, and waited.
+  `alter_projection` never changes the key, so it now takes `FOR NO KEY UPDATE`, which foreign-key
+  checks don't wait for.
+- **A statement that wrote several shards could deadlock key recompute** (older than this work,
+  found by this test). Each shard's trigger upserted the keys it touched into `isomer.pending`;
+  Citus runs the shards over parallel connections of one distributed transaction, so two of them
+  inserting the same key waited on each other until Citus's deadlock detector cancelled the
+  statement. Capture now only appends (`isomer.key_log`, and `node_queue` on workers without its
+  unique key), and the drain merges what has committed into `pending` in one session. A write
+  still uncommitted when the drain merges is merged by the next drain, so nothing is missed;
+  `wait_for`, `freshness`, the auditor and the status view count the log too.
+
+Limits:
+
+- The state lives on the coordinator. It is small (one row per group of the fact's join and
+  grouping columns, plus the joined tables' columns), but it is not sharded.
+- Incremental projections are bounded; a sync projection is re-derived by key in the writing
+  transaction.
+- `jsonb_agg` (nested documents), `DISTINCT` aggregates and expressions in GROUP BY stay on key
+  recompute.
+- Floating-point sums can differ from the query's in the last bits (addition order), which the
+  auditor would report.
+
+## 2026-10-12 — Cutover plan (FR-A6)
+
+`tests/cutover_plan.sh` passes. `isomer.cutover_plan('crm')` (isomer 0.16.0) reads the team's
+database and IsomerDB's copy of it and returns the plan in order. Each step is ok, blocked, to do or
+for information, and comes with its SQL. `isomer.cutover_plan_markdown` renders the same plan as a
+document. The admin API (`/v1/admin/attachments/{name}/plan`), `isomer plan` and the console's
+Attachments page all show it.
+
+- **Before cutover:** the copy has finished, replication is healthy (slot, WAL, errors,
+  conflicts), the auditor has checked the projections over these tables and found no drift,
+  every table in the attached schemas is copied, and nothing outside them is written to. Cutover
+  makes the whole source database read-only, so writes to other schemas would start failing.
+- **What the copy does not carry yet.** Attach copies columns and primary keys. The plan
+  compares the source with the copy and returns the SQL for whatever is missing: extensions,
+  functions, indexes, unique, check and exclusion constraints, foreign keys, triggers, views and
+  materialized views, and roles and grants. The source prints every name schema-qualified
+  (`search_path` is `pg_catalog` on that connection), so the SQL runs as it is. Foreign keys are
+  added `NOT VALID`, then validated. Stored generated columns are flagged, since they arrive as
+  plain values.
+- **Cutover:** the applications connected to the source (role, address, application name), and
+  the write rate and quietest hour seen so far. `isomer.sample_attachments()` records writes to the
+  attached tables per hour, every minute. Then the cutover command.
+- **After cutover:** the bounded projections that can now be `sync`, tables over a size threshold
+  with a shard key, and how to stop rollback replication.
+
+The test builds a source with each of these gaps, applies the plan's own SQL, cuts over, and
+checks that the copy enforces the foreign key, unique and check constraints, fires the trigger, and
+gives the application's role exactly its privileges.
+
+- **Cutover failed on stored generated columns.** It copied every column default, and a
+  generated column's expression is stored as one; Postgres refuses it as a default because it
+  refers to other columns. Cutover now skips them. The column keeps its replicated values, and the
+  plan says what to do. The test found this.
+
+## 2026-10-12 — Alert delivery (FR-K3)
+
+`tests/alerts.sh` passes. Alerts were raised and shown before; now they reach on-call (isomer
+0.15.0 and the HTTP API).
+
+- **Each alert is tracked from firing to resolved** in `isomer.alert_state`, keyed by kind and
+  subject. `isomer.pending_notifications()` brings it in line with `isomer.alerts` and returns the
+  transitions not yet delivered; an alert that clears and comes back is a new incident.
+- **Channels:** `webhook` (JSON, optional bearer token), `slack` (incoming webhook) and `pagerduty`
+  (Events API v2: trigger on firing, resolve on resolved, one dedup key per alert and subject).
+  Each has a minimum severity: drift and broken attachments are critical, lag-budget breaches,
+  embedding lag and dead letters are errors, staleness and paused budgets are warnings. "Unused"
+  projections are never paged.
+- **The HTTP API delivers** every `ISOMER_ALERT_INTERVAL_SECS` (15 by default) and records every
+  attempt in `isomer.alert_deliveries`. A failed send is retried on the next pass, to the channels
+  that have not accepted it yet. The first version retried to all of them, so one failing channel
+  made the others hear the same alert three times; the test caught it.
+- **Secrets stay out of the database:** a channel names the environment variable on the API that
+  holds its routing key or token.
+
+The test drives a mock receiver (`tests/mockhooks/`) with a channel that fails twice before
+accepting.
+
+## 2026-10-12 — Jepsen (FR-K4)
+
+`tests/jepsen.sh` runs Jepsen (0.3.14) against the three-node compose cluster from a control
+container, with a nemesis that pauses, kills and network-isolates the workers through the Docker
+socket, a randomly chosen fault every 20 seconds, healed 10 seconds later:
+
+- **append**: Elle list-append over a table distributed in 8 shards, 10 clients, 2–4 operations per
+  transaction (most span shards, so commit is two-phase). Checked against READ COMMITTED (G0, G1a,
+  G1b, G1c) and for lost or phantom appends. Valid over 120s with 2 pauses, 2 kills and 2
+  partitions: 3,344 transactions (2,994 ok, 54 failed, 296 indeterminate), no anomalies.
+- **ryw**: read your writes through a document projection. A client increments a counter, takes
+  `isomer.last_write_token()`, and reads the projection with `SET isomer.read_after`. An answer must
+  show its increment or a later one; "not yet" (IS001) is the allowed alternative. At the end every
+  acknowledged increment must be in the table and the projection must equal recomputation.
+  Valid over 120s with a pause, 4 kills and a partition: 550 increments (7 indeterminate), 497
+  reads answered, 0 stale, 44 explicit "not yet", none lost, no drift.
+
+It found two bugs, both fixed:
+
+- **A cluster hung while a worker was paused or cut off.** Citus caches a connection per worker,
+  and without keepalives a query waiting on one to a node that stopped answering waits until the
+  node returns: ten minutes in the first run, the length of the pause. Node connections now carry
+  `keepalives=1 keepalives_idle=10 keepalives_interval=5 keepalives_count=3 tcp_user_timeout=20000`
+  (image config, and the operator's `citus.node_conninfo`), so such a query fails within about 20s.
+- **Read-your-writes did not wait for writes to a worker's shards.** `isomer.last_write_token()` is
+  set by the capture trigger, which on a multi-node cluster runs in the worker's backend, so the
+  client's session never had a token and `read_after` did nothing: 11 stale reads in the first run.
+  `isomer_router` now sets the session's token from the coordinator's clock after every top-level
+  write to a table with capture triggers. `tests/multinode.sh` covers it.
+
+Not covered yet: faults on the coordinator itself (the operator's failover is tested on kind
+instead), clock skew, and the MongoDB wire path.
+
+## 2026-10-12 — Usage metering (FR-CL2)
+
+`tests/metering.sh` passes. Every minute `isomer.meter()` (isomer 0.14.0) samples into
+`isomer.usage`, one row per hour, metric and dimension:
+
+| Metric | Kind | By |
+|---|---|---|
+| `storage_bytes` | gauge (peak) | (total of every node) |
+| `node_hours` | counter | coordinator / worker |
+| `documents_written` | counter | projection |
+| `embedding_tokens`, `embedding_cost_usd` | counter | model |
+| `sql_statements` | counter | (coordinator) |
+| `api_requests` | counter | API key's role |
+
+`isomer.usage_report(from, to, 'hour'|'day'|'month')` rolls it up; the admin API serves it as JSON
+or CSV (`/v1/admin/usage`), `isomer usage` prints or exports it, and the console has a Usage page.
+
+- **Counters are differences from the last sample** (`isomer.usage_cursor`), so a restart, a second
+  sampler (they serialise on an advisory lock) or a statistics reset never counts anything twice.
+  The meter's very first sample takes a baseline; a source that appears later (a new projection,
+  model or month) counts in full. The first version treated every new source as a baseline, which
+  would have dropped each month's first minute of embedding tokens; the test caught it.
+- **The HTTP API counts its own requests** in memory and adds them every 15 seconds through
+  `isomer.record_usage`, keeping counts it could not write. Only data requests count: the admin
+  API (the console polls it) does not.
+- **Node-hours accrue between samples, capped at two minutes**: a gap means the sampler was not
+  running, and is not billed.
+
+Not metered: standbys (the database does not see them; the operator does), MongoDB gateway
+requests, and network transfer.
+
+## 2026-10-12 — Operator: version upgrades (FR-CL1)
+
+`tests/operator_upgrade.sh` passes on kind. A cluster with standbys moves to an image carrying a
+newer isomer extension while a writer commits once a second through the client Service: every pod
+reaches the new image (standbys first, then a planned switchover per group), the extension is
+updated on every node, no acknowledged write is lost (137 of 137), and the writer saw 21 failed
+attempts over the run, about seven seconds per group switched.
+
+- **The operator rolls pods itself** (`OnDelete` StatefulSets): it knows which pod is the primary,
+  which the StatefulSet controller does not, and would restart a primary while its standby was
+  still on the old image. Any template change goes through the same path.
+- **A planned switchover loses nothing:** the old primary's fast shutdown sends all WAL to the
+  standby before exiting, and the operator waits for the standby to have replayed it before
+  promoting.
+- **Extensions are updated per primary, in dependency order,** only where the image has a newer
+  version; standbys get the change through WAL.
+
+Limit: write availability during a switchover is a few seconds per node; clients must retry. A
+major Postgres upgrade is not covered.
+
+## 2026-10-12 — Operator: backups and point-in-time recovery (FR-CL1)
+
+`tests/operator_backup.sh` passes on kind, against SeaweedFS as the S3 store. A cluster archives
+every node's WAL and takes base backups; a restore point is created; later writes follow; a second
+cluster restored to the point has exactly the data before it (and the projection, equal to
+recomputation, still maintained), with Citus pointed at its own nodes and the source's passwords.
+
+- **WAL-G** (3.0.9, pinned and checksummed in the image) does the archiving and base backups.
+  `isomer-walg` picks the node group's area of the store from the pod's name; `isomer-backup-agent`
+  is a sidecar that takes the base backups while its pod is the primary.
+- **Consistency across nodes comes from restore points**, not timestamps:
+  `isomer.create_restore_point()` (isomer 0.13.0) wraps `citus_create_restore_point`, which blocks
+  distributed commits for the instant it writes the point on every node. Names carry the UTC time,
+  which a restore uses to choose each node's base backup (the newest that finished before it).
+- **Restore is a new cluster**, built by each pod's init container (`isomer-node-init`): fetch,
+  replay to the point, promote. Citus's metadata then still names the source's hosts; the operator
+  repoints the workers first and the coordinator last, syncing metadata between steps (a sync
+  that tries the source's hosts would fail).
+
+Things that bit us:
+
+- **A bug from query routing, found by this test:** a fresh session whose first statement was a
+  multi-shard `INSERT ... SELECT` into a table behind a projection failed with "another command is
+  already in progress". The capture trigger on the coordinator's own shards ran mid-COPY, and its
+  first planned statement made `isomer_router` load its routes in an internal subtransaction,
+  which Citus mirrors as `SAVEPOINT` on every open worker connection, busy with COPY. Routing now
+  ignores statements nested inside another (only top-level application queries are routed);
+  `tests/multinode.sh` covers the case.
+- **`.pgpass` lives outside the data directory,** so pods cloned as standbys or restored never had
+  one, and shard moves to a promoted coordinator would have failed. The init container writes it.
+- **A restore's `restore_command` must not outlive the restore:** a restored node that later
+  becomes a standby would otherwise fetch WAL from the source's archive. The init container
+  removes the recovery settings once recovery has finished.
+- **MinIO no longer publishes images**; the test uses SeaweedFS's S3 gateway, and creates the
+  bucket with `weed shell` (a short-lived `kubectl run -i` loses its output to an attach race).
+
+## 2026-10-12 — Operator: certificates between nodes, standbys and failover (FR-CL1)
+
+`tests/operator.sh` passes on kind. It now also checks that workers refuse anything but the node
+certificate, that every connection between nodes is encrypted and certificate-authenticated, that
+a reissued certificate is picked up without a restart, and that a standby takes over when a
+worker's or the coordinator's postmaster is frozen: Citus is repointed, every row stays readable,
+SQL, MongoDB and HTTP clients carry on through the same Services, projections keep being
+maintained, the old primary rejoins as a standby, and turning standbys off moves the primaries
+back with nothing lost. See `operator/README.md` for how it works.
+
+Things that bit us:
+
+- **Kubernetes stops containers with SIGTERM, Postgres's smart shutdown.** It waits for every
+  client to leave; Citus caches connections, so every pod deletion ran into the 60s grace period
+  and was killed uncleanly. A `preStop` hook sends SIGINT (fast shutdown: well under a second,
+  and a standby is sent all WAL first). The hook must only send the signal: one that waits for
+  PID 1 to exit hangs itself until the grace period ends.
+- **A rolling restart looked like a failure.** The pod is missing (or terminating) for a moment,
+  and "missing" first triggered an immediate failover. Missing now gets the same
+  `failoverAfter` grace as unready.
+- **Turning standbys on restarted every primary** while the standbys were being cloned, because
+  the replication settings were server arguments. The operator now sets
+  `max_slot_wal_keep_size` and `synchronous_standby_names` with `ALTER SYSTEM` on each primary.
+- **`citus_set_coordinator_host` refuses while a metadata node is out of sync,** which a worker
+  failover a minute earlier leaves behind. Promotion now does only the promotion; every pass
+  brings Citus's metadata in line with the topology and syncs it, so a refused step is retried.
+- **A container's PID 1 ignores SIGSTOP sent from inside its namespace** (it is the namespace's
+  init). The test freezes the postmaster from the kind node instead, via `crictl`, and must pick
+  the ready sandbox: a recreated pod has two.
+- **`pg_ident.conf` maps the node certificate to every role** with `isomer-nodes isomer-node all`
+  (Postgres 16+), which is what Citus needs: it connects to workers as each client's own role.
+
+Limits: one standby per node; a failover is decided by the operator's view of pod readiness, so
+an operator that is down delays failover (the database keeps running). Logical replication slots
+on the coordinator (cutover rollback) are not carried over to its standby.
+
+## 2026-10-12 — Embeddings on the cluster's own CPU (FR-V1b)
+
+`tests/local_model.sh` passes. A vector projection can now use `model => 'bge-small-en-v1.5'`:
+the embedder computes it on its own CPU, with no API key, no network and no per-token cost. That
+covers the free tier, development, and air-gapped clusters, which until now had only
+`local-hash-64` (word hashing, no meaning).
+
+- **Model:** BAAI/bge-small-en-v1.5 (MIT, 384 dimensions, ~130 MB), one of the two the PRD names.
+  It is downloaded at a pinned revision during the image build, checked against SHA-256 sums, and
+  shipped at `/usr/share/isomer/models/bge-small-en-v1.5` with its license. `ISOMER_MODEL_DIR`
+  points the embedder at another directory of Hugging Face-layout models (`config.json`,
+  `tokenizer.json`, `model.safetensors`); register one with provider `'local'`.
+- **Runtime:** candle (pure Rust) and the `tokenizers` crate with its pure-Rust regex backend, so
+  the image gains no native libraries. Inference runs on a blocking thread so a batch doesn't stall
+  the async workers. The model loads once per process.
+- **Checked against the reference implementation:** our vectors match sentence-transformers' to
+  cosine > 0.9999 (the ignored unit test takes `ISOMER_REFERENCE_EMBEDDINGS`). The acceptance test
+  ranks five listings by meaning with queries that share no content word with them.
+
+Things that bit us:
+
+- **candle 0.11 needs Rust 1.95** on aarch64 (it uses NEON f16 intrinsics that 1.89 calls
+  unstable). The embedder now pins 1.95 in `rust-toolchain.toml` and its Dockerfile.
+- **BGE pools the [CLS] token, not the mean.** A reference built from just the three weight files
+  silently used mean pooling, because sentence-transformers reads pooling from `modules.json`;
+  the comparison needs the repo's `1_Pooling/config.json`.
+
+Limits: English only, 512 tokens per input (longer text is truncated), and throughput is whatever
+the embedder's CPUs give: scale the embedder out for large backfills.
+
+## 2026-10-12 — Console and CLI (FR-O3)
+
+`tests/console.sh` passes. Operators get three things, all over the same admin API:
+
+- **`/v1/admin/*` on the HTTP API** (`services/api/src/admin.rs`): overview, one projection in
+  full, audit, repair, proposals (mine, accept, reject, route), routes on/off, the shard advisor,
+  attachments and the event log. The SQL behind it lives in the extension
+  (`isomer.admin_overview()`, `admin_projection()`, `admin_projections()`, isomer 0.10.0), so it
+  can be checked from psql and the API stays a thin layer.
+- **`isomer`, the CLI** (`clients/cli`, Node 20+, no runtime dependencies): `status`, `watch`,
+  `projection`, `drift`, `alerts`, `audit`, `proposals`, `accept`, `route`, `routes`, `advice`,
+  `attachments`, `events`, `get`. `--json` everywhere. Exit codes carry the outcome (`status` and
+  `drift` exit 1 while something is wrong, 75 for "not yet"), so it slots into scripts and health
+  checks.
+- **The console** (`clients/console`, Preact, served at `/console`): every projection as a row
+  whose lag travels toward its budget mark, drift counters, grouped alerts, a lag sparkline per
+  projection, proposals with accept/reject/route, the advisor, routes, attachments and events.
+  It loads no fonts or scripts from elsewhere, so it works air-gapped.
+
+Access: a key may use the admin API only if its role is a member of the new `isomer_admin` role.
+API keys never act as a superuser (that was already enforced by `create_api_key`), so membership
+is the only way in. Keys for other roles get 403 from `/v1/admin/*` and keep their projection reads.
+
+Things that bit us:
+
+- **`isomer.repair` re-derives only the keys the auditor found drifted,** not the whole
+  projection. The first labels said "re-derive every key"; the console and CLI now say "repair
+  drifted keys".
+- **`coalesce($1, 0)` makes Postgres type `$1` as `integer`,** and tokio-postgres then refuses to
+  bind an `i64`, which the API reported as "database unavailable". Cast parameters explicitly.
+- **Routing a proposal builds its own cache projection** (`route_<id>`) and points the proposal at
+  it, and keeps the route disabled when the measured speedup is under
+  `isomer.routing_min_speedup`. The console's routes page shows those and lets an operator turn
+  them on anyway.
+- **The event log repeats.** `isomer.alerts` includes every warning from the last 15 minutes, so a
+  projection that breached its budget a few times listed each one. The console groups alerts by
+  kind and subject with a count.
+
+## 2026-10-12 — Read-your-writes without calling wait_for (FR-R4, FR-R4a, FR-R5)
+
+`tests/freshness.sh` passes, five runs in a row. It closes the read-your-writes gaps the Phase 2
+notes left open:
+
+- **`SET isomer.read_after = <token>` works on plain SQL reads.** `isomer_router` now also hooks
+  the executor. A top-level SELECT that reads a projection waits, through `isomer.wait_for`, until
+  that projection reflects the token, or fails with IS001 ("not yet") after
+  `isomer.read_after_timeout` (5s). Reads that touch no projection never wait. `SET LOCAL` works,
+  so transaction-mode PgBouncer is fine. `isomer.get` and `isomer.cache_get` honour it as well.
+- **MongoDB responses carry cluster time.** Writes return `operationTime` and `$clusterTime`
+  (the cluster clock after the write). Reads of a projection return `operationTime` set to
+  `isomer.freshness`: the newest token the projection reflects, which is the read's freshness.
+- **Implicit causal reads** (`ISOMER_IMPLICIT_CAUSAL=1` on the gateway). A projection read that
+  carries `$clusterTime` but no `afterClusterTime` waits for it. `$clusterTime` is only returned on
+  writes, so a client's gossiped time is advanced by its own writes and nothing else.
+
+Things that bit us:
+
+- **Under READ COMMITTED the statement snapshot is taken before the executor starts.** Waiting in
+  ExecutorStart and then reading with that snapshot returns the stale row: the test that resumes
+  draining two seconds into a read caught exactly that when the fix was disabled. After a wait the
+  hook unregisters the query's snapshot and registers a fresh one; `PortalRunSelect` pushes
+  `queryDesc->snapshot`, so the run uses it. Only top-level statements wait (executor nesting is
+  tracked), and never in REPEATABLE READ, which `wait_for` refuses with a reason.
+- **Which relations are a projection.** Plan permission entries cover views and the tables under
+  them, so the map (`isomer._projection_relations()`, loaded as the bootstrap superuser and cached
+  for two seconds) lists each projection's view, its storage table and any native view.
+  `documentdb_api.collection(db, name)` has no relation; the hook matches its constant arguments,
+  and waits for every projection when they aren't constants.
+- **`isomer.get` and `cache_get` were STABLE,** so their reads ran on the caller's snapshot.
+  They are VOLATILE now and wait inside, before reading.
+- **The Node driver only gossips a session's cluster time on a connection that holds one
+  itself** (`prepareCommand`: `let a = this.clusterTime`, then the session's time if larger). A
+  pooled connection that never saw a write sent nothing, so implicit reads passed or failed
+  depending on the connection. In implicit mode the hello handshake now returns a zero
+  `$clusterTime`, which starts every connection's clock without making anything wait.
+- **The gateway's error-code proc macro bakes in `CARGO_MANIFEST_DIR`.** After the move out of
+  `vendor/`, a cached build looked for the CSV at the old path; `cargo clean -p documentdb_macros`.
+
+Limits:
+
+- Implicit causal mode guarantees read-your-writes within a driver session. A read on an implicit
+  session that lands on a connection which never carried the write's cluster time does not wait.
+- The token is a single scalar, so a read waits for every change up to it on that projection, not
+  only the caller's own.
+
 ## 2026-10-11 — Kubernetes operator on kind
 
 `tests/operator.sh` passes on a local kind cluster (Kubernetes 1.36), with nothing spent on cloud
@@ -527,7 +1634,7 @@ Things that bit us:
   pg_trickle defaults to statement-level, origin-only CDC triggers, so its stream tables silently
   went stale over attached tables (2m48s stale in our first test). Fixed with
   `pg_trickle.cdc_trigger_mode = 'row'` plus a patch that creates its triggers `ENABLE ALWAYS`
-  (see `vendor/README.md`).
+  (see "Upstream code in `extensions/`" above).
 - **Patching pg_trickle's trigger creation in the wrong place broke it.** Running `ALTER TABLE`
   before pg_trickle records the source in `pgt_change_tracking` sends its own DDL hook looking for
   a buffer under the wrong name. Its DDL tracker also suspends every stream table on a source for
@@ -588,8 +1695,8 @@ What we found along the way:
   starts cleanly afterwards.
 - **No `rum` package exists for PG 18.** DocumentDB uses its own `pg_documentdb_extended_rum`, set by
   `documentdb.rum_library_load_option` and `documentdb.alternate_index_handler_name`.
-- **DocumentDB version choice.** We vendored the latest stable, v0.117-0. v1.0-RC2 was published
-  on 9 Oct 2026. Re-vendor before we start modifying the gateway, so our changes sit on 1.0.
+- **DocumentDB version choice.** We imported the latest stable, v0.117-0. v1.0-RC2 was published
+  on 9 Oct 2026. Re-import before we start modifying the gateway, so our changes sit on 1.0.
 - **Disk.** A cold build needs roughly 10–15 GB of Docker space (Rust toolchains plus three
   compiles). The first attempt failed because the Mac's disk was full, which left Docker's VM
   read-only until Docker Desktop was force-restarted.

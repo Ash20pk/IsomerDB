@@ -1,6 +1,8 @@
-//! Embedding providers: any OpenAI-compatible endpoint, and a deterministic local test embedder.
+//! Embedding providers: any OpenAI-compatible endpoint, a model run on the embedder's own CPU
+//! (`local`), and a deterministic test embedder (`local-hash`).
 
 use std::fmt;
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use serde::Deserialize;
@@ -16,6 +18,10 @@ pub struct Model {
     pub max_batch_items: i64,
     pub requests_per_min: f64,
     pub tokens_per_min: f64,
+    /// Large backfills go through the provider's Batch API.
+    pub batch_api: bool,
+    /// A backfill at least this large is left to a batch.
+    pub batch_min_items: i64,
 }
 
 pub struct EmbedResult {
@@ -47,6 +53,7 @@ impl fmt::Display for EmbedError {
 pub async fn embed(http: &reqwest::Client, model: &Model, inputs: &[&str]) -> Result<EmbedResult, EmbedError> {
     let result = match model.provider.as_str() {
         "openai" => openai(http, model, inputs).await?,
+        "local" => local(model, inputs).await?,
         "local-hash" => EmbedResult {
             vectors: inputs.iter().map(|i| local_hash(i, model.dimensions)).collect(),
             tokens: None,
@@ -69,6 +76,33 @@ pub async fn embed(http: &reqwest::Client, model: &Model, inputs: &[&str]) -> Re
         )));
     }
     Ok(result)
+}
+
+fn local_models() -> &'static crate::local::LocalModels {
+    static MODELS: OnceLock<crate::local::LocalModels> = OnceLock::new();
+    MODELS.get_or_init(Default::default)
+}
+
+/// Run the model on a blocking thread: inference is CPU-bound and would stall the async workers.
+async fn local(model: &Model, inputs: &[&str]) -> Result<EmbedResult, EmbedError> {
+    let dir = crate::local::model_dir(&model.model);
+    let owned: Vec<String> = inputs.iter().map(|s| (*s).to_owned()).collect();
+    let (name, dims) = (model.name.clone(), model.dimensions);
+    let (vectors, tokens) = tokio::task::spawn_blocking(move || {
+        let m = local_models().get(&dir).map_err(|e| EmbedError::Permanent(format!("{e:#}")))?;
+        if m.dimensions != dims {
+            return Err(EmbedError::Permanent(format!(
+                "model {name} is registered with {dims} dimensions, but {} produces {}",
+                dir.display(),
+                m.dimensions
+            )));
+        }
+        let refs: Vec<&str> = owned.iter().map(String::as_str).collect();
+        m.embed(&refs).map_err(|e| EmbedError::Transient(format!("{e:#}")))
+    })
+    .await
+    .map_err(|e| EmbedError::Transient(format!("local model task: {e}")))??;
+    Ok(EmbedResult { vectors, tokens: Some(tokens) })
 }
 
 #[derive(Deserialize)]
@@ -128,7 +162,7 @@ async fn openai(http: &reqwest::Client, model: &Model, inputs: &[&str]) -> Resul
     })
 }
 
-fn truncate(s: &str) -> String {
+pub fn truncate(s: &str) -> String {
     s.chars().take(300).collect()
 }
 

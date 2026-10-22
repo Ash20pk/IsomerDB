@@ -1,0 +1,40 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: controlplane
+spec:
+  selector: {app: controlplane}
+  ports: [{port: 8095}]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: controlplane
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: controlplane}
+  template:
+    metadata:
+      labels: {app: controlplane}
+    spec:
+      serviceAccountName: controlplane
+      containers:
+        - name: controlplane
+          image: isomerdb-controlplane:dev
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: CP_DATABASE_URL
+              valueFrom: {secretKeyRef: {name: controlplane, key: database-url}}
+            - name: CP_ADMIN_TOKEN
+              valueFrom: {secretKeyRef: {name: controlplane, key: admin-token}}
+            - {name: CP_CONFIG, value: /etc/isomerdb-cloud/config.json}
+            - {name: CP_COLLECT_EVERY, value: 5m}
+          ports: [{containerPort: 8095}]
+          readinessProbe:
+            httpGet: {path: /healthz, port: 8095}
+            periodSeconds: 5
+          volumeMounts: [{name: config, mountPath: /etc/isomerdb-cloud}]
+      volumes:
+        - name: config
+          configMap: {name: controlplane-config}

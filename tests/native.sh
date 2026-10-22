@@ -48,7 +48,18 @@ CREATE UNIQUE INDEX ON shopn.customer_card (id);
 SQL
 )
 contains "the unique index registers the projection" "document projection customer_card: 2 documents" "$out"
-contains "an unconnected table is treated as a lookup, with a notice" "shopn.plans treated as lookup" "$out"
+contains "its correlated subqueries are maintained incrementally, by the cost model's choice" "maintained incrementally" "$out"
+out=$($ISO 2>&1 <<'SQL'
+SET client_min_messages = notice;
+CREATE MATERIALIZED VIEW shopn.customer_plan USING isomer_bounded AS
+  SELECT c.id, jsonb_build_object('discount', (SELECT p.discount FROM shopn.plans p WHERE p.tier = c.tier)) AS doc
+  FROM shopn.customers c;
+COMMENT ON MATERIALIZED VIEW shopn.customer_plan IS 'isomer {"strategy": "recompute"}';
+CREATE UNIQUE INDEX ON shopn.customer_plan (id);
+SQL
+)
+contains "maintained by key, an unconnected table is treated as a lookup, with a notice" "shopn.plans treated as lookup" "$out"
+$ISO -c "DROP MATERIALIZED VIEW shopn.customer_plan" >/dev/null
 expect "freshness comes from the access method, lag from the comment" "bounded|00:00:03" \
   "$($ISO -c "SELECT freshness || '|' || lag_budget FROM isomer.projections WHERE name = 'customer_card'")"
 expect "mappings: inferred through joins, overridden by the comment, lookup for the rest" \

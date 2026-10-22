@@ -21,6 +21,8 @@ CREATE EXTENSION IF NOT EXISTS pg_trickle CASCADE;
 GRANT USAGE ON SCHEMA documentdb_core, documentdb_api_catalog, documentdb_api, documentdb_api_internal TO PUBLIC;
 CREATE EXTENSION IF NOT EXISTS dblink;
 CREATE EXTENSION IF NOT EXISTS pg_stat_statements;
+-- Columnar storage, for analytics projections.
+CREATE EXTENSION IF NOT EXISTS citus_columnar;
 -- Workers run IsomerDB's capture triggers on their shards and queue keys locally; the
 -- coordinator pulls the queues and does all the scheduled work.
 CREATE EXTENSION IF NOT EXISTS isomer;
@@ -49,6 +51,8 @@ GRANT USAGE ON SCHEMA documentdb_core, documentdb_api_catalog, documentdb_api, d
 
 CREATE EXTENSION IF NOT EXISTS dblink;
 CREATE EXTENSION IF NOT EXISTS pg_stat_statements;
+-- Columnar storage, for analytics projections.
+CREATE EXTENSION IF NOT EXISTS citus_columnar;
 CREATE EXTENSION IF NOT EXISTS isomer;
 -- Bounded projections are drained every second; attachments are health-checked every 10s.
 SELECT cron.schedule('isomer-drain', '1 seconds', 'SELECT isomer.drain()') WHERE citus_is_coordinator();

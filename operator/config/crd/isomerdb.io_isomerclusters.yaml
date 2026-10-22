@@ -198,6 +198,58 @@ spec:
                 required:
                 - enabled
                 type: object
+              backup:
+                description: |-
+                  Backup archives every node's WAL continuously and takes base backups, to S3-compatible
+                  storage, and creates cluster-consistent restore points.
+                properties:
+                  fullEvery:
+                    default: 24h
+                    description: FullEvery is how often each node takes a full base
+                      backup; WAL is archived continuously.
+                    type: string
+                  restorePointEvery:
+                    default: 15m
+                    description: RestorePointEvery is how often a cluster-consistent
+                      restore point is created.
+                    type: string
+                  retain:
+                    default: 7
+                    description: Retain is how many full backups each node keeps (and
+                      the WAL needed by them).
+                    format: int32
+                    minimum: 1
+                    type: integer
+                  s3:
+                    description: S3Spec is a location in S3-compatible storage.
+                    properties:
+                      bucket:
+                        type: string
+                      credentialsSecret:
+                        description: CredentialsSecret holds access-key-id and secret-access-key.
+                        type: string
+                      endpoint:
+                        description: Endpoint for S3-compatible stores (MinIO, R2,
+                          GCS interoperability); empty for AWS.
+                        type: string
+                      forcePathStyle:
+                        description: ForcePathStyle addresses buckets as <endpoint>/<bucket>
+                          (MinIO needs it).
+                        type: boolean
+                      prefix:
+                        description: Prefix inside the bucket; defaults to <namespace>/<cluster
+                          name>.
+                        type: string
+                      region:
+                        default: us-east-1
+                        type: string
+                    required:
+                    - bucket
+                    - credentialsSecret
+                    type: object
+                required:
+                - s3
+                type: object
               deleteVolumes:
                 description: |-
                   DeleteVolumes removes the data volumes when the IsomerCluster is deleted. Off by default:
@@ -478,6 +530,36 @@ spec:
                 required:
                 - enabled
                 type: object
+              ha:
+                description: HA runs a streaming standby beside the coordinator and
+                  every worker, and fails over to it.
+                properties:
+                  failoverAfter:
+                    default: 30s
+                    description: FailoverAfter is how long a primary may be unready
+                      before its standby is promoted.
+                    type: string
+                  maxRetainedWAL:
+                    default: 4GB
+                    description: |-
+                      MaxRetainedWAL caps the WAL a primary keeps for a disconnected standby. Past it, the
+                      standby's slot is invalidated and the operator re-clones the standby.
+                    type: string
+                  standbys:
+                    description: |-
+                      Standbys per node: 0 (no standbys) or 1. Each standby streams from its node's primary and
+                      takes over when the primary stays unready for FailoverAfter.
+                    format: int32
+                    maximum: 1
+                    minimum: 0
+                    type: integer
+                  synchronous:
+                    description: |-
+                      Synchronous makes every commit wait until its node's standby has the WAL, so a failover
+                      loses nothing. Writes then stop while a standby is down. Off by default (asynchronous: a
+                      failover can lose the last moments of commits).
+                    type: boolean
+                type: object
               image:
                 default: isomerdb:dev
                 description: Image of the database (Postgres + Citus + DocumentDB
@@ -546,6 +628,54 @@ spec:
                       More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/
                     type: object
                 type: object
+              restore:
+                description: |-
+                  Restore builds this cluster from another cluster's backups, as of one of its restore
+                  points. Used when the cluster is created; set Workers to the source cluster's count.
+                properties:
+                  credentialsSecret:
+                    description: |-
+                      CredentialsSecret holds the source cluster's passwords (its <name>-credentials Secret,
+                      copied here): the restored data carries them.
+                    type: string
+                  from:
+                    description: From is the source cluster's backup store (its spec.backup.s3,
+                      with its prefix).
+                    properties:
+                      bucket:
+                        type: string
+                      credentialsSecret:
+                        description: CredentialsSecret holds access-key-id and secret-access-key.
+                        type: string
+                      endpoint:
+                        description: Endpoint for S3-compatible stores (MinIO, R2,
+                          GCS interoperability); empty for AWS.
+                        type: string
+                      forcePathStyle:
+                        description: ForcePathStyle addresses buckets as <endpoint>/<bucket>
+                          (MinIO needs it).
+                        type: boolean
+                      prefix:
+                        description: Prefix inside the bucket; defaults to <namespace>/<cluster
+                          name>.
+                        type: string
+                      region:
+                        default: us-east-1
+                        type: string
+                    required:
+                    - bucket
+                    - credentialsSecret
+                    type: object
+                  restorePoint:
+                    description: |-
+                      RestorePoint is the name of one of the source's restore points (isomer.restore_points, or
+                      status.lastRestorePoint on the source).
+                    type: string
+                required:
+                - credentialsSecret
+                - from
+                - restorePoint
+                type: object
               storage:
                 anyOf:
                 - type: integer
@@ -572,6 +702,12 @@ spec:
           status:
             description: IsomerClusterStatus is what the operator last observed.
             properties:
+              certificatesIssuedAt:
+                description: |-
+                  CertificatesIssuedAt is when the node certificates were last issued. Nodes reload their
+                  configuration for a few minutes afterwards, as the new files reach their volumes.
+                format: date-time
+                type: string
               conditions:
                 items:
                   description: Condition contains details for one aspect of the current
@@ -642,15 +778,74 @@ spec:
                   postgres:
                     type: string
                 type: object
+              groups:
+                description: 'Groups: each node group''s primary and standby.'
+                items:
+                  description: 'GroupStatus is one node group: a primary and, with
+                    spec.ha, its standby.'
+                  properties:
+                    name:
+                      description: 'Name: coordinator-0, worker-0, worker-1, ...'
+                      type: string
+                    primary:
+                      description: Primary is the pod that is the group's primary.
+                      type: string
+                    replayLagBytes:
+                      description: ReplayLagBytes is how far the standby's replay
+                        is behind the primary.
+                      format: int64
+                      type: integer
+                    standby:
+                      description: Standby is the pod that follows it, if any.
+                      type: string
+                    standbyStreaming:
+                      description: 'StandbyStreaming: the standby is connected and
+                        replaying the primary''s WAL.'
+                      type: boolean
+                  required:
+                  - name
+                  - primary
+                  type: object
+                type: array
               isomerVersion:
                 description: IsomerVersion is the isomer extension version on the
                   coordinator.
                 type: string
+              lastFailover:
+                description: LastFailover is the last standby promotion, planned or
+                  not.
+                properties:
+                  at:
+                    format: date-time
+                    type: string
+                  from:
+                    type: string
+                  group:
+                    type: string
+                  reason:
+                    type: string
+                  to:
+                    type: string
+                required:
+                - at
+                - from
+                - group
+                - reason
+                - to
+                type: object
               lastRepairedJob:
                 description: LastRepairedJob is the last rebalance job after which
                   capture triggers were re-checked.
                 format: int64
                 type: integer
+              lastRestorePoint:
+                description: LastRestorePoint is the newest restore point the operator
+                  created.
+                type: string
+              lastRestorePointAt:
+                description: LastRestorePointAt is when it was created.
+                format: date-time
+                type: string
               observedGeneration:
                 format: int64
                 type: integer
@@ -665,6 +860,10 @@ spec:
                 description: Rebalance is the state of the last Citus rebalance job,
                   if any.
                 type: string
+              restored:
+                description: Restored is set once a restore has finished and Citus
+                  points at this cluster's nodes.
+                type: boolean
               workers:
                 items:
                   description: WorkerStatus is one worker node as the cluster sees

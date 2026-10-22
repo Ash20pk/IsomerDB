@@ -12,5 +12,6 @@ RUN --mount=type=cache,target=/go/pkg/mod --mount=type=cache,target=/root/.cache
 
 FROM gcr.io/distroless/static-debian12:nonroot
 COPY --from=build /operator /operator
+COPY LICENSE /usr/share/doc/isomerdb/LICENSE
 USER 65532:65532
 ENTRYPOINT ["/operator"]

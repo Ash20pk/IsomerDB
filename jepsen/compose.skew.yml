@@ -1,0 +1,14 @@
+# Runs the coordinator and both workers on the libfaketime image, so the Jepsen nemesis can skew
+# their clocks (tests/jepsen.sh with SKEW=1 adds it). They start as postgres: libfaketime's first
+# process creates a semaphore that every later one opens, and one created by root (the image's
+# usual entrypoint steps) would be closed to the server.
+services:
+  db:
+    image: isomerdb:skew
+    user: postgres
+  worker1:
+    image: isomerdb:skew
+    user: postgres
+  worker2:
+    image: isomerdb:skew
+    user: postgres

@@ -2,7 +2,9 @@ package controller
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -13,12 +15,15 @@ type citus struct {
 	conn *pgx.Conn
 }
 
-func connectCoordinator(ctx context.Context, host, password string) (*citus, error) {
-	cfg, err := pgx.ParseConfig(fmt.Sprintf("host=%s port=5432 user=postgres dbname=postgres sslmode=disable connect_timeout=5", host))
+// connectCoordinator connects as postgres over TLS, verifying the coordinator's certificate.
+func connectCoordinator(ctx context.Context, host, password string, tlsConfig *tls.Config) (*citus, error) {
+	cfg, err := pgx.ParseConfig(fmt.Sprintf("host=%s port=5432 user=postgres dbname=postgres connect_timeout=5", host))
 	if err != nil {
 		return nil, err
 	}
 	cfg.Password = password
+	cfg.TLSConfig = tlsConfig
+	cfg.Fallbacks = nil
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 	conn, err := pgx.ConnectConfig(ctx, cfg)
@@ -121,4 +126,164 @@ func (c *citus) repairAfterRebalance(ctx context.Context) (int, error) {
 	var n int
 	err := c.conn.QueryRow(ctx, `SELECT count(*) FROM isomer.rebalance_finished()`).Scan(&n)
 	return n, err
+}
+
+func (c *citus) reload(ctx context.Context) error {
+	_, err := c.conn.Exec(ctx, `SELECT pg_reload_conf()`)
+	return err
+}
+
+// reloadAll reloads configuration (and TLS files) on the coordinator and every worker.
+func (c *citus) reloadAll(ctx context.Context) error {
+	_, err := c.conn.Exec(ctx, `SELECT pg_reload_conf(); SELECT run_command_on_workers('SELECT pg_reload_conf()')`)
+	return err
+}
+
+// ── high availability (on individual nodes) ─────────────────────────────────
+
+// waitReplayed waits, on a standby whose primary has shut down, until it has replayed everything
+// it received and its WAL receiver has stopped.
+func (c *citus) waitReplayed(ctx context.Context, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	for {
+		var done bool
+		err := c.conn.QueryRow(ctx, `
+			SELECT pg_last_wal_receive_lsn() IS NOT NULL
+			   AND pg_last_wal_replay_lsn() >= pg_last_wal_receive_lsn()
+			   AND NOT EXISTS (SELECT 1 FROM pg_stat_wal_receiver WHERE status = 'streaming')`).Scan(&done)
+		if err != nil {
+			return err
+		}
+		if done {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("standby did not finish replaying within %s", timeout)
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+}
+
+func (c *citus) promote(ctx context.Context) error {
+	var ok bool
+	if err := c.conn.QueryRow(ctx, `SELECT pg_promote(true, 60)`).Scan(&ok); err != nil {
+		return err
+	}
+	if !ok {
+		return fmt.Errorf("pg_promote did not finish within 60s")
+	}
+	return nil
+}
+
+func (c *citus) setCoordinatorHost(ctx context.Context, host string) error {
+	_, err := c.conn.Exec(ctx, `SELECT citus_set_coordinator_host($1, 5432)`, host)
+	return err
+}
+
+// updateNode repoints a worker's metadata from its old primary to the promoted standby.
+func (c *citus) updateNode(ctx context.Context, oldHost, newHost string) error {
+	_, err := c.conn.Exec(ctx, `
+		SELECT citus_update_node(nodeid, $2, 5432, true)
+		FROM pg_dist_node WHERE nodename = $1 AND nodeport = 5432`, oldHost, newHost)
+	return err
+}
+
+// dropOtherSlots drops inactive physical slots of standbys that are no longer this node's.
+func (c *citus) dropOtherSlots(ctx context.Context, keep string) error {
+	_, err := c.conn.Exec(ctx, `
+		SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots
+		WHERE slot_type = 'physical' AND NOT active AND slot_name <> $1
+		  AND slot_name ~ '_(coordinator|worker)(_replica)?_[0-9]+$'`, keep)
+	return err
+}
+
+func (c *citus) dropSlot(ctx context.Context, slot string) error {
+	_, err := c.conn.Exec(ctx, `
+		SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots WHERE slot_name = $1 AND NOT active`, slot)
+	return err
+}
+
+// replicationOf reports a standby's slot on this primary.
+func (c *citus) replicationOf(ctx context.Context, slot string) (replication, error) {
+	var r replication
+	err := c.conn.QueryRow(ctx, `
+		SELECT coalesce(s.wal_status = 'lost', false), coalesce(rep.state = 'streaming', false),
+		       coalesce(pg_wal_lsn_diff(pg_current_wal_lsn(), rep.replay_lsn), 0)::bigint
+		FROM pg_replication_slots s LEFT JOIN pg_stat_replication rep ON rep.pid = s.active_pid
+		WHERE s.slot_name = $1`, slot).Scan(&r.slotLost, &r.streaming, &r.lagBytes)
+	if err == pgx.ErrNoRows {
+		return replication{}, nil
+	}
+	return r, err
+}
+
+// replicationSettings sets a primary's WAL retention for standbys and its synchronous standby
+// (by application_name, which is the standby's slot name; "" for asynchronous), reloading only
+// when something changed.
+func (c *citus) replicationSettings(ctx context.Context, maxRetainedWAL, syncStandby string) error {
+	var changed bool
+	err := c.conn.QueryRow(ctx, `
+		SELECT current_setting('max_slot_wal_keep_size') <> pg_size_pretty(pg_size_bytes($1))
+		    OR current_setting('synchronous_standby_names') <> $2`, maxRetainedWAL, syncStandby).Scan(&changed)
+	if err != nil || !changed {
+		return err
+	}
+	if _, err := c.conn.Exec(ctx, fmt.Sprintf(`ALTER SYSTEM SET max_slot_wal_keep_size = '%s'`, escapeLiteral(maxRetainedWAL))); err != nil {
+		return err
+	}
+	if _, err := c.conn.Exec(ctx, fmt.Sprintf(`ALTER SYSTEM SET synchronous_standby_names = '%s'`, escapeLiteral(syncStandby))); err != nil {
+		return err
+	}
+	_, err = c.conn.Exec(ctx, `SELECT pg_reload_conf()`)
+	return err
+}
+
+func escapeLiteral(s string) string { return strings.ReplaceAll(s, "'", "''") }
+
+// coordinatorHost is the coordinator's own entry in pg_dist_node ("" if it has none).
+func (c *citus) coordinatorHost(ctx context.Context) (string, error) {
+	var host string
+	err := c.conn.QueryRow(ctx, `SELECT nodename FROM pg_dist_node WHERE groupid = 0`).Scan(&host)
+	if err == pgx.ErrNoRows {
+		return "", nil
+	}
+	return host, err
+}
+
+// syncMetadata brings every metadata node's copy of the metadata up to date.
+func (c *citus) syncMetadata(ctx context.Context) error {
+	_, err := c.conn.Exec(ctx, `SELECT start_metadata_sync_to_all_nodes()`)
+	return err
+}
+
+// createRestorePoint makes a cluster-consistent restore point (isomer.create_restore_point).
+func (c *citus) createRestorePoint(ctx context.Context) (string, error) {
+	var name string
+	err := c.conn.QueryRow(ctx, `SELECT isomer.create_restore_point()`).Scan(&name)
+	return name, err
+}
+
+// staleExtensions: installed extensions whose version is older than the one the image provides.
+func (c *citus) staleExtensions(ctx context.Context) (map[string]bool, error) {
+	rows, err := c.conn.Query(ctx, `
+		SELECT e.extname FROM pg_extension e JOIN pg_available_extensions a ON a.name = e.extname
+		WHERE a.default_version IS NOT NULL AND e.extversion <> a.default_version`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]bool{}
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return nil, err
+		}
+		out[name] = true
+	}
+	return out, rows.Err()
+}
+
+func (c *citus) updateExtension(ctx context.Context, name string) error {
+	_, err := c.conn.Exec(ctx, fmt.Sprintf(`ALTER EXTENSION %q UPDATE`, name))
+	return err
 }

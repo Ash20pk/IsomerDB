@@ -11,6 +11,17 @@
  * isomer.routing_min_speedup = 1.2     (routes measured below this are ignored)
  *
  * Routes are cached per backend and reloaded every two seconds.
+ *
+ * It also honours read-your-writes tokens on plain SQL reads (PRD FR-R4). With
+ *
+ *   SET isomer.read_after = <token>     (from isomer.last_write_token(); '' turns it off)
+ *   SET isomer.read_after_timeout = 5s
+ *
+ * a top-level SELECT that reads a projection first waits, through isomer.wait_for(), until that
+ * projection reflects the token, then runs with a snapshot taken after the wait. Under READ
+ * COMMITTED the statement's snapshot is taken before the executor starts, so without the fresh
+ * snapshot the read would not see what it waited for. A projection known to have reached a token
+ * is not waited on again for that token in this backend.
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
@@ -42,7 +53,11 @@
 #include "utils/timestamp.h"
 #include "utils/syscache.h"
 #include "utils/catcache.h"
+#include "utils/rel.h"
+#include "utils/relcache.h"
+#include "commands/trigger.h"
 #include "catalog/pg_proc.h"
+#include "catalog/pg_type_d.h"
 #include "funcapi.h"
 
 PG_MODULE_MAGIC;
@@ -75,6 +90,41 @@ static int64 shadow_matches = 0;
 static int64 routed_count = 0;
 
 static planner_hook_type prev_planner_hook = NULL;
+static int	exec_nesting = 0;		/* executor depth: > 0 inside another statement */
+
+/* read-your-writes on SQL reads */
+static char *read_after = NULL;
+static int	read_after_timeout_ms = 5000;
+static ExecutorStart_hook_type prev_ExecutorStart = NULL;
+static ExecutorRun_hook_type prev_ExecutorRun = NULL;
+static ExecutorFinish_hook_type prev_ExecutorFinish = NULL;
+static bool in_wait = false;
+
+typedef struct ProjectionRel
+{
+	Oid			relid;			/* hash key */
+	char		projection[NAMEDATALEN];
+} ProjectionRel;
+
+typedef struct ProjectionCollection
+{
+	char	   *database;
+	char	   *collection;
+	char	   *projection;
+} ProjectionCollection;
+
+typedef struct Reached
+{
+	char		projection[NAMEDATALEN];	/* hash key */
+	int64		token;
+} Reached;
+
+static HTAB *projection_rels = NULL;
+static List *projection_collections = NIL;
+static MemoryContext projection_cxt = NULL;
+static TimestampTz projection_rels_loaded_at = 0;
+static bool projection_rels_ok = false;
+static HTAB *reached = NULL;
 
 void _PG_init(void);
 static Oid get_func_oid_simple(const char *nsp, const char *name);
@@ -257,8 +307,15 @@ isomer_planner(Query *parse, const char *query_string, int cursorOptions, ParamL
 	Route	   *route;
 	int64		qid = parse->queryId;
 
-	if (routing_mode == ROUTING_OFF || in_router || parse->commandType != CMD_SELECT || qid == 0
-		|| !IsTransactionState() || IsInParallelMode())
+	/*
+	 * Only top-level statements are routed: routes are for application queries. Statements run
+	 * inside another (a trigger's, a function's) are planned as written. Loading routes there
+	 * would also open a subtransaction in the middle of the outer statement, which Citus mirrors
+	 * as a SAVEPOINT on every open worker connection, failing while those are busy (a multi-shard
+	 * COPY firing triggers on the coordinator's own shards).
+	 */
+	if (routing_mode == ROUTING_OFF || in_router || exec_nesting > 0 || parse->commandType != CMD_SELECT
+		|| qid == 0 || !IsTransactionState() || IsInParallelMode())
 		return next_planner(parse, query_string, cursorOptions, boundParams);
 
 	if (routes == NULL || TimestampDifferenceExceeds(routes_loaded_at, GetCurrentTimestamp(), 2000))
@@ -368,6 +425,439 @@ isomer_planner(Query *parse, const char *query_string, int cursorOptions, ParamL
 	}
 }
 
+/*
+ * Load which relations (and documentdb_api.collection() arguments) belong to which projection,
+ * through isomer._projection_relations(), as the bootstrap superuser. On failure the map is marked
+ * unusable, and reads wait for every projection instead: never less than asked for.
+ */
+static void
+load_projection_rels(void)
+{
+	HASHCTL		ctl;
+	MemoryContext caller_cxt = CurrentMemoryContext;
+	ResourceOwner caller_owner = CurrentResourceOwner;
+	Oid			save_userid;
+	int			save_sec;
+
+	if (projection_cxt == NULL)
+		projection_cxt = AllocSetContextCreate(TopMemoryContext, "isomer_router projections",
+											   ALLOCSET_SMALL_SIZES);
+	else
+		MemoryContextReset(projection_cxt);
+	projection_collections = NIL;
+
+	memset(&ctl, 0, sizeof(ctl));
+	ctl.keysize = sizeof(Oid);
+	ctl.entrysize = sizeof(ProjectionRel);
+	ctl.hcxt = projection_cxt;
+	projection_rels = hash_create("isomer_router projections", 64, &ctl,
+								  HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+	projection_rels_loaded_at = GetCurrentTimestamp();
+	projection_rels_ok = false;
+
+	GetUserIdAndSecContext(&save_userid, &save_sec);
+	BeginInternalSubTransaction(NULL);
+	MemoryContextSwitchTo(caller_cxt);
+	PG_TRY();
+	{
+		SetUserIdAndSecContext(BOOTSTRAP_SUPERUSERID, save_sec | SECURITY_LOCAL_USERID_CHANGE);
+		if (OidIsValid(get_func_oid_simple("isomer", "_projection_relations"))
+			&& SPI_connect() == SPI_OK_CONNECT)
+		{
+			bool		pushed = false;
+
+			if (!ActiveSnapshotSet())
+			{
+				PushActiveSnapshot(GetTransactionSnapshot());
+				pushed = true;
+			}
+			if (SPI_execute("SELECT relid, projection, mongo_database, collection FROM isomer._projection_relations()",
+							true, 0) == SPI_OK_SELECT)
+			{
+				for (uint64 i = 0; i < SPI_processed; i++)
+				{
+					HeapTuple	tup = SPI_tuptable->vals[i];
+					TupleDesc	desc = SPI_tuptable->tupdesc;
+					bool		isnull;
+					Datum		relid = SPI_getbinval(tup, desc, 1, &isnull);
+					char	   *projection = SPI_getvalue(tup, desc, 2);
+					MemoryContext old = MemoryContextSwitchTo(projection_cxt);
+
+					if (!isnull)
+					{
+						Oid			oid = DatumGetObjectId(relid);
+						ProjectionRel *r = (ProjectionRel *) hash_search(projection_rels, &oid, HASH_ENTER, NULL);
+
+						strlcpy(r->projection, projection, NAMEDATALEN);
+					}
+					else
+					{
+						ProjectionCollection *c = palloc(sizeof(ProjectionCollection));
+
+						c->database = pstrdup(SPI_getvalue(tup, desc, 3));
+						c->collection = pstrdup(SPI_getvalue(tup, desc, 4));
+						c->projection = pstrdup(projection);
+						projection_collections = lappend(projection_collections, c);
+					}
+					MemoryContextSwitchTo(old);
+				}
+				projection_rels_ok = true;
+			}
+			if (pushed)
+				PopActiveSnapshot();
+			SPI_finish();
+		}
+		else
+			projection_rels_ok = true;	/* no extension in this database: no projections */
+		SetUserIdAndSecContext(save_userid, save_sec);
+		ReleaseCurrentSubTransaction();
+		MemoryContextSwitchTo(caller_cxt);
+		CurrentResourceOwner = caller_owner;
+	}
+	PG_CATCH();
+	{
+		ErrorData  *edata;
+
+		SetUserIdAndSecContext(save_userid, save_sec);
+		MemoryContextSwitchTo(caller_cxt);
+		edata = CopyErrorData();
+		FlushErrorState();
+		RollbackAndReleaseCurrentSubTransaction();
+		MemoryContextSwitchTo(caller_cxt);
+		CurrentResourceOwner = caller_owner;
+		projection_collections = NIL;
+		ereport(WARNING, (errmsg("isomer_router: could not load projections; isomer.read_after waits for all of them: %s",
+								 edata->message)));
+		FreeErrorData(edata);
+	}
+	PG_END_TRY();
+}
+
+static const char *
+const_text(Node *node)
+{
+	if (node && IsA(node, Const) && !((Const *) node)->constisnull
+		&& ((Const *) node)->consttype == TEXTOID)
+		return TextDatumGetCString(((Const *) node)->constvalue);
+	return NULL;
+}
+
+/*
+ * The projections a plan reads: its relations (permission entries cover views as well as the
+ * tables under them), plus documentdb_api.collection(db, name) scans. *all is set when one can't
+ * be told apart (a collection() call with non-constant arguments, or an unusable map).
+ */
+static List *
+projections_read(PlannedStmt *stmt, bool *all)
+{
+	List	   *names = NIL;
+	ListCell   *lc;
+
+	*all = !projection_rels_ok;
+	if (*all)
+		return NIL;
+
+	foreach(lc, stmt->permInfos)
+	{
+		RTEPermissionInfo *perm = (RTEPermissionInfo *) lfirst(lc);
+		ProjectionRel *r = (ProjectionRel *) hash_search(projection_rels, &perm->relid, HASH_FIND, NULL);
+
+		if (r)
+			names = list_append_unique(names, makeString(pstrdup(r->projection)));
+	}
+
+	if (projection_collections == NIL)
+		return names;
+	foreach(lc, stmt->rtable)
+	{
+		RangeTblEntry *rte = (RangeTblEntry *) lfirst(lc);
+		ListCell   *lf;
+
+		if (rte->rtekind != RTE_FUNCTION)
+			continue;
+		foreach(lf, rte->functions)
+		{
+			RangeTblFunction *rtf = (RangeTblFunction *) lfirst(lf);
+			FuncExpr   *fe = (FuncExpr *) rtf->funcexpr;
+			char	   *nsp;
+			char	   *fname;
+			const char *db;
+			const char *coll;
+			ListCell   *lp;
+
+			if (!IsA(fe, FuncExpr) || list_length(fe->args) != 2)
+				continue;
+			fname = get_func_name(fe->funcid);
+			nsp = get_namespace_name(get_func_namespace(fe->funcid));
+			if (!fname || !nsp || strcmp(fname, "collection") != 0 || strcmp(nsp, "documentdb_api") != 0)
+				continue;
+			db = const_text(linitial(fe->args));
+			coll = const_text(lsecond(fe->args));
+			if (!db || !coll)
+			{
+				*all = true;
+				return NIL;
+			}
+			foreach(lp, projection_collections)
+			{
+				ProjectionCollection *c = (ProjectionCollection *) lfirst(lp);
+
+				if (strcmp(c->database, db) == 0 && strcmp(c->collection, coll) == 0)
+					names = list_append_unique(names, makeString(pstrdup(c->projection)));
+			}
+		}
+	}
+	return names;
+}
+
+static bool
+already_reached(const char *projection, int64 token)
+{
+	Reached    *r;
+	char		key[NAMEDATALEN] = {0};
+
+	if (reached == NULL)
+		return false;
+	strlcpy(key, projection, NAMEDATALEN);
+	r = (Reached *) hash_search(reached, key, HASH_FIND, NULL);
+	return r != NULL && r->token >= token;
+}
+
+static void
+remember_reached(const char *projection, int64 token)
+{
+	Reached    *r;
+	char		key[NAMEDATALEN] = {0};
+
+	if (reached == NULL || hash_get_num_entries(reached) > 4096)
+	{
+		HASHCTL		ctl;
+
+		if (reached)
+			hash_destroy(reached);
+		memset(&ctl, 0, sizeof(ctl));
+		ctl.keysize = NAMEDATALEN;
+		ctl.entrysize = sizeof(Reached);
+		ctl.hcxt = TopMemoryContext;
+		reached = hash_create("isomer_router reached tokens", 64, &ctl, HASH_ELEM | HASH_STRINGS | HASH_CONTEXT);
+	}
+	strlcpy(key, projection, NAMEDATALEN);
+	r = (Reached *) hash_search(reached, key, HASH_ENTER, NULL);
+	r->token = token;
+}
+
+/*
+ * Wait until every projection the statement reads reflects isomer.read_after. Errors (the "not
+ * yet" timeout, IS001) reach the caller unchanged. Returns whether anything was waited for.
+ */
+static bool
+wait_for_read_after(QueryDesc *queryDesc, int64 token)
+{
+	bool		all;
+	List	   *names;
+	List	   *pending = NIL;
+	ListCell   *lc;
+	Datum		args[3];
+	Oid			argtypes[3] = {INT8OID, TEXTARRAYOID, TEXTOID};
+	char		timeout[32];
+
+	if (projection_rels == NULL
+		|| TimestampDifferenceExceeds(projection_rels_loaded_at, GetCurrentTimestamp(), 2000))
+		load_projection_rels();
+
+	names = projections_read(queryDesc->plannedstmt, &all);
+	if (!all)
+	{
+		foreach(lc, names)
+			if (!already_reached(strVal(lfirst(lc)), token))
+				pending = lappend(pending, lfirst(lc));
+		if (pending == NIL)
+			return false;
+	}
+
+	snprintf(timeout, sizeof(timeout), "%d milliseconds", read_after_timeout_ms);
+	args[0] = Int64GetDatum(token);
+	if (all)
+		args[1] = (Datum) 0;
+	else
+	{
+		Datum	   *elems = palloc(sizeof(Datum) * list_length(pending));
+		int			n = 0;
+
+		foreach(lc, pending)
+			elems[n++] = CStringGetTextDatum(strVal(lfirst(lc)));
+		args[1] = PointerGetDatum(construct_array_builtin(elems, n, TEXTOID));
+	}
+	args[2] = CStringGetTextDatum(timeout);
+
+	if (SPI_connect() != SPI_OK_CONNECT)
+		elog(ERROR, "isomer_router: SPI_connect failed");
+	SPI_execute_with_args(all
+						  ? "SELECT isomer.wait_for($1, NULL, $3::interval)"
+						  : "SELECT isomer.wait_for($1, p, $3::interval) FROM unnest($2) p",
+						  3, argtypes, args, all ? " n " : "   ", false, 0);
+	SPI_finish();
+
+	if (all)
+	{
+		/* everything reached it; remember nothing (the map may be what failed) */
+		return true;
+	}
+	foreach(lc, pending)
+		remember_reached(strVal(lfirst(lc)), token);
+	return true;
+}
+
+static void
+isomer_ExecutorStart(QueryDesc *queryDesc, int eflags)
+{
+	if (exec_nesting == 0 && !in_wait && !in_router && read_after != NULL && read_after[0] != '\0'
+		&& queryDesc->operation == CMD_SELECT && (eflags & EXEC_FLAG_EXPLAIN_ONLY) == 0
+		&& IsTransactionState())
+	{
+		int64		token;
+		char	   *end;
+		bool		waited = false;
+
+		errno = 0;
+		token = strtoi64(read_after, &end, 10);
+		if (errno != 0 || *end != '\0' || token < 0)
+			ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+							errmsg("isomer.read_after must be a token from isomer.last_write_token(), not \"%s\"",
+								   read_after)));
+		in_wait = true;
+		PG_TRY();
+		{
+			waited = wait_for_read_after(queryDesc, token);
+		}
+		PG_FINALLY();
+		{
+			in_wait = false;
+		}
+		PG_END_TRY();
+
+		/*
+		 * Read with a snapshot taken after the wait. wait_for() refuses anything but READ
+		 * COMMITTED, where each statement may take a new snapshot.
+		 */
+		if (waited && !IsolationUsesXactSnapshot())
+		{
+			UnregisterSnapshot(queryDesc->snapshot);
+			queryDesc->snapshot = RegisterSnapshot(GetTransactionSnapshot());
+		}
+	}
+
+	if (prev_ExecutorStart)
+		prev_ExecutorStart(queryDesc, eflags);
+	else
+		standard_ExecutorStart(queryDesc, eflags);
+}
+
+/* Track executor nesting, so only top-level statements wait (not queries inside functions). */
+static void
+isomer_ExecutorRun(QueryDesc *queryDesc, ScanDirection direction, uint64 count)
+{
+	exec_nesting++;
+	PG_TRY();
+	{
+		if (prev_ExecutorRun)
+			prev_ExecutorRun(queryDesc, direction, count);
+		else
+			standard_ExecutorRun(queryDesc, direction, count);
+	}
+	PG_FINALLY();
+	{
+		exec_nesting--;
+	}
+	PG_END_TRY();
+}
+
+/* Whether a statement writes to a table carrying IsomerDB's capture triggers (isomer_*). */
+static bool
+writes_projection_source(PlannedStmt *stmt)
+{
+	ListCell   *lc;
+
+	foreach(lc, stmt->permInfos)
+	{
+		RTEPermissionInfo *perm = (RTEPermissionInfo *) lfirst(lc);
+		Relation	rel;
+		bool		found = false;
+
+		if ((perm->requiredPerms & (ACL_INSERT | ACL_UPDATE | ACL_DELETE)) == 0)
+			continue;
+		rel = RelationIdGetRelation(perm->relid);
+		if (!RelationIsValid(rel))
+			continue;
+		if (rel->trigdesc)
+			for (int i = 0; i < rel->trigdesc->numtriggers && !found; i++)
+				found = strncmp(rel->trigdesc->triggers[i].tgname, "isomer_", 7) == 0;
+		RelationClose(rel);
+		if (found)
+			return true;
+	}
+	return false;
+}
+
+/*
+ * After a top-level write to a projection's source table, set the session's write token
+ * (isomer.last_write_token) from this node's cluster clock. The capture trigger sets it too, but
+ * on a multi-node cluster the trigger runs in the worker's backend, so the client's session never
+ * sees it; the coordinator's clock after the write is at or past the write's own token.
+ */
+static void
+record_write_token(QueryDesc *queryDesc)
+{
+	CmdType		op = queryDesc->operation;
+
+	if (exec_nesting != 0 || in_wait || in_router
+		|| !(op == CMD_INSERT || op == CMD_UPDATE || op == CMD_DELETE || op == CMD_MERGE)
+		|| queryDesc->estate == NULL || queryDesc->estate->es_processed == 0
+		|| !writes_projection_source(queryDesc->plannedstmt)
+		|| !OidIsValid(get_func_oid_simple("isomer", "current_token")))
+		return;
+
+	in_wait = true;
+	PG_TRY();
+	{
+		if (SPI_connect() == SPI_OK_CONNECT)
+		{
+			if (SPI_execute("SELECT isomer.current_token()::text", true, 1) == SPI_OK_SELECT && SPI_processed == 1)
+			{
+				char	   *token = SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1);
+
+				if (token)
+					SetConfigOption("isomer.last_write_token", token, PGC_USERSET, PGC_S_SESSION);
+			}
+			SPI_finish();
+		}
+	}
+	PG_FINALLY();
+	{
+		in_wait = false;
+	}
+	PG_END_TRY();
+}
+
+static void
+isomer_ExecutorFinish(QueryDesc *queryDesc)
+{
+	exec_nesting++;
+	PG_TRY();
+	{
+		if (prev_ExecutorFinish)
+			prev_ExecutorFinish(queryDesc);
+		else
+			standard_ExecutorFinish(queryDesc);
+	}
+	PG_FINALLY();
+	{
+		exec_nesting--;
+	}
+	PG_END_TRY();
+	record_write_token(queryDesc);
+}
+
 /* isomer_router_stats(): what this backend has routed. */
 Datum
 isomer_router_stats(PG_FUNCTION_ARGS)
@@ -396,6 +886,20 @@ _PG_init(void)
 							 NULL, &min_speedup, 1.2, 0.0, 1000.0,
 							 PGC_USERSET, 0, NULL, NULL, NULL);
 
+	DefineCustomStringVariable("isomer.read_after",
+							   "Reads of projections wait until they reflect this write token ('' for no wait).",
+							   NULL, &read_after, "", PGC_USERSET, 0, NULL, NULL, NULL);
+	DefineCustomIntVariable("isomer.read_after_timeout",
+							"How long a read waits for isomer.read_after before failing with \"not yet\" (IS001).",
+							NULL, &read_after_timeout_ms, 5000, 0, INT_MAX,
+							PGC_USERSET, GUC_UNIT_MS, NULL, NULL, NULL);
+
 	prev_planner_hook = planner_hook;
 	planner_hook = isomer_planner;
+	prev_ExecutorStart = ExecutorStart_hook;
+	ExecutorStart_hook = isomer_ExecutorStart;
+	prev_ExecutorRun = ExecutorRun_hook;
+	ExecutorRun_hook = isomer_ExecutorRun;
+	prev_ExecutorFinish = ExecutorFinish_hook;
+	ExecutorFinish_hook = isomer_ExecutorFinish;
 }
