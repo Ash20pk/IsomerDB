@@ -25,7 +25,9 @@ ENV PATH="/root/.cargo/bin:${PATH}"
 FROM build-base AS citus
 COPY extensions/sharding /src/citus
 WORKDIR /src/citus
-RUN ./configure && make -j"$(nproc)" && make install && make install DESTDIR=/out
+# configure is generated from configure.ac and shipped with it; a checkout can leave configure.ac
+# the newer of the two, and make would then try to regenerate configure (with autoconf, absent).
+RUN touch configure && ./configure && make -j"$(nproc)" && make install && make install DESTDIR=/out
 
 # ── DocumentDB extensions (extensions/documents) ──────────────────────────────
 # Built on top of the Citus stage so pg_documentdb_distributed finds the Citus headers.
