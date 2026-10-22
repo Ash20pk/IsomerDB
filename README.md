@@ -181,13 +181,16 @@ sequenceDiagram
 ## Quick start
 
 ```sh
-docker compose up --build -d     # Postgres on :5432, MongoDB wire on :10260, HTTP API and console on :8080
-./scripts/smoke.sh
+# The released images (or `docker compose up --build -d` to build from source)
+ISOMER_REGISTRY=ghcr.io/ash20pk/ ISOMER_TAG=0.27.0 docker compose up -d --no-build
+./scripts/smoke.sh               # Postgres on :5432, MongoDB wire on :10260, HTTP API and console on :8080
 psql postgres://postgres:isomer@localhost:5432/postgres
 ```
 
 `docker compose --profile cluster up -d` adds two worker nodes; `--profile attach` adds a stand-in
-"existing Postgres" on :5433. These are local development credentials only.
+"existing Postgres" on :5433. If a port is taken, set `ISOMER_PG_PORT`, `ISOMER_MONGO_PORT` or
+`ISOMER_API_PORT`. These are local development credentials only. To run it for real, on
+Kubernetes with the operator, see [Self-hosting](docs/self-hosting.md).
 
 ## Using it
 
