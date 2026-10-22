@@ -4,8 +4,8 @@ FROM rust:1.95-bookworm AS build
 WORKDIR /src
 COPY services/embedder/Cargo.toml services/embedder/Cargo.lock* services/embedder/rust-toolchain.toml ./
 COPY services/embedder/src ./src
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/src/target \
+RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,target=/src/target,sharing=locked \
     cargo test --release && cargo build --release && cp target/release/isomer-embedder /isomer-embedder
 
 # The in-cluster CPU model (provider 'local'): BAAI/bge-small-en-v1.5, MIT, pinned and checksummed,

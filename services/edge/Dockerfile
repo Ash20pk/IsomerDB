@@ -4,7 +4,7 @@ FROM rust:1.89-bookworm AS build
 WORKDIR /src
 COPY services/edge/Cargo.toml services/edge/Cargo.lock* ./
 COPY services/edge/src ./src
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
+RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     cargo build --release && cp target/release/isomer-edge /isomer-edge
 
 FROM debian:bookworm-slim

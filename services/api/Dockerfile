@@ -12,8 +12,8 @@ FROM rust:1.89-bookworm AS build
 WORKDIR /src
 COPY services/api/Cargo.toml services/api/Cargo.lock* ./
 COPY services/api/src ./src
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/src/target \
+RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,target=/src/target,sharing=locked \
     cargo build --release && cp target/release/isomer-api /isomer-api
 
 FROM debian:bookworm-slim
