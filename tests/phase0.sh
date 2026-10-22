@@ -9,6 +9,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 ISO="docker compose exec -T -e PGOPTIONS=-cclient_min_messages=warning db psql -U postgres -d postgres -X -q -t -A -v ON_ERROR_STOP=1"
+ISO_DIAG="docker compose exec -T db psql -U postgres -d postgres -X -q -t -A"   # every query runs, even after one fails
 SRC="docker compose exec -T source psql -U postgres -d postgres -X -q -t -A -v ON_ERROR_STOP=1"
 NET="$(basename "$PWD" | tr '[:upper:]' '[:lower:]')_default"
 MONGO=(docker run --rm --network "$NET" mongo:8 mongosh
@@ -16,7 +17,14 @@ MONGO=(docker run --rm --network "$NET" mongo:8 mongosh
 CONN="host=source port=5432 dbname=postgres user=postgres password=source"
 
 pass() { printf '  ok   %s\n' "$1"; }
-fail() { printf '  FAIL %s\n       expected: %s\n       got:      %s\n' "$1" "$2" "$3"; exit 1; }
+fail() {
+  printf '  FAIL %s\n       expected: %s\n       got:      %s\n' "$1" "$2" "$3"
+  echo "-- state at failure --"
+  $ISO_DIAG -c "SELECT 'alert', alert, subject, left(detail, 200) FROM isomer.alerts" \
+            -c "SELECT 'status', name, kind, status, oldest_pending, search_staleness FROM isomer.projection_status" \
+            -c "SELECT 'search row', id, status, left(note, 60) FROM public.order_search ORDER BY id" 2>&1 | sed 's/^/       /'
+  exit 1
+}
 expect() { [ "$3" = "$2" ] && pass "$1" || fail "$1" "$2" "$3"; }
 # Poll until a command prints the expected value, for up to $4 seconds.
 eventually() {

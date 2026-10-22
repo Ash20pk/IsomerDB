@@ -7,11 +7,18 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 ISO="docker compose exec -T -e PGOPTIONS=-cclient_min_messages=warning db psql -U postgres -d postgres -X -q -t -A -v ON_ERROR_STOP=1"
+ISO_DIAG="docker compose exec -T db psql -U postgres -d postgres -X -q -t -A"   # every query runs, even after one fails
 MOCK() { docker compose exec -T mockai python -c "import urllib.request,sys; r=urllib.request.Request('http://localhost:8080$1', method='$2'); print(urllib.request.urlopen(r).read().decode())"; }
 stat() { MOCK /stats GET | python3 -c "import json,sys; d=json.load(sys.stdin); print(eval(sys.argv[1]))" "$1"; }
 
 pass() { printf '  ok   %s\n' "$1"; }
-fail() { printf '  FAIL %s\n       expected: %s\n       got:      %s\n' "$1" "$2" "$3"; exit 1; }
+fail() {
+  printf '  FAIL %s\n       expected: %s\n       got:      %s\n' "$1" "$2" "$3"
+  echo "-- state at failure --"
+  $ISO_DIAG -c "SELECT 'alert', alert, subject, left(detail, 200) FROM isomer.alerts" \
+            -c "SELECT 'status', name, kind, status, oldest_pending, search_staleness FROM isomer.projection_status" 2>&1 | sed 's/^/       /'
+  exit 1
+}
 expect() { [ "$3" = "$2" ] && pass "$1" || fail "$1" "$2" "$3"; }
 eventually() {
   local name=$1 want=$2 cmd=$3 timeout=$(( ${4:-20} * ${ISOMER_TIMEOUT_SCALE:-1} )) got="" start=$SECONDS
