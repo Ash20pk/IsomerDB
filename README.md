@@ -367,8 +367,12 @@ coordinator, and on every node's clock. They have found and fixed three bugs so 
 | Area | Not built yet | PRD |
 |---|---|---|
 | Adoption | Attach and cutover run against each real managed provider in CI: the provider check and a run as a non-superuser role are done, real providers need their accounts | FR-A11 |
-| Cloud | Charging cards (invoices are computed, collecting payment needs a payment provider account); regions in other clouds run for real | FR-CL1, CL2 |
 | Product | Trademark clearance, ParadeDB HA licensing, design partners | PRD §15 |
+
+IsomerDB is self-hosted for now: free to run, including commercially, under the license below.
+The [cloud control plane](controlplane/) is built (sign-up, plans, provisioning, usage, invoices),
+but a managed IsomerDB is on hold until there is demand for one, so charging cards and running
+regions in other clouds are left until then (FR-CL1, CL2).
 
 ## License
 
