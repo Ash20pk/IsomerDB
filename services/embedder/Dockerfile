@@ -28,4 +28,5 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
 COPY --from=build /isomer-embedder /usr/local/bin/isomer-embedder
 COPY --from=model /model /usr/share/isomer/models/bge-small-en-v1.5
 COPY LICENSE NOTICE /usr/share/doc/isomerdb/
+COPY licenses/third-party/isomer-embedder.txt /usr/share/doc/isomerdb/THIRD_PARTY_LICENSES
 ENTRYPOINT ["isomer-embedder"]

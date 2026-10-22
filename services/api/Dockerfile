@@ -21,6 +21,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
 COPY --from=build /isomer-api /usr/local/bin/isomer-api
 COPY --from=console /src/clients/console/dist /usr/share/isomer/console
 COPY LICENSE NOTICE /usr/share/doc/isomerdb/
+COPY licenses/third-party/isomer-api.txt /usr/share/doc/isomerdb/THIRD_PARTY_LICENSES
 COPY clients/LICENSE /usr/share/isomer/console/LICENSE
 ENTRYPOINT ["isomer-api"]
 EXPOSE 8080
