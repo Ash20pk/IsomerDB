@@ -208,8 +208,18 @@ expect "drift detected and counted" "1" "$($ISO -c "SELECT drift FROM isomer.dri
 expect "the drifted input is pinned" "21|tampered" \
   "$($ISO -c "SELECT key || '|' || (actual ->> 'name') FROM isomer.drift_samples WHERE projection = 'customer_orders'")"
 expect "drift raises an alert" "1" "$($ISO -c "SELECT count(*) FROM isomer.alerts WHERE alert = 'drift'")"
+# Still wrong, audited again past the confirmation window: the same key isn't counted twice.
+for _ in 1 2 3; do sleep 3; $ISO -c "SELECT isomer.audit(200)" >/dev/null; done
+expect "a key that stays wrong is counted once" "1|1" \
+  "$($ISO -c "SELECT (SELECT drift FROM isomer.drift_report WHERE projection = 'customer_orders') || '|' || (SELECT count(*) FROM isomer.drift_samples WHERE projection = 'customer_orders')")"
 $ISO -c "SELECT isomer.repair('customer_orders')" >/dev/null
 expect "repair restores the document" "customer 21" "$(mongo_eval 'print(db.getSiblingDB("dist").customer_orders.findOne({_id: 21}).name)')"
+# Right again, then wrong again: that's new drift, and it counts.
+for _ in 1 2; do $ISO -c "SELECT isomer.audit(200)" >/dev/null; sleep 1; done
+$ISO -c "SELECT documentdb_api.update('dist', '{\"update\": \"customer_orders\", \"updates\": [{\"q\": {\"_id\": 21}, \"u\": {\"\$set\": {\"name\": \"tampered\"}}}]}'::documentdb_core.bson)" >/dev/null
+for _ in 1 2 3; do $ISO -c "SELECT isomer.audit(200)" >/dev/null; sleep 3; done
+expect "the same key drifting again after a repair counts again" "2" "$($ISO -c "SELECT drift FROM isomer.drift_report WHERE projection = 'customer_orders'")"
+$ISO -c "SELECT isomer.repair('customer_orders')" >/dev/null
 contains "drift report reads as a counter" "checks" "$($ISO -c "SELECT summary FROM isomer.drift_report WHERE projection = 'customer_orders'")"
 
 echo "== phase 2 passed"
