@@ -220,7 +220,9 @@ SELECT isomer.create_projection(name => 'category_sales', kind => 'document', ke
 -- subqueries, each one's state is sharded by the column it is correlated through, co-located
 -- with the outer rows it belongs to (customer_profile's orders by customer_id, beside its customers).
 -- A subquery correlated another way, an order's lines by order_id, is anchored: each line's state
--- carries its order's customer, and moves when the order does.
+-- carries its order's customer, and moves when the order does. min and max are anchored the same
+-- way, and so is a subquery inside an anchored one (each line's marks, carrying the customer of
+-- their line's order).
 SELECT strategy, strategy_reason FROM isomer.projections;   -- what was chosen, and why
 SELECT * FROM isomer.strategy_advice();
 
@@ -364,7 +366,6 @@ coordinator, and on every node's clock. They have found and fixed three bugs so 
 
 | Area | Not built yet | PRD |
 |---|---|---|
-| Projections | Distributing min or max inside a subquery correlated through another column than its parent's shard column, or one such subquery inside another (they stay on the coordinator) | FR-P6 |
 | Adoption | Attach and cutover run against each real managed provider in CI: the provider check and a run as a non-superuser role are done, real providers need their accounts | FR-A11 |
 | Cloud | Charging cards (invoices are computed, collecting payment needs a payment provider account); regions in other clouds run for real | FR-CL1, CL2 |
 | Product | Trademark clearance, ParadeDB HA licensing, design partners | PRD §15 |

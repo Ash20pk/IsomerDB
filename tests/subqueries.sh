@@ -369,8 +369,65 @@ if [ "$MULTI" = "t" ]; then
   $ISO -c "DELETE FROM sq.d_orders WHERE id = 7777" -c "UPDATE sq.d_lines SET qty = 1 WHERE order_id = 7777" >/dev/null
   eventually "orders gone, the line waits again, still changing" "0" "drift sq_sharded" 60
   expect "on the coordinator" "1" "$($ISO -c "SELECT count(*) FROM isomer_state.${APFX}_b4po WHERE order_id = 7777")"
-  contains "min or max over anchored lines is refused, with the reason" "takes min or max over sq.d_lines" \
-    "$($ISO_NOFAIL -c "SELECT isomer.create_projection('sq_bad', 'SELECT c.id, (SELECT jsonb_agg((SELECT max(l.qty) FROM sq.d_lines l WHERE l.order_id = o.id)) FROM sq.d_orders o WHERE o.customer_id = c.id) AS value FROM sq.d_customers c', 'cache', 'id', state => 'distributed')" 2>&1)"
+  echo "== FR-P6 anchored min and max, and an anchored subquery inside another"
+  $ISO <<'SQL' >/dev/null
+CREATE TABLE sq.d_marks (order_id bigint NOT NULL, line int NOT NULL, n int NOT NULL, score int, PRIMARY KEY (order_id, line, n));
+SELECT create_distributed_table('sq.d_marks', 'order_id', colocate_with => 'sq.d_lines');
+INSERT INTO sq.d_marks SELECT o, l, n, (o * 7 + l * 3 + n) % 50 FROM generate_series(1, 600) o, generate_series(1, 2) l, generate_series(1, 2) n
+WHERE (o + l) % 3 <> 0;
+SQL
+  DNEST='SELECT c.id, jsonb_build_object('"'"'orders'"'"', (SELECT jsonb_agg(jsonb_build_object('"'"'id'"'"', o.id,
+      '"'"'most'"'"', (SELECT max(l.qty) FROM sq.d_lines l WHERE l.order_id = o.id),
+      '"'"'least'"'"', (SELECT min(l.qty) FROM sq.d_lines l WHERE l.order_id = o.id),
+      '"'"'lines'"'"', (SELECT jsonb_agg(jsonb_build_object('"'"'line'"'"', l.line,
+          '"'"'marks'"'"', (SELECT count(*) FROM sq.d_marks k WHERE k.order_id = l.order_id AND k.line = l.line),
+          '"'"'top'"'"', (SELECT max(k.score) FROM sq.d_marks k WHERE k.order_id = l.order_id AND k.line = l.line)) ORDER BY l.line)
+        FROM sq.d_lines l WHERE l.order_id = o.id)) ORDER BY o.id)
+    FROM sq.d_orders o WHERE o.customer_id = c.id)) AS doc
+  FROM sq.d_customers c'
+  contains "min and max over anchored lines, and each line's marks anchored below them" "its state distributed across the cluster" \
+    "$($ISO -c "SELECT isomer.create_projection('sq_nest', \$q\$$DNEST\$q\$, 'document', 'id', state => 'distributed')")"
+  expect "it equals the query" "0" "$(drift sq_nest)"
+  NPFX=$($ISO -c "SELECT isomer._engine_prefix('sq_nest')")
+  expect "the marks and the lines' multisets sit with their orders and customers" "1" \
+    "$($ISO -c "SELECT count(DISTINCT colocationid) FROM pg_dist_partition WHERE logicalrelid::text LIKE 'isomer_state.${NPFX}%' AND partmethod = 'h'")"
+  expect "the marks are anchored through their line's order" "order_id" \
+    "$($ISO -c "SELECT string_agg(DISTINCT b -> 'anchor' ->> 'col', ',') FROM isomer.engine_plans e, jsonb_array_elements(e.plan -> 'placement' -> 'blocks') b WHERE e.projection = 'sq_nest' AND (b -> 'anchor' ->> 'nested')::boolean")"
+  nested() { $ISO -c "SELECT (SELECT o -> '$3' FROM jsonb_array_elements(isomer.get('sq_nest', '$1') -> 'orders') o WHERE o ->> 'id' = '$2')::text"; }
+  marks() { $ISO -c "SELECT (SELECT l ->> 'marks' || '/' || coalesce(l ->> 'top', '-') FROM jsonb_array_elements(isomer.get('sq_nest', '$1') -> 'orders') o, jsonb_array_elements(o -> 'lines') l WHERE o ->> 'id' = '$2' AND l ->> 'line' = '$3')"; }
+  $ISO -c "INSERT INTO sq.d_orders VALUES (8888, 20, 1)" -c "INSERT INTO sq.d_lines VALUES (8888, 1, 5), (8888, 2, 2)" \
+       -c "INSERT INTO sq.d_marks VALUES (8888, 1, 1, 30), (8888, 1, 2, 45), (8888, 2, 1, 7)" >/dev/null
+  eventually "a new order's largest and smallest line" "5|2" "echo \$(nested 20 8888 most)'|'\$(nested 20 8888 least)"
+  eventually "and its lines' marks, two levels below the order" "2/45" "marks 20 8888 1"
+  $ISO -c "UPDATE sq.d_lines SET qty = 1 WHERE order_id = 8888 AND line = 1" -c "DELETE FROM sq.d_marks WHERE order_id = 8888 AND line = 1 AND n = 2" >/dev/null
+  eventually "a maximum leaving, at each level" "2|1|1/30" "echo \$(nested 20 8888 most)'|'\$(nested 20 8888 least)'|'\$(marks 20 8888 1)"
+  # The coordinator tables holding the marks blocks' orphans.
+  MORPH=$($ISO -c "SELECT string_agg(f -> 'anchor' ->> 'orphans', ' ' ORDER BY (f ->> 'block')::int) FROM isomer.engine_plans e, jsonb_array_elements(e.plan -> 'facts') f WHERE e.projection = 'sq_nest' AND (f -> 'anchor' ->> 'nested')::boolean")
+  orphans() { local t n=0; for t in $MORPH; do n=$(( n + $($ISO -c "SELECT count(*) FROM $t WHERE order_id = $1") )); done; echo $n; }
+  $ISO -c "INSERT INTO sq.d_marks VALUES (8888, 3, 1, 9)" >/dev/null
+  $ISO -c "INSERT INTO sq.d_lines VALUES (8888, 3, 4)" >/dev/null
+  eventually "a mark written before its line, then the line" "1/9" "marks 20 8888 3"
+  $ISO -c "INSERT INTO sq.d_marks VALUES (8889, 1, 1, 12)" -c "INSERT INTO sq.d_lines VALUES (8889, 1, 4)" >/dev/null
+  eventually "a mark and a line whose order doesn't exist yet wait on the coordinator, in both marks blocks" "2" "orphans 8889"
+  $ISO -c "INSERT INTO sq.d_orders VALUES (8889, 20, 1)" >/dev/null
+  eventually "the order arrives: its line joins the customer, and the line's mark follows, a level down" "1/12" "marks 20 8889 1"
+  expect "leaving the coordinator" "0" "$(orphans 8889)"
+  $ISO -c "BEGIN" -c "DELETE FROM sq.d_orders WHERE id = 8888" -c "INSERT INTO sq.d_orders VALUES (8888, 21, 1)" -c "COMMIT" >/dev/null
+  eventually "an order moving to another customer takes its lines' marks with it" "1/30|1/9|4" \
+    "echo \$(marks 21 8888 1)'|'\$(marks 21 8888 3)'|'\$(nested 21 8888 most)"
+  eventually "and leaves the first customer" "0" \
+    "$ISO -c \"SELECT count(*) FROM jsonb_array_elements(coalesce(isomer.get('sq_nest', '20') -> 'orders', '[]')) o WHERE o ->> 'id' = '8888'\""
+  $ISO -c "UPDATE sq.d_lines SET qty = 9 WHERE order_id = 8888 AND line = 2" -c "INSERT INTO sq.d_marks VALUES (8888, 3, 2, 49)" >/dev/null
+  eventually "the multisets moved with them: writes after the move land under the new customer" "9|2/49" \
+    "echo \$(nested 21 8888 most)'|'\$(marks 21 8888 3)"
+  $ISO -c "DELETE FROM sq.d_orders WHERE id = 8888" -c "UPDATE sq.d_marks SET score = 3 WHERE order_id = 8888" >/dev/null
+  eventually "the order gone, its lines and marks wait again, still changing" "0" "drift sq_nest" 60
+  expect "the marks on the coordinator" "6" "$(orphans 8888)"
+  $ISO -c "INSERT INTO sq.d_orders VALUES (8888, 22, 1)" >/dev/null
+  eventually "and come back with the order" "9|2/3" "echo \$(nested 22 8888 most)'|'\$(marks 22 8888 3)"
+  expect "it equals the query" "0" "$(drift sq_nest)"
+  contains "a subquery in the WHERE of an anchored subquery is refused, with the reason" "in the WHERE of a subquery whose state is anchored" \
+    "$($ISO_NOFAIL -c "SELECT isomer.create_projection('sq_bad', 'SELECT c.id, (SELECT jsonb_agg((SELECT sum(l.qty) FROM sq.d_lines l WHERE l.order_id = o.id AND l.qty > (SELECT min(k.score) FROM sq.d_marks k WHERE k.order_id = l.order_id AND k.line = l.line))) FROM sq.d_orders o WHERE o.customer_id = c.id) AS value FROM sq.d_customers c', 'cache', 'id', state => 'distributed')" 2>&1)"
   DIST='SELECT c.id, jsonb_build_object('"'"'tier'"'"', (SELECT t.name FROM sq.d_tiers t WHERE t.id = c.tier_id),
       '"'"'spent'"'"', (SELECT sum(o.total) FROM sq.d_orders o WHERE o.customer_id = c.id),
       '"'"'biggest'"'"', (SELECT max(o.total) FROM sq.d_orders o WHERE o.customer_id = c.id),
@@ -412,7 +469,7 @@ BEGIN
     FOR i IN 1 .. n LOOP
         c := 1 + (random() * 69)::int;
         o := 1 + (random() * 599)::int;
-        CASE (random() * 6)::int
+        CASE (random() * 8)::int
             WHEN 0 THEN INSERT INTO sq.d_orders VALUES (200000 + seed * 10000 + i, c, i % 90);
             WHEN 1 THEN UPDATE sq.d_orders SET total = total + 7 WHERE customer_id = c AND id % 3 = i % 3;
             WHEN 2 THEN DELETE FROM sq.d_orders WHERE customer_id = c AND id % 5 = i % 5;
@@ -421,6 +478,8 @@ BEGIN
             WHEN 5 THEN  -- an order moves to another customer, with its lines
                 DELETE FROM sq.d_orders WHERE id = o RETURNING total INTO t;
                 IF FOUND THEN INSERT INTO sq.d_orders VALUES (o, c, t) ON CONFLICT DO NOTHING; END IF;
+            WHEN 6 THEN UPDATE sq.d_marks SET score = (score * 13 + i) % 60 WHERE order_id = o;
+            WHEN 7 THEN INSERT INTO sq.d_marks VALUES (o, 1 + i % 3, 100 + i, i % 60) ON CONFLICT DO NOTHING;
             ELSE UPDATE sq.d_customers SET tier_id = 1 + i % 2 WHERE id = c;
         END CASE;
         COMMIT;
@@ -432,6 +491,7 @@ SQL
   for pid in "${pids[@]}"; do wait "$pid" || fail "a writer failed" "exit 0" "exit $?"; done
   eventually "after 400 concurrent transactions across the shards, it equals the query" "0" "drift sq_dist" 90
   eventually "and the document with anchored lines" "0" "drift sq_sharded" 90
+  eventually "and the one with min and max over them, and marks anchored below them" "0" "drift sq_nest" 90
   DSHARE='SELECT c.id, round((SELECT coalesce(sum(o.total), 0) FROM sq.d_orders o WHERE o.customer_id = c.id)
                          / nullif((SELECT sum(o.total) FROM sq.d_orders o), 0), 6) AS value FROM sq.d_customers c'
   contains "a share of an uncorrelated total, distributed" "its state distributed across the cluster" \

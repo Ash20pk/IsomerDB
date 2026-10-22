@@ -45,6 +45,38 @@ opt-in setting.
    unmodified as its own import commit on a branch, then re-apply our changes. Update the tables
    above in the same change.
 
+## 2026-10-22 — Anchored min and max, and anchored subqueries inside anchored ones (FR-P6)
+
+`tests/subqueries.sh` passes on the cluster (isomer 0.27.0, upgraded in place from 0.26.0), with a
+document of each order's largest and smallest line and each line's marks inside the order's
+lines, under 400 concurrent transactions that also move orders between customers.
+
+- **min and max.** Their multisets are anchored like the partial rows: each value row carries
+  `__anchor`, keyed `(__anchor, __h, value)`, sharded co-located, and an orphan's multiset waits
+  in a coordinator table of its own (`_b<n>pom<i>`). A fold takes each partial row's min or max
+  again from the multiset under the same anchor. A move reads one copy of each moved partial
+  row's values (`DISTINCT ON (__h, value)`: they are the same under every anchor) and writes them
+  under the anchors of the partial row's correlation value.
+- **A subquery anchored below an anchored one** (marks correlated with `l.order_id, l.line`, the
+  lines anchored by order) takes its anchors from the parent's anchored partial rows, not from a
+  table: a mark is kept under every customer with a partial row of its line. Its map is built
+  from the parent's partial rows, and kept after each fold. The parent's partial rows the fold
+  reached or moved are noted (`isomer_anchor_touched`, a temp table), and each nested block, top
+  down, recomputes its map for those values from the parent's partial rows and moves the values
+  whose anchors changed. That runs after the facts are folded, not before like the first level,
+  because the anchors are the parent's state as this fold leaves it. A block folded before its
+  parent in the same fold is anchored by the old map and then moved, so the order of the folds
+  doesn't matter.
+- **Which correlation.** With several equalities, the nested block prefers the column its parent
+  is anchored by (`k.order_id = l.order_id` over `k.line = l.line`). Through the line number,
+  every mark would be kept under nearly every customer: right, and very wide.
+- **Key queries.** A key query driven by the anchored parent's changed rows reads them from a
+  reference table, which has no `__anchor`, so the anchor of the blocks below is left out there.
+  That's safe only because finding keys drops the parent's output, where those blocks are. One in
+  the parent's WHERE would stay, as a correlated subquery over sharded rows from a reference
+  table, which Citus refuses. So a subquery in the WHERE of an anchored one is refused, with the
+  reason.
+
 ## 2026-10-21 — Anchored subqueries: an order's lines, distributed (FR-P6)
 
 `tests/subqueries.sh` passes on the cluster (isomer 0.26.0), and Jepsen's `subqueries` workload
