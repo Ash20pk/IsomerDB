@@ -34,6 +34,7 @@ jobs:
       - name: Cluster suites
         env:
           ISOMER_SKIP_BUILD: "1"
+          ISOMER_TIMEOUT_SCALE: "3"
         run: ./scripts/test-all.sh cluster
       - name: Jepsen
         run: ./tests/jepsen.sh

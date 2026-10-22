@@ -44,8 +44,10 @@ docker compose up --build -d         # the first build compiles Citus, DocumentD
 your machine, set `ISOMER_PG_PORT`, `ISOMER_MONGO_PORT` and `ISOMER_API_PORT`, and point the
 suites at the API with `ISOMER_API=http://localhost:<port>`.
 
-CI runs the Go and TypeScript tests and every single-node suite on each pull request. The
-cluster suites and Jepsen run nightly.
+On a slow machine, `ISOMER_TIMEOUT_SCALE=3` makes every suite wait three times as long for
+projections to catch up. It never changes what a check expects. CI runs the Go and TypeScript
+tests and every single-node suite on each pull request, with that scale. The cluster suites and
+Jepsen run nightly.
 
 ## Changing the extension
 

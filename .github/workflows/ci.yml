@@ -75,6 +75,8 @@ jobs:
       - name: Run the suites
         env:
           ISOMER_SKIP_BUILD: "1"
+          # The runners are slower than a laptop: projections take longer to catch up.
+          ISOMER_TIMEOUT_SCALE: "3"
         run: ./scripts/test-all.sh single
       - name: Logs on failure
         if: failure()
