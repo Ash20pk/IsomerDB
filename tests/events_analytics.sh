@@ -9,7 +9,8 @@ cd "$(dirname "$0")/.."
 
 ISO="docker compose exec -T -e PGOPTIONS=-cclient_min_messages=warning db psql -U postgres -d postgres -X -q -t -A -v ON_ERROR_STOP=1"
 ISO_NOFAIL="docker compose exec -T -e PGOPTIONS=-cclient_min_messages=warning db psql -U postgres -d postgres -X -q -t -A"
-API="curl -sS"   # the HTTP API is published on localhost:8080
+API="curl -sS"
+API_URL=${ISOMER_API:-http://localhost:8080}
 
 pass() { printf '  ok   %s\n' "$1"; }
 fail() { printf '  FAIL %s\n       expected: %s\n       got:      %s\n' "$1" "$2" "$3"; exit 1; }
@@ -71,7 +72,7 @@ $ISO -c "TRUNCATE ev.orders" -c "INSERT INTO ev.orders VALUES (600, 1, 'new', 1)
 eventually "a TRUNCATE is not a row change" "order_created:600" "events 600"
 KEY=$($ISO -c "SELECT isomer.create_api_key('ev-reader', 'ev_reader')")
 contains "the feed is served over HTTP, as events" '"op":"event"' \
-  "$($API -H "Authorization: Bearer $KEY" "http://localhost:8080/v1/projections/ev_orders/changes?after=0&limit=1")"
+  "$($API -H "Authorization: Bearer $KEY" "$API_URL/v1/projections/ev_orders/changes?after=0&limit=1")"
 expect "the certificate holds" "true" "$($ISO -c "SELECT isomer.certificate('ev_orders') ->> 'valid'")"
 before=$($ISO -c "SELECT count(*) FROM isomer.changes WHERE projection = 'ev_orders'")
 $ISO -c "UPDATE isomer.changes SET at = now() - interval '30 days' WHERE projection = 'ev_orders' AND key::int < 100" -c "SELECT isomer.prune_history()" >/dev/null
