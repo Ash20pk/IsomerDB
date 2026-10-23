@@ -25,7 +25,14 @@ fail() {
             -c "SELECT 'search row', id, status, left(note, 60) FROM public.order_search ORDER BY id" \
             -c "SELECT 'stream table', row_to_json(s) FROM pgtrickle.pgt_stream_tables s" \
             -c "SELECT 'refresh', row_to_json(h) FROM (SELECT * FROM pgtrickle.pgt_refresh_history ORDER BY 1 DESC LIMIT 5) h" \
-            -c "SELECT 'worker', backend_type, application_name, state, left(query, 80) FROM pg_stat_activity WHERE backend_type ILIKE '%trickle%' OR application_name ILIKE '%trickle%'" 2>&1 | sed 's/^/       /'
+            -c "SELECT 'worker', backend_type, application_name, state, left(query, 80) FROM pg_stat_activity WHERE backend_type ILIKE '%trickle%' OR application_name ILIKE '%trickle%'" \
+            -c "SELECT 'backends', backend_type, count(*) FROM pg_stat_activity GROUP BY 1, 2 ORDER BY 3 DESC" \
+            -c "SELECT 'health', row_to_json(x) FROM pgtrickle.health_check() x" \
+            -c "SELECT 'cdc', row_to_json(x) FROM pgtrickle.check_cdc_health() x" \
+            -c "SELECT 'cdc pause', row_to_json(x) FROM pgtrickle.cdc_pause_status() x" \
+            -c "SELECT 'gate', row_to_json(x) FROM pgtrickle.bootstrap_gate_status() x" \
+            -c "SELECT 'jobs', row_to_json(x) FROM (SELECT * FROM pgtrickle.parallel_job_status() LIMIT 5) x" \
+            -c "SELECT 'buffered', c.relname, (xpath('/row/n/text()', query_to_xml(format('SELECT count(*) AS n FROM pgtrickle_changes.changes_%s', c.oid), false, true, '')))[1]::text FROM pg_class c WHERE c.relname IN ('orders', 'customers') AND c.relnamespace = 'public'::regnamespace" 2>&1 | sed 's/^/       /'
   docker compose logs --since 3m db 2>&1 | grep -iE 'trickle|pgt_|suspend|ERROR' | tail -30 | sed 's/^/       /'
   exit 1
 }
