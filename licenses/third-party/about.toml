@@ -1,0 +1,17 @@
+# The licenses accepted in the services' Rust dependencies (cargo-about; scripts/third-party-licenses.sh).
+accepted = [
+    "AGPL-3.0-only",         # IsomerDB's own crates
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "MIT",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+    "Unlicense",
+    "BSL-1.0",
+    "CDLA-Permissive-2.0",
+]
+ignore-build-dependencies = true
+ignore-dev-dependencies = true

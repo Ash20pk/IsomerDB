@@ -45,6 +45,36 @@ opt-in setting.
    unmodified as its own import commit on a branch, then re-apply our changes. Update the tables
    above in the same change.
 
+## 2026-10-23 — pg_trickle's load shedding is off
+
+On a 4-vCPU CI runner, a bounded search projection never refreshed after it was created: the
+stream table was `ACTIVE` with no errors, but its only refresh was the initial one.
+`pgtrickle.health_check()` showed why: `scheduler_load` at `pressure=1.000` against the default
+`load_shed_threshold` of 0.8, with deferrals adding up. pg_trickle counts backends that were active
+in the last two scheduler intervals, divides by the CPU count, and holds back scheduled work
+(not IMMEDIATE, not initial population) while the ratio stays at the threshold. pg_cron's
+once-a-second jobs and a dozen client connections keep it there on four CPUs, so the stream table
+kept getting deferred. A laptop with more CPUs never hit it.
+
+`pg_trickle.load_shed_threshold = 0` in `postgresql.isomer.conf` turns it off. A projection's lag
+budget is what IsomerDB promises, and it raises its own alert when a projection falls behind.
+A refresh postponed by an estimate that counts IsomerDB's own background jobs breaks that
+promise without saying so.
+
+## 2026-10-23 — The auditor counts a drifted key once (FR-K2)
+
+`tests/phase2.sh` passes on isomer 0.28.0. It now checks that a key that stays wrong is counted
+once, and that the same key drifting again after a repair counts again.
+
+- **One bad key read as several.** A confirmed key was taken off `audit_suspects`. While it stayed
+  wrong, the next audit suspected it again and, once the confirmation window had passed, counted
+  it again. The counter read 2, 3, ... for one key, and more often the slower the audits ran, which
+  is how it showed up first on CI. A confirmed suspect now stays, marked `confirmed`, and isn't
+  counted again while the key differs the same way. A key that matches the tables again is taken
+  off, so a later drift counts afresh.
+- **Concurrent audits.** The scheduled audit and one called by hand can run at once. A suspect is
+  locked (`FOR UPDATE`) while it is checked, so two audits can't both confirm it.
+
 ## 2026-10-22 — Anchored min and max, and anchored subqueries inside anchored ones (FR-P6)
 
 `tests/subqueries.sh` passes on the cluster (isomer 0.27.0, upgraded in place from 0.26.0), with a

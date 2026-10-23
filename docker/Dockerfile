@@ -25,7 +25,9 @@ ENV PATH="/root/.cargo/bin:${PATH}"
 FROM build-base AS citus
 COPY extensions/sharding /src/citus
 WORKDIR /src/citus
-RUN ./configure && make -j"$(nproc)" && make install && make install DESTDIR=/out
+# configure is generated from configure.ac and shipped with it; a checkout can leave configure.ac
+# the newer of the two, and make would then try to regenerate configure (with autoconf, absent).
+RUN touch configure && ./configure && make -j"$(nproc)" && make install && make install DESTDIR=/out
 
 # ── DocumentDB extensions (extensions/documents) ──────────────────────────────
 # Built on top of the Citus stage so pg_documentdb_distributed finds the Citus headers.
@@ -49,8 +51,8 @@ RUN make && make install DESTDIR=/out
 FROM build-base AS gateway
 COPY extensions/documents /src/documentdb
 WORKDIR /src/documentdb/pg_documentdb_gw
-RUN --mount=type=cache,target=/root/.cargo/registry \
-    --mount=type=cache,target=/root/.cargo/git \
+RUN --mount=type=cache,target=/root/.cargo/registry,sharing=locked \
+    --mount=type=cache,target=/root/.cargo/git,sharing=locked \
     cargo build --release && \
     install -D target/release/documentdb_gateway /out/usr/local/bin/documentdb_gateway
 
@@ -61,8 +63,8 @@ RUN cargo install --locked cargo-pgrx --version 0.18.0 && \
     cargo pgrx init --pg${PG_MAJOR} /usr/bin/pg_config
 COPY extensions/ivm /src/pg_trickle
 WORKDIR /src/pg_trickle
-RUN --mount=type=cache,target=/root/.cargo/registry \
-    --mount=type=cache,target=/root/.cargo/git \
+RUN --mount=type=cache,target=/root/.cargo/registry,sharing=locked \
+    --mount=type=cache,target=/root/.cargo/git,sharing=locked \
     cargo pgrx package --pg-config /usr/bin/pg_config && \
     mkdir -p /out && cp -r target/release/pg_trickle-pg${PG_MAJOR}/* /out/ && \
     cp sql/pg_trickle--*--*.sql /out/usr/share/postgresql/${PG_MAJOR}/extension/

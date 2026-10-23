@@ -21,7 +21,7 @@ fail() { printf '  FAIL %s\n       expected: %s\n       got:      %s\n' "$1" "$2
 expect() { [ "$3" = "$2" ] && pass "$1" || fail "$1" "$2" "$3"; }
 contains() { case "$3" in *"$2"*) pass "$1";; *) fail "$1" "...$2..." "$3";; esac; }
 eventually() {
-  local name=$1 want=$2 cmd=$3 timeout=${4:-30} got="" start=$SECONDS
+  local name=$1 want=$2 cmd=$3 timeout=$(( ${4:-30} * ${ISOMER_TIMEOUT_SCALE:-1} )) got="" start=$SECONDS
   while (( SECONDS - start < timeout )); do
     got=$(eval "$cmd" 2>/dev/null || true)
     [ "$got" = "$want" ] && { pass "$name ($(( SECONDS - start ))s)"; return; }

@@ -4,6 +4,7 @@
 #
 #   ./scripts/test-all.sh            # everything
 #   ./scripts/test-all.sh single     # single-node suites only
+#   ./scripts/test-all.sh cluster    # three-node cluster suites only
 set -uo pipefail
 cd "$(dirname "$0")/.."
 
@@ -23,18 +24,21 @@ healthy() {
 }
 
 docker compose --profile attach --profile test --profile cluster down -v --remove-orphans
-(cd clients && npm ci --silent && npm run build --silent >/dev/null && npm test --silent) || { echo "### clients: FAILED"; exit 1; }
-docker compose --profile attach --profile test build
-docker compose --profile attach --profile test up -d
-healthy
-sleep 5
-for t in scripts/smoke.sh tests/phase0.sh tests/phase1.sh tests/phase2.sh tests/phase3.sh tests/native.sh \
-         tests/routing.sh tests/history.sh tests/freshness.sh tests/console.sh tests/local_model.sh tests/metering.sh tests/alerts.sh tests/cutover_plan.sh \
-         tests/incremental.sh tests/subqueries.sh tests/embed_batch.sh tests/edge.sh tests/managed_source.sh tests/events_analytics.sh; do
-  run "$t"
-done
+if [ "${1:-all}" != "cluster" ]; then
+  (cd clients && npm ci --silent && npm run build --silent >/dev/null && npm test --silent) || { echo "### clients: FAILED"; exit 1; }
+  # ISOMER_SKIP_BUILD=1: the images are already built (CI builds them once, with a layer cache).
+  [ "${ISOMER_SKIP_BUILD:-0}" = "1" ] || docker compose --profile attach --profile test build
+  docker compose --profile attach --profile test up -d
+  healthy
+  sleep 5
+  for t in scripts/smoke.sh tests/phase0.sh tests/phase1.sh tests/phase2.sh tests/phase3.sh tests/native.sh \
+           tests/routing.sh tests/history.sh tests/freshness.sh tests/console.sh tests/local_model.sh tests/metering.sh tests/alerts.sh tests/cutover_plan.sh \
+           tests/incremental.sh tests/subqueries.sh tests/embed_batch.sh tests/edge.sh tests/managed_source.sh tests/events_analytics.sh; do
+    run "$t"
+  done
+fi
 
-if [ "${1:-all}" = "all" ]; then
+if [ "${1:-all}" = "all" ] || [ "${1:-}" = "cluster" ]; then
   docker compose --profile attach --profile test down -v --remove-orphans
   docker compose --profile cluster up -d
   healthy

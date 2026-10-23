@@ -71,3 +71,9 @@ Included in the web console:
 
 Inside the Docker images, the same license texts are under /usr/share/doc/isomerdb/licenses/ (the
 database image) and next to the model in the embedder image.
+
+Compiled into the services and the operator: the Rust crates and Go modules each one links, all
+under permissive licenses (Apache-2.0, MIT, BSD, ISC, Zlib, Unicode-3.0, CDLA-Permissive-2.0),
+listed with their license texts in licenses/third-party/isomer-api.txt, isomer-edge.txt,
+isomer-embedder.txt and operator/THIRD_PARTY_LICENSES; in each image, at
+/usr/share/doc/isomerdb/THIRD_PARTY_LICENSES. scripts/third-party-licenses.sh regenerates them.

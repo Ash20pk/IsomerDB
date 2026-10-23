@@ -1,5 +1,8 @@
 # Local single-node IsomerDB: Postgres on 5432, MongoDB wire gateway on 10260.
 #   docker compose up --build
+# Or the released images, without building:
+#   ISOMER_REGISTRY=ghcr.io/ash20pk/ ISOMER_TAG=0.27.0 docker compose up -d --no-build
+# Host ports, when something else holds them: ISOMER_PG_PORT, ISOMER_MONGO_PORT, ISOMER_API_PORT.
 #
 # The gateway reaches Postgres over its Unix socket (shared volume), because the DocumentDB
 # gateway only supports password-less local connections to Postgres.
@@ -8,14 +11,14 @@ services:
     build:
       context: .
       dockerfile: docker/Dockerfile
-    image: isomerdb:dev
+    image: ${ISOMER_REGISTRY:-}isomerdb:${ISOMER_TAG:-dev}
     environment:
       POSTGRES_PASSWORD: isomer
       ISOMER_MONGO_USER: isomer
       ISOMER_MONGO_PASSWORD: isomer
       ISOMER_COORDINATOR_HOST: db
     ports:
-      - "5432:5432"
+      - "${ISOMER_PG_PORT:-5432}:5432"
     volumes:
       - pgdata:/var/lib/postgresql
       - pgsocket:/var/run/postgresql
@@ -25,7 +28,7 @@ services:
       retries: 60
 
   gateway:
-    image: isomerdb:dev
+    image: ${ISOMER_REGISTRY:-}isomerdb:${ISOMER_TAG:-dev}
     depends_on:
       db:
         condition: service_healthy
@@ -36,7 +39,7 @@ services:
     volumes:
       - pgsocket:/var/run/postgresql
     ports:
-      - "10260:10260"
+      - "${ISOMER_MONGO_PORT:-10260}:10260"
 
   # Computes embeddings for vector projections, outside Postgres. API keys come from the
   # environment variables named in isomer.embedding_models.api_key_env.
@@ -44,7 +47,7 @@ services:
     build:
       context: .
       dockerfile: services/embedder/Dockerfile
-    image: isomer-embedder:dev
+    image: ${ISOMER_REGISTRY:-}isomer-embedder:${ISOMER_TAG:-dev}
     depends_on:
       db:
         condition: service_healthy
@@ -63,7 +66,7 @@ services:
     build:
       context: .
       dockerfile: services/api/Dockerfile
-    image: isomer-api:dev
+    image: ${ISOMER_REGISTRY:-}isomer-api:${ISOMER_TAG:-dev}
     depends_on:
       db:
         condition: service_healthy
@@ -77,7 +80,7 @@ services:
     volumes:
       - pgsocket:/var/run/postgresql
     ports:
-      - "8080:8080"
+      - "${ISOMER_API_PORT:-8080}:8080"
 
   # A stand-in OpenAI-compatible embeddings API, for tests (rate-limits every 5th request).
   mockai:
@@ -108,7 +111,7 @@ services:
     build:
       context: .
       dockerfile: services/edge/Dockerfile
-    image: isomer-edge:dev
+    image: ${ISOMER_REGISTRY:-}isomer-edge:${ISOMER_TAG:-dev}
     profiles: ["edge"]
     depends_on: [api]
     environment:
@@ -130,7 +133,7 @@ services:
   # Citus worker nodes, for multi-node clusters:
   #   docker compose --profile cluster up -d   then   SELECT isomer.add_node('worker1');
   worker1:
-    image: isomerdb:dev
+    image: ${ISOMER_REGISTRY:-}isomerdb:${ISOMER_TAG:-dev}
     profiles: ["cluster"]
     environment:
       POSTGRES_PASSWORD: isomer
@@ -147,7 +150,7 @@ services:
       retries: 60
 
   worker2:
-    image: isomerdb:dev
+    image: ${ISOMER_REGISTRY:-}isomerdb:${ISOMER_TAG:-dev}
     profiles: ["cluster"]
     environment:
       POSTGRES_PASSWORD: isomer
