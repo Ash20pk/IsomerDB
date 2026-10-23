@@ -22,7 +22,11 @@ fail() {
   echo "-- state at failure --"
   $ISO_DIAG -c "SELECT 'alert', alert, subject, left(detail, 200) FROM isomer.alerts" \
             -c "SELECT 'status', name, kind, status, oldest_pending, search_staleness FROM isomer.projection_status" \
-            -c "SELECT 'search row', id, status, left(note, 60) FROM public.order_search ORDER BY id" 2>&1 | sed 's/^/       /'
+            -c "SELECT 'search row', id, status, left(note, 60) FROM public.order_search ORDER BY id" \
+            -c "SELECT 'stream table', row_to_json(s) FROM pgtrickle.pgt_stream_tables s" \
+            -c "SELECT 'refresh', row_to_json(h) FROM (SELECT * FROM pgtrickle.pgt_refresh_history ORDER BY 1 DESC LIMIT 5) h" \
+            -c "SELECT 'worker', backend_type, application_name, state, left(query, 80) FROM pg_stat_activity WHERE backend_type ILIKE '%trickle%' OR application_name ILIKE '%trickle%'" 2>&1 | sed 's/^/       /'
+  docker compose logs --since 3m db 2>&1 | grep -iE 'trickle|pgt_|suspend|ERROR' | tail -30 | sed 's/^/       /'
   exit 1
 }
 expect() { [ "$3" = "$2" ] && pass "$1" || fail "$1" "$2" "$3"; }
