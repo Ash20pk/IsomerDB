@@ -182,7 +182,7 @@ sequenceDiagram
 
 ```sh
 # The released images (or `docker compose up --build -d` to build from source)
-ISOMER_REGISTRY=ghcr.io/ash20pk/ ISOMER_TAG=0.27.0 docker compose up -d --no-build
+ISOMER_REGISTRY=ghcr.io/ash20pk/ ISOMER_TAG=0.28.0 docker compose up -d --no-build
 ./scripts/smoke.sh               # Postgres on :5432, MongoDB wire on :10260, HTTP API and console on :8080
 psql postgres://postgres:isomer@localhost:5432/postgres
 ```

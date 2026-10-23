@@ -20,7 +20,7 @@ You need Docker with Compose v2.
 
 ```sh
 git clone https://github.com/Ash20pk/IsomerDB.git && cd IsomerDB
-ISOMER_REGISTRY=ghcr.io/ash20pk/ ISOMER_TAG=0.27.0 docker compose up -d --no-build
+ISOMER_REGISTRY=ghcr.io/ash20pk/ ISOMER_TAG=0.28.0 docker compose up -d --no-build
 ./scripts/smoke.sh
 ```
 
@@ -58,7 +58,7 @@ The operator runs an `IsomerCluster`: a coordinator with the MongoDB gateway bes
 workers, the HTTP API and, if you want it, the embedder. Install it from a release:
 
 ```sh
-kubectl apply --server-side -f https://github.com/Ash20pk/IsomerDB/releases/download/v0.27.0/isomerdb-operator.yaml
+kubectl apply --server-side -f https://github.com/Ash20pk/IsomerDB/releases/download/v0.28.0/isomerdb-operator.yaml
 ```
 
 That installs the CRD, RBAC and the operator in the `isomerdb-system` namespace, with every image
