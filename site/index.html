@@ -494,14 +494,14 @@ curl -H "X-Isomer-After: $TOKEN" \
           <tbody>
             <tr><th scope="row">Does a write land everywhere at once?</th><td data-label="Postgres + sync pipelines">No. Each store commits on its own, so a crash between them leaves the copies disagreeing.</td><td data-label="IsomerDB">Yes. Sync projections change in the writing transaction; bounded ones follow within a lag budget you set.</td></tr>
             <tr><th scope="row">Can I read my own write from another store?</th><td data-label="Postgres + sync pipelines">Not reliably. A read can come back stale until the consumer catches up, and nothing tells you when it has.</td><td data-label="IsomerDB">Yes. Pass the write token and the read waits for that write, over SQL, MongoDB or HTTP.</td></tr>
-            <tr><th scope="row">How fresh is each copy?</th><td data-label="Postgres + sync pipelines">Whatever the pipeline manages that day. Seconds is normal; a backfill can take it to minutes.</td><td data-label="IsomerDB">Declared per projection, measured all the time, and an alert fires on a breach.</td></tr>
+            <tr><th scope="row">How long until a write shows up everywhere?</th><td data-label="Postgres + sync pipelines">Typically 1 to 5 seconds from Postgres to Elasticsearch through Debezium, and minutes during a backfill. Each hop adds its own delay, and nobody sets a limit.</td><td data-label="IsomerDB">No delay for sync projections: they change in the writing transaction. Bounded ones landed about 0.7 s after commit in our tests, inside a 2 s budget that raises an alert if it is broken.</td></tr>
             <tr><th scope="row">How do I find a copy that has drifted?</th><td data-label="Postgres + sync pipelines">Usually a customer reports it.</td><td data-label="IsomerDB">The live auditor recomputes samples from the tables and pages on-call on any difference.</td></tr>
             <tr><th scope="row">How do I know it's correct?</th><td data-label="Postgres + sync pipelines">Each store is tested on its own. Nothing tests the pipelines between them.</td><td data-label="IsomerDB">Each projection carries a certificate of the rules it relies on, and Jepsen runs nightly with nodes killed, paused and partitioned.</td></tr>
             <tr><th scope="row">What do I operate?</th><td data-label="Postgres + sync pipelines">Five databases, Kafka, connectors and the consumers you wrote.</td><td data-label="IsomerDB">One database.</td></tr>
           </tbody>
         </table>
       </div>
-      <p class="muted">IsomerDB column: Jepsen nightly run of 23 October 2026, five workloads valid (isolation across shards, read-your-writes over SQL and MongoDB, incremental and subquery projections). The workloads have found and fixed three bugs so far.</p>
+      <p class="muted">IsomerDB column: Jepsen nightly run of 23 October 2026, five workloads valid (isolation across shards, read-your-writes over SQL and MongoDB, incremental and subquery projections). The workloads have found and fixed three bugs so far. Latency: IsomerDB measured on our dev stack; the pipeline range is the commonly published one for Debezium to Elasticsearch.</p>
     </div>
     <table class="tb" aria-label="Sheet 6 of 6"><tr><td class="no">Sheet<b>6/6</b></td><td>Title<b>Compared</b></td><td>Rev<b>0.28.0</b></td></tr></table>
   </div>
