@@ -117,7 +117,15 @@ $SRC -c "INSERT INTO shop.orders (customer_id, total) SELECT 1 + g % 30, g FROM 
 # Pretend the last sample was 60 seconds ago, so the 120 writes are spread over a minute.
 $ISO -c "UPDATE isomer.attachment_activity_cursor SET at = clock_timestamp() - interval '60 seconds' WHERE attachment = 'shop'"
 $ISO -c "SELECT isomer.sample_attachments()" >/dev/null
-contains "the write rate is measured" "2.00 writes/s on average" "$(plan detail 'When to cut over')"
+# The next sample runs a moment after the 60 seconds, more so on a slow machine: 120 writes over
+# 60 to 66 seconds.
+when=$(plan detail 'When to cut over')
+rate=$(sed -n 's/^\([0-9.]*\) writes\/s on average.*/\1/p' <<<"$when")
+if [ -n "$rate" ] && awk -v r="$rate" 'BEGIN { exit !(r >= 1.80 && r <= 2.00) }'; then
+  pass "the write rate is measured ($rate writes/s)"
+else
+  fail "the write rate is measured" "1.80 to 2.00 writes/s on average..." "$when"
+fi
 contains "  and the quietest hour named" "quietest hour so far $(date -u +%H):00" "$(plan detail 'When to cut over')"
 
 echo "== apply the plan"
