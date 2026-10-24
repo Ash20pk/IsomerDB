@@ -877,16 +877,56 @@ function start() {
     el, at: V(...el.dataset.at.split(',').map(Number)), center: el.dataset.align === 'center',
   }));
   const target = V(0.57, 3.4, 0);
+  const EL = 26 * Math.PI / 180;
+  function place(azDeg) {
+    const az = azDeg * Math.PI / 180, d = 30;
+    camera.position.set(target.x + d * Math.sin(az) * Math.cos(EL), target.y + d * Math.sin(EL), target.z + d * Math.cos(az) * Math.cos(EL));
+    camera.lookAt(target);
+  }
+
+  // The drawing's extremes: the stack and its construction lines, the line out to Postgres, the cylinder.
+  const extremes = [];
+  for (const x of [-3.3, 3.3]) for (const y of [-0.7, 8.3]) for (const z of [-1.5, 1.5]) extremes.push(V(x, y, z));
+  for (const x of [-6.8, 4.6]) extremes.push(V(x, -0.15, 0));
+  for (const x of [-6.35, -4.85]) for (const y of [-0.45, 0.45]) for (const z of [-0.75, 0.75]) extremes.push(V(x, y, z));
+
+  // Fit the camera so the drawing and every label stay inside the box through the whole swing:
+  // find the largest scale at which they all fit, then centre them.
   function resize() {
     const w = box.clientWidth, h = box.clientHeight;
     if (!w || !h) return;
     renderer.setSize(w, h, false);
-    const aspect = w / h, narrow = w < 700;
-    // room on the right for the labels, unless the figure is too narrow to show their text
     box.classList.toggle('tight', w < 560);
-    target.x = w < 560 ? 0.57 : 1.25;
-    const vh = narrow ? Math.max(10.6, 12.6 / aspect) : Math.max(12.4, 15.4 / aspect);
-    camera.left = -vh * aspect / 2; camera.right = vh * aspect / 2; camera.top = vh / 2; camera.bottom = -vh / 2;
+    const items = [];
+    for (const az of reduce ? [38] : [31, 34.5, 38, 41.5, 45]) {
+      place(az);
+      camera.updateMatrixWorld();
+      const view = (p) => p.clone().applyMatrix4(camera.matrixWorldInverse);
+      for (const p of extremes) { const v = view(p); items.push({ x: v.x, y: v.y, l: 0, r: 0, u: 0, d: 0 }); }
+      for (const lb of labels) {
+        const v = view(lb.at), lw = lb.el.offsetWidth, lh = lb.el.offsetHeight;
+        items.push(lb.center
+          ? { x: v.x, y: v.y, l: lw / 2, r: lw / 2, u: lh, d: 0 }
+          : { x: v.x, y: v.y, l: 0, r: lw + 10, u: lh / 2, d: lh / 2 });
+      }
+    }
+    const bounds = (k) => {
+      let x0 = Infinity, x1 = -Infinity, y0 = Infinity, y1 = -Infinity;
+      for (const it of items) {
+        x0 = Math.min(x0, it.x * k - it.l); x1 = Math.max(x1, it.x * k + it.r);
+        y0 = Math.min(y0, it.y * k - it.d); y1 = Math.max(y1, it.y * k + it.u);
+      }
+      return { x0, x1, y0, y1 };
+    };
+    const pad = 10;
+    let lo = 1, hi = 400;
+    for (let i = 0; i < 40; i++) {
+      const k = (lo + hi) / 2, b = bounds(k);
+      if (b.x1 - b.x0 <= w - 2 * pad && b.y1 - b.y0 <= h - 2 * pad) lo = k; else hi = k;
+    }
+    const b = bounds(lo), cx = (b.x0 + b.x1) / 2 / lo, cy = (b.y0 + b.y1) / 2 / lo;
+    camera.left = cx - w / 2 / lo; camera.right = cx + w / 2 / lo;
+    camera.top = cy + h / 2 / lo; camera.bottom = cy - h / 2 / lo;
     camera.updateProjectionMatrix();
   }
 
@@ -894,9 +934,7 @@ function start() {
   let next = 0.3;
   function frame() {
     const t = clock.getElapsedTime();
-    const az = (38 + (reduce ? 0 : 7 * Math.sin(t * 0.25))) * Math.PI / 180, el = 26 * Math.PI / 180, d = 30;
-    camera.position.set(target.x + d * Math.sin(az) * Math.cos(el), target.y + d * Math.sin(el), target.z + d * Math.cos(az) * Math.cos(el));
-    camera.lookAt(target);
+    place(38 + (reduce ? 0 : 7 * Math.sin(t * 0.25)));
     if (!reduce && t > next) { spawn(t); next = t + 0.45 + rnd() * 0.55; }
     for (let i = dots.length - 1; i >= 0; i--) {
       const p = dots[i], u = (t - p.t0) / p.dur;
@@ -919,10 +957,11 @@ function start() {
   }
 
   paint();
+  box.classList.add('is-3d');
   resize();
   frame();
-  box.classList.add('is-3d');
   new ResizeObserver(() => { resize(); frame(); }).observe(box);
+  document.fonts?.ready.then(() => { resize(); frame(); });
   const repaint = () => { paint(); frame(); };
   matchMedia('(prefers-color-scheme: dark)').addEventListener('change', repaint);
   new MutationObserver(repaint).observe(document.documentElement, { attributes: true, attributeFilter: ['data-theme'] });
