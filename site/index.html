@@ -194,17 +194,33 @@ pre .k { color: var(--red); }
 .kind .via { font: 700 15px var(--hand); color: var(--red); }
 .kind p { font-size: 15.5px; }
 
-/* crash test */
-.report { width: 100%; border-collapse: collapse; font-size: 15.5px; }
-.report th, .report td { text-align: left; padding: 12px 10px; border-bottom: 1px solid var(--marker); vertical-align: top; }
-.report th { font: 600 13px/1.2 var(--mono); text-transform: uppercase; letter-spacing: .06em; color: var(--pencil); border-bottom: 2px solid var(--ink); }
-.report td:first-child { font-family: var(--mono); font-size: 14px; white-space: nowrap; }
-.pass { font: 800 17px var(--display); letter-spacing: .08em; color: var(--red); text-transform: uppercase; }
+/* comparison */
+.vs { width: 100%; min-width: 640px; border-collapse: collapse; font-size: 15.5px; line-height: 1.5; table-layout: fixed; }
+.vs th, .vs td { text-align: left; vertical-align: top; padding: 16px 18px; border-bottom: 1px solid var(--marker); }
+.vs thead th { font: 800 24px/1 var(--display); text-transform: uppercase; letter-spacing: .01em; border-bottom: 2px solid var(--ink); padding-block: 0 14px; }
+.vs thead th:nth-child(2) { color: var(--pencil); }
+.vs tbody th { font: 700 18px/1.3 var(--hand); width: 26%; padding-left: 0; }
+.vs td:nth-child(2) { color: var(--pencil); }
+.vs td:nth-child(3), .vs th:nth-child(3) { border-left: 2px solid var(--ink); border-right: 2px solid var(--ink); background: color-mix(in srgb, var(--paper-2) 80%, transparent); }
+.vs tbody tr:last-child td:nth-child(3) { border-bottom: 2px solid var(--ink); }
+.vs thead th:nth-child(3) { border-top: 2px solid var(--ink); padding-top: 14px; color: var(--red); }
+@media (max-width: 700px) {
+  .vs { min-width: 0; }
+  .vs thead { display: none; }
+  .vs, .vs tbody, .vs tr, .vs th, .vs td { display: block; width: auto; }
+  .vs tr { padding-block: 18px; border-bottom: 1px solid var(--marker); }
+  .vs th, .vs td { border: 0 !important; padding: 0; }
+  .vs tbody th { width: auto; padding-bottom: 10px; }
+  .vs td { padding: 10px 14px 12px; }
+  .vs td::before { content: attr(data-label); display: block; font: 800 15px/1.3 var(--display); text-transform: uppercase; letter-spacing: .02em; margin-bottom: 2px; }
+  .vs td:nth-child(3) { border: 2px solid var(--ink) !important; }
+  .vs td:nth-child(3)::before { color: var(--red); }
+  .stamp { top: -40px; }
+}
+.sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); }
 .table-scroll { overflow-x: auto; min-width: 0; }
 .stamp-wrap { position: relative; display: grid; gap: 16px; min-width: 0; }
-.stamp { position: absolute; right: 4px; top: -52px; transform: rotate(-9deg); border: 3px double var(--red); color: var(--red); padding: 6px 14px; font: 800 26px/1 var(--display); letter-spacing: .12em; text-transform: uppercase; border-radius: 4px; pointer-events: none; }
-.proofs { display: grid; gap: 22px; align-content: start; }
-.proof { display: grid; gap: 6px; }
+.stamp { position: absolute; right: 18px; top: -58px; transform: rotate(-9deg); border: 3px double var(--red); color: var(--red); padding: 6px 14px; font: 800 26px/1 var(--display); letter-spacing: .12em; text-transform: uppercase; border-radius: 4px; pointer-events: none; z-index: 1; }
 
 /* quick start */
 .start { display: grid; grid-template-columns: minmax(0, .8fr) minmax(0, 1.2fr); gap: 40px; align-items: start; }
@@ -241,7 +257,7 @@ footer { padding-block: 32px 56px; font-size: 14.5px; }
     <nav class="nav" aria-label="Sections">
       <a href="#how">How it works</a>
       <a href="#projections">Projections</a>
-      <a href="#proof">Crash test</a>
+      <a href="#proof">Compared</a>
       <a href="#start">Get it</a>
       <a href="https://github.com/Ash20pk/IsomerDB">GitHub</a>
     </nav>
@@ -262,8 +278,8 @@ footer { padding-block: 32px 56px; font-size: 14.5px; }
           <caption>parts list</caption>
           <thead><tr><th>Item</th><th>Part</th></tr></thead>
           <tbody>
-            <tr><td>1</td><td><strong>Tables</strong><span>PostgreSQL 18 with Citus. Full SQL, joins and transactions, sharded across nodes.</span></td></tr>
-            <tr><td>2</td><td><strong>The isomer extension</strong><span>Captures the keys each write touches, maintains projections, audits for drift.</span></td></tr>
+            <tr><td>1</td><td><strong>Tables</strong><span>The source of truth. Full SQL, joins and transactions, sharded across nodes.</span></td></tr>
+            <tr><td>2</td><td><strong>Projection engine</strong><span>Re-derives what each write touches, holds every projection to its freshness, audits for drift.</span></td></tr>
             <tr><td>3</td><td><strong>Projections</strong><span>Documents, search, vectors, caches, events and analytics, each a query over the tables.</span></td></tr>
             <tr><td>4</td><td><strong>Interfaces</strong><span>Postgres wire, MongoDB wire and HTTP. A write token makes any of them read your writes.</span></td></tr>
             <tr><td>5</td><td><strong>Your apps</strong><span>Ordinary drivers, unchanged.</span></td></tr>
@@ -274,7 +290,7 @@ footer { padding-block: 32px 56px; font-size: 14.5px; }
       <figure class="figure">
         <p class="fig-note"><span>exploded view of the stack</span><span class="w">in red: each write, re-deriving the projections it touches</span></p>
         <div class="stack" id="stack">
-        <svg id="flat" class="flat sketch c-ink" viewBox="0 0 1000 540" role="img" aria-label="The IsomerDB stack: your apps on top, then SQL, MongoDB and HTTP interfaces, projections, the isomer extension, and tables sharded across three nodes, attached to your existing Postgres">
+        <svg id="flat" class="flat sketch c-ink" viewBox="0 0 1000 540" role="img" aria-label="The IsomerDB stack: your apps on top, then SQL, MongoDB and HTTP interfaces, projections, the projection engine, and tables sharded across three nodes, attached to your existing Postgres">
           <g class="strokes"></g>
           <text class="t-box" x="620" y="54" text-anchor="middle">your apps</text>
           <text class="t-box" x="400" y="144" text-anchor="middle">SQL</text>
@@ -286,7 +302,7 @@ footer { padding-block: 32px 56px; font-size: 14.5px; }
           <text class="t-box" x="674" y="234" text-anchor="middle" font-size="13">cache</text>
           <text class="t-box" x="783" y="234" text-anchor="middle" font-size="13">events</text>
           <text class="t-box" x="891" y="234" text-anchor="middle" font-size="13">analytics</text>
-          <text class="t-box" x="620" y="334" text-anchor="middle">isomer extension</text>
+          <text class="t-box" x="620" y="334" text-anchor="middle">projection engine</text>
           <text class="t-box" x="400" y="434" text-anchor="middle">node 1</text>
           <text class="t-box" x="620" y="434" text-anchor="middle">node 2</text>
           <text class="t-box" x="840" y="434" text-anchor="middle">node 3</text>
@@ -302,7 +318,7 @@ footer { padding-block: 32px 56px; font-size: 14.5px; }
         <canvas id="stack-3d" aria-hidden="true"></canvas>
         <div class="stack-labels" id="stack-labels" aria-hidden="true">
           <div class="lbl" data-at="3.6,0,-1.5"><span class="num">1</span><span class="txt">tables, sharded</span></div>
-          <div class="lbl" data-at="3.6,1.9,-1.5"><span class="num">2</span><span class="txt">isomer extension</span></div>
+          <div class="lbl" data-at="3.6,1.9,-1.5"><span class="num">2</span><span class="txt">projection engine</span></div>
           <div class="lbl" data-at="3.6,3.8,-1.5"><span class="num">3</span><span class="txt">projections</span></div>
           <div class="lbl" data-at="3.6,5.7,-1.5"><span class="num">4</span><span class="txt">interfaces</span></div>
           <div class="lbl" data-at="3.6,7.6,-1.5"><span class="num">5</span><span class="txt">your apps</span></div>
@@ -467,35 +483,27 @@ curl -H "X-Isomer-After: $TOKEN" \
 <section class="sheet" id="proof">
   <div class="wrap"><div class="frame">
     <div class="sheet-head">
-      <h2>Proven, not trusted</h2>
-      <p class="lede">A projection that is silently wrong looks like data loss. So every one is checked three ways, all the time.</p>
+      <h2>The usual stack, next to IsomerDB</h2>
+      <p class="lede">The same data kept in Postgres, MongoDB, Elasticsearch, Redis and a vector store, synced by CDC pipelines, against one database that keeps its own projections. Every claim on the right is checked while it runs.</p>
     </div>
-    <div class="two">
-      <div class="stamp-wrap">
-        <span class="stamp" aria-hidden="true">Valid</span>
-        <div class="table-scroll">
-          <table class="report">
-            <thead><tr><th>Workload</th><th>What it checks</th><th>Result</th></tr></thead>
-            <tbody>
-              <tr><td>append</td><td>Isolation across shards, analysed with Elle</td><td class="pass">valid</td></tr>
-              <tr><td>ryw</td><td>Read-your-writes through projections over SQL</td><td class="pass">valid</td></tr>
-              <tr><td>mongo</td><td>Read-your-writes over the MongoDB wire protocol</td><td class="pass">valid</td></tr>
-              <tr><td>incremental</td><td>Incrementally maintained projections</td><td class="pass">valid</td></tr>
-              <tr><td>subqueries</td><td>Anchored subqueries under concurrent moves</td><td class="pass">valid</td></tr>
-            </tbody>
-          </table>
-        </div>
-        <p class="muted">Jepsen, nightly run of 23 October 2026, with worker nodes paused, killed and cut off from the network. The workloads have found and fixed three bugs so far.</p>
+    <div class="stamp-wrap">
+      <span class="stamp" aria-hidden="true">Valid</span>
+      <div class="table-scroll">
+        <table class="vs">
+          <thead><tr><th scope="col"><span class="sr">Question</span></th><th scope="col">Postgres + sync pipelines</th><th scope="col">IsomerDB</th></tr></thead>
+          <tbody>
+            <tr><th scope="row">Does a write land everywhere at once?</th><td data-label="Postgres + sync pipelines">No. Each store commits on its own, so a crash between them leaves the copies disagreeing.</td><td data-label="IsomerDB">Yes. Sync projections change in the writing transaction; bounded ones follow within a lag budget you set.</td></tr>
+            <tr><th scope="row">Can I read my own write from another store?</th><td data-label="Postgres + sync pipelines">Not reliably. A read can come back stale until the consumer catches up, and nothing tells you when it has.</td><td data-label="IsomerDB">Yes. Pass the write token and the read waits for that write, over SQL, MongoDB or HTTP.</td></tr>
+            <tr><th scope="row">How fresh is each copy?</th><td data-label="Postgres + sync pipelines">Whatever the pipeline manages that day. Seconds is normal; a backfill can take it to minutes.</td><td data-label="IsomerDB">Declared per projection, measured all the time, and an alert fires on a breach.</td></tr>
+            <tr><th scope="row">How do I find a copy that has drifted?</th><td data-label="Postgres + sync pipelines">Usually a customer reports it.</td><td data-label="IsomerDB">The live auditor recomputes samples from the tables and pages on-call on any difference.</td></tr>
+            <tr><th scope="row">How do I know it's correct?</th><td data-label="Postgres + sync pipelines">Each store is tested on its own. Nothing tests the pipelines between them.</td><td data-label="IsomerDB">Each projection carries a certificate of the rules it relies on, and Jepsen runs nightly with nodes killed, paused and partitioned.</td></tr>
+            <tr><th scope="row">What do I operate?</th><td data-label="Postgres + sync pipelines">Five databases, Kafka, connectors and the consumers you wrote.</td><td data-label="IsomerDB">One database.</td></tr>
+          </tbody>
+        </table>
       </div>
-      <div class="proofs">
-        <div class="proof"><h3>Live auditor</h3><p>Recomputes samples from the tables and compares them with each projection. Any drift is pinned for reproduction and pages on-call.</p></div>
-        <div class="proof"><h3>Certificates</h3><p>Every projection carries the rules it relies on, checked live, so you can see why it is correct.</p></div>
-        <pre><span class="k">SELECT</span> * <span class="k">FROM</span> isomer.drift_report;
-<span class="c">-- drift 0 rows · N checks · since ...</span>
-<span class="k">SELECT</span> isomer.certificate('customer_profile');</pre>
-      </div>
+      <p class="muted">IsomerDB column: Jepsen nightly run of 23 October 2026, five workloads valid (isolation across shards, read-your-writes over SQL and MongoDB, incremental and subquery projections). The workloads have found and fixed three bugs so far.</p>
     </div>
-    <table class="tb" aria-label="Sheet 6 of 6"><tr><td class="no">Sheet<b>6/6</b></td><td>Title<b>Crash test</b></td><td>Rev<b>0.28.0</b></td></tr></table>
+    <table class="tb" aria-label="Sheet 6 of 6"><tr><td class="no">Sheet<b>6/6</b></td><td>Title<b>Compared</b></td><td>Rev<b>0.28.0</b></td></tr></table>
   </div>
   </div>
 </section>
@@ -818,7 +826,7 @@ function start() {
     return out;
   }
 
-  // 1 tables on three nodes, 2 the extension, 3 projections, 4 interfaces, 5 your apps
+  // 1 tables on three nodes, 2 the projection engine, 3 projections, 4 interfaces, 5 your apps
   const XS = [-2.3, 0, 2.3];
   XS.forEach((x) => block(V(x, 0, 0), V(2, 0.3, 3)));
   block(V(0, 1.9, 0), V(6.6, 0.3, 3));
@@ -844,7 +852,7 @@ function start() {
   scene.add(new THREE.LineSegments(strokes(pg, 1, 0.008), mats.ink));
   scene.add(new THREE.LineSegments(strokes([[V(-4.7, 0, 0), V(-3.45, 0, 0)], [V(-3.45, 0, 0), V(-3.7, 0.16, 0)], [V(-3.45, 0, 0), V(-3.7, -0.16, 0)]], 2, 0.01), mats.red));
 
-  // writes: from a shard, through the extension, into the projection they touch
+  // writes: from a shard, through the projection engine, into the projection they touch
   const dots = [], dotGeo = new THREE.SphereGeometry(0.09, 12, 8);
   function spawn(t) {
     const sx = XS[Math.floor(rnd() * 3)] + (rnd() - 0.5) * 1.2, sz = (rnd() - 0.5) * 2;
