@@ -1,0 +1,845 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>IsomerDB</title>
+<meta name="description" content="One database. Write once, read in any projection. SQL tables are the source of truth; documents, search, vectors and caches are projections the database keeps consistent on every write.">
+<meta property="og:title" content="IsomerDB">
+<meta property="og:description" content="One database. Write once, read in any projection.">
+<meta property="og:url" content="https://isomerdb.com/">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect x='3' y='19' width='26' height='6' fill='none' stroke='%2324272b' stroke-width='2.5'/%3E%3Crect x='3' y='11' width='26' height='6' fill='none' stroke='%2324272b' stroke-width='2.5'/%3E%3Crect x='3' y='3' width='26' height='6' fill='%23cc2e24'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wght@400;500;600&family=JetBrains+Mono:wght@400;500&family=Kalam:wght@400;700&family=Saira+Extra+Condensed:wght@600;800&display=swap">
+<style>
+/* Layout: a designer's concept sheet. Each section is one sheet of the drawing set, with rough
+   pencil construction, grey marker shading and a single red marker for what matters. */
+:root {
+  --paper: #eceeeb;     /* cool vellum */
+  --paper-2: #e1e4e0;
+  --grid: #e2e5e1;
+  --ink: #24272b;       /* fineliner */
+  --pencil: #7c838a;    /* construction lines */
+  --marker: #c3c8cb;    /* cool grey marker */
+  --red: #cc2e24;       /* the one red marker */
+  --display: "Saira Extra Condensed", "Arial Narrow", "Roboto Condensed", sans-serif;
+  --body: "Archivo", "Helvetica Neue", Arial, sans-serif;
+  --hand: "Kalam", "Comic Neue", "Segoe Print", cursive;
+  --mono: "JetBrains Mono", ui-monospace, "SFMono-Regular", Menlo, monospace;
+  color-scheme: light;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --paper: #16181b; --paper-2: #1f2226; --grid: #1c1f22; --ink: #e8eaeb;
+    --pencil: #7f878e; --marker: #363b41; --red: #ff5a47; color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --paper: #16181b; --paper-2: #1f2226; --grid: #1c1f22; --ink: #e8eaeb;
+  --pencil: #7f878e; --marker: #363b41; --red: #ff5a47; color-scheme: dark;
+}
+
+* { box-sizing: border-box; }
+html { scroll-behavior: smooth; }
+@media (prefers-reduced-motion: reduce) { html { scroll-behavior: auto; } }
+[hidden] { display: none !important; }
+img { max-width: 100%; }
+body {
+  margin: 0;
+  background-color: var(--paper);
+  background-image:
+    linear-gradient(var(--grid) 1px, transparent 1px),
+    linear-gradient(90deg, var(--grid) 1px, transparent 1px);
+  background-size: 32px 32px;
+  color: var(--ink);
+  font: 400 17px/1.6 var(--body);
+  -webkit-font-smoothing: antialiased;
+}
+.wrap {
+  max-width: 1160px; margin: 0 auto;
+  padding-left: max(16px, env(safe-area-inset-left, 0px));
+  padding-right: max(16px, env(safe-area-inset-right, 0px));
+}
+a { color: inherit; text-decoration-color: var(--red); text-underline-offset: 3px; text-decoration-thickness: 2px; }
+a:hover { color: var(--red); }
+:focus-visible { outline: 2px dashed var(--red); outline-offset: 3px; }
+
+/* sketch colours: every stroke is drawn in currentColor */
+.c-ink { color: var(--ink); }
+.c-pencil { color: var(--pencil); }
+.c-marker { color: var(--marker); }
+.c-red { color: var(--red); }
+.c-paper { color: var(--paper); }
+.soft { opacity: .5; }
+svg.sketch { display: block; width: 100%; height: auto; max-width: 100%; overflow: visible; }
+svg text { fill: currentColor; }
+.t-hand { font-family: var(--hand); font-size: 15px; }
+.t-box { font-family: var(--body); font-weight: 600; font-size: 15px; }
+.t-num { font-family: var(--display); font-weight: 800; font-size: 22px; }
+
+/* top bar */
+.top { display: flex; align-items: center; justify-content: space-between; gap: 16px; flex-wrap: wrap; padding-block: 20px; }
+.brand { font: 800 30px/1 var(--display); letter-spacing: .02em; text-transform: uppercase; text-decoration: none; }
+.brand span { color: var(--red); }
+.nav { display: flex; flex-wrap: wrap; gap: 6px 20px; font-size: 15px; }
+.nav a { text-decoration: none; }
+.nav a:hover { text-decoration: underline; text-decoration-color: var(--red); }
+
+/* type */
+.eyebrow { font: 700 18px/1.2 var(--hand); color: var(--red); margin: 0 0 8px; }
+h1, h2, h3 { font-family: var(--display); text-transform: uppercase; text-wrap: balance; margin: 0; }
+h1 { font-weight: 800; font-size: clamp(46px, 7.4vw, 96px); line-height: .92; letter-spacing: .005em; }
+h2 { font-weight: 800; font-size: clamp(36px, 4.6vw, 60px); line-height: .95; }
+h3 { font-weight: 600; font-size: 26px; line-height: 1.05; letter-spacing: .01em; }
+p { margin: 0; }
+.lede { font-size: clamp(18px, 1.6vw, 21px); max-width: 60ch; }
+.muted { color: var(--pencil); }
+.prose { max-width: 62ch; display: grid; gap: 14px; }
+
+/* buttons */
+.ctas { display: flex; flex-wrap: wrap; gap: 12px; }
+.btn {
+  display: inline-flex; align-items: center; gap: 8px; padding: 11px 18px;
+  font: 600 15px/1 var(--body); text-decoration: none; border: 2px solid var(--ink);
+  border-radius: 3px 6px 4px 7px; background: transparent; color: var(--ink); cursor: pointer;
+  box-shadow: 3px 3px 0 var(--marker); transition: transform .12s, box-shadow .12s;
+}
+.btn:hover { color: var(--ink); transform: translate(-1px, -1px); box-shadow: 5px 5px 0 var(--marker); }
+.btn.primary { background: var(--ink); color: var(--paper); }
+.btn.primary:hover { color: var(--paper); }
+
+/* hero */
+.hero { padding-block: 28px 8px; }
+.hero-grid { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 32px; align-items: end; }
+.hero-copy { display: grid; gap: 22px; min-width: 0; }
+.titleblock { border: 2px solid var(--ink); border-collapse: collapse; font: 500 12px/1.3 var(--mono); text-transform: uppercase; letter-spacing: .04em; background: var(--paper); }
+.titleblock td { border: 1px solid var(--ink); padding: 6px 10px; vertical-align: top; }
+.titleblock td b { display: block; font: 700 15px/1.2 var(--hand); text-transform: none; letter-spacing: 0; color: var(--red); }
+.figure { margin: 30px 0 0; display: grid; gap: 18px; }
+.fig-note { font: 700 17px var(--hand); color: var(--pencil); display: flex; flex-wrap: wrap; gap: 4px 18px; }
+.fig-note .w { color: var(--red); }
+
+/* the stack: a 3D drawing when WebGL runs, the 2D sketch otherwise */
+.stack { position: relative; aspect-ratio: 16 / 10; max-width: 100%; overflow: hidden; }
+.stack canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: none; }
+.stack .flat { position: absolute; inset: 0; width: 100%; height: 100%; }
+.stack.is-3d canvas { display: block; }
+.stack.is-3d .flat { display: none; }
+.stack-labels { position: absolute; inset: 0; pointer-events: none; display: none; }
+.stack.is-3d .stack-labels { display: block; }
+.lbl { position: absolute; left: 0; top: 0; display: flex; align-items: center; gap: 8px; font: 700 17px/1 var(--hand); white-space: nowrap; will-change: transform; }
+.lbl .num, .balloon { width: 30px; height: 30px; border: 2px solid var(--ink); border-radius: 50%; display: inline-grid; place-items: center; font: 800 17px/1 var(--display); background: var(--paper); flex: none; }
+
+.legend { list-style: none; margin: 0; padding: 0; display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 16px 28px; }
+.legend li { display: grid; grid-template-columns: 34px minmax(0, 1fr); gap: 12px; align-items: start; }
+.legend .balloon { width: 34px; height: 34px; font-size: 19px; }
+.legend strong { display: block; font: 600 20px/1.1 var(--display); text-transform: uppercase; letter-spacing: .02em; }
+.legend span { font-size: 15px; color: var(--pencil); }
+
+/* sheets */
+.sheet { padding-block: 72px; border-top: 1.5px dashed var(--pencil); }
+.sheet-head { display: grid; gap: 12px; margin-bottom: 36px; max-width: 780px; }
+.two { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 32px; }
+.panel { display: grid; gap: 10px; min-width: 0; margin: 0; }
+.panel figcaption { font: 700 20px var(--hand); }
+.panel figcaption.bad { color: var(--red); }
+
+/* steps: a real sequence, so they are numbered */
+.steps { list-style: none; margin: 0; padding: 0; display: grid; }
+.step { display: grid; grid-template-columns: 90px minmax(0, 1fr) minmax(0, 1.15fr); gap: 28px; padding-block: 28px; border-bottom: 1px solid var(--marker); align-items: start; }
+.step:first-child { border-top: 1px solid var(--marker); }
+.step-n { font: 800 84px/.8 var(--display); color: transparent; -webkit-text-stroke: 2px var(--ink); }
+.step-text { display: grid; gap: 8px; min-width: 0; }
+
+/* code */
+pre { margin: 0; min-width: 0; overflow-x: auto; background: var(--paper-2); border: 1.5px solid var(--ink); border-radius: 2px 5px 3px 6px; box-shadow: 4px 4px 0 var(--marker); padding: 16px 18px; font: 400 13.5px/1.6 var(--mono); }
+pre .c { color: var(--pencil); }
+pre .k { color: var(--red); }
+
+/* freshness */
+.gauge-row { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 40px; align-items: center; }
+.modes { display: grid; gap: 18px; }
+.mode { display: grid; gap: 4px; padding-left: 16px; border-left: 3px solid var(--ink); }
+.mode.bounded { border-left-color: var(--red); }
+
+/* projection kinds */
+.kinds { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 250px), 1fr)); border-top: 2px solid var(--ink); border-left: 2px solid var(--ink); }
+.kind { padding: 20px; border-right: 2px solid var(--ink); border-bottom: 2px solid var(--ink); display: grid; gap: 8px; align-content: start; min-width: 0; background: color-mix(in srgb, var(--paper) 70%, transparent); }
+.kind .via { font: 700 15px var(--hand); color: var(--red); }
+.kind p { font-size: 15.5px; }
+
+/* crash test */
+.report { width: 100%; border-collapse: collapse; font-size: 15.5px; }
+.report th, .report td { text-align: left; padding: 12px 10px; border-bottom: 1px solid var(--marker); vertical-align: top; }
+.report th { font: 600 13px/1.2 var(--mono); text-transform: uppercase; letter-spacing: .06em; color: var(--pencil); border-bottom: 2px solid var(--ink); }
+.report td:first-child { font-family: var(--mono); font-size: 14px; white-space: nowrap; }
+.pass { font: 800 17px var(--display); letter-spacing: .08em; color: var(--red); text-transform: uppercase; }
+.table-scroll { overflow-x: auto; min-width: 0; }
+.stamp-wrap { position: relative; display: grid; gap: 16px; min-width: 0; }
+.stamp { position: absolute; right: 4px; top: -58px; transform: rotate(-9deg); border: 3px double var(--red); color: var(--red); padding: 6px 14px; font: 800 26px/1 var(--display); letter-spacing: .12em; text-transform: uppercase; border-radius: 4px; pointer-events: none; }
+.proofs { display: grid; gap: 22px; align-content: start; }
+.proof { display: grid; gap: 6px; }
+
+/* quick start */
+.start { display: grid; grid-template-columns: minmax(0, .8fr) minmax(0, 1.2fr); gap: 40px; align-items: start; }
+.copy-row { display: flex; justify-content: flex-end; margin-top: 10px; gap: 12px; align-items: center; }
+.copy-note { font: 400 15px var(--hand); color: var(--red); }
+
+footer { padding-block: 40px 56px; border-top: 1.5px dashed var(--pencil); font-size: 14.5px; }
+.foot { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 16px; }
+
+@media (max-width: 900px) {
+  .hero-grid, .two, .gauge-row, .start { grid-template-columns: minmax(0, 1fr); }
+  .legend { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .step { grid-template-columns: 60px minmax(0, 1fr); }
+  .step pre { grid-column: 1 / -1; }
+  .step-n { font-size: 60px; }
+  .titleblock { justify-self: start; }
+}
+@media (max-width: 700px) {
+  .stack { aspect-ratio: 1 / 1; }
+  .lbl .txt { display: none; }
+}
+@media (max-width: 600px) {
+  .legend { grid-template-columns: minmax(0, 1fr); }
+  .sheet { padding-block: 52px; }
+  .stamp { top: -46px; font-size: 20px; }
+}
+</style>
+</head>
+<body>
+
+<div class="wrap">
+  <header class="top">
+    <a class="brand" href="#top">Isomer<span>DB</span></a>
+    <nav class="nav" aria-label="Sections">
+      <a href="#how">How it works</a>
+      <a href="#projections">Projections</a>
+      <a href="#proof">Crash test</a>
+      <a href="#start">Get it</a>
+      <a href="https://github.com/Ash20pk/IsomerDB">GitHub</a>
+    </nav>
+  </header>
+
+  <section class="hero" id="top">
+    <div class="hero-grid">
+      <div class="hero-copy">
+        <p class="eyebrow">concept sketch · rev 0.28.0, out now</p>
+        <h1>One database.<br>Write once, read in any projection.</h1>
+        <p class="lede">Keep your SQL tables as the single source of truth. Documents, search indexes, vectors and caches are projections of those tables that the database builds, shards and keeps consistent on every write. Start by attaching to the Postgres you already run, with no migration.</p>
+        <div class="ctas">
+          <a class="btn primary" href="#start">Run it in one command</a>
+          <a class="btn" href="https://github.com/Ash20pk/IsomerDB">Star on GitHub</a>
+          <a class="btn" href="https://github.com/Ash20pk/IsomerDB/releases/tag/v0.28.0">Release notes</a>
+        </div>
+      </div>
+      <table class="titleblock" aria-label="Drawing title block">
+        <tr><td>Project<b>IsomerDB</b></td><td>Rev<b>0.28.0</b></td></tr>
+        <tr><td>Licence<b>AGPL-3.0</b></td><td>Images<b>amd64 · arm64</b></td></tr>
+        <tr><td colspan="2">Sheet<b>1 of 6</b></td></tr>
+      </table>
+    </div>
+
+    <figure class="figure">
+      <p class="fig-note"><span>exploded view of the stack</span><span class="w">in red: each write, re-deriving the projections it touches</span></p>
+      <div class="stack" id="stack">
+        <svg id="flat" class="flat sketch c-ink" viewBox="0 0 1000 540" role="img" aria-label="The IsomerDB stack: your apps on top, then SQL, MongoDB and HTTP interfaces, projections, the isomer extension, and tables sharded across three nodes, attached to your existing Postgres">
+          <g class="strokes"></g>
+          <text class="t-box" x="620" y="54" text-anchor="middle">your apps</text>
+          <text class="t-box" x="400" y="144" text-anchor="middle">SQL</text>
+          <text class="t-box" x="620" y="144" text-anchor="middle">MongoDB wire</text>
+          <text class="t-box" x="840" y="144" text-anchor="middle">HTTP</text>
+          <text class="t-box" x="349" y="234" text-anchor="middle" font-size="13">docs</text>
+          <text class="t-box" x="457" y="234" text-anchor="middle" font-size="13">search</text>
+          <text class="t-box" x="566" y="234" text-anchor="middle" font-size="13">vectors</text>
+          <text class="t-box" x="674" y="234" text-anchor="middle" font-size="13">cache</text>
+          <text class="t-box" x="783" y="234" text-anchor="middle" font-size="13">events</text>
+          <text class="t-box" x="891" y="234" text-anchor="middle" font-size="13">analytics</text>
+          <text class="t-box" x="620" y="334" text-anchor="middle">isomer extension</text>
+          <text class="t-box" x="400" y="434" text-anchor="middle">node 1</text>
+          <text class="t-box" x="620" y="434" text-anchor="middle">node 2</text>
+          <text class="t-box" x="840" y="434" text-anchor="middle">node 3</text>
+          <text class="t-hand" x="140" y="510" text-anchor="middle">your Postgres</text>
+          <text class="t-hand c-red" x="260" y="414" text-anchor="middle">attach</text>
+          <text class="t-num" x="975" y="429" text-anchor="middle" dominant-baseline="central">1</text>
+          <text class="t-num" x="975" y="329" text-anchor="middle" dominant-baseline="central">2</text>
+          <text class="t-num" x="975" y="229" text-anchor="middle" dominant-baseline="central">3</text>
+          <text class="t-num" x="975" y="139" text-anchor="middle" dominant-baseline="central">4</text>
+          <text class="t-num" x="975" y="49" text-anchor="middle" dominant-baseline="central">5</text>
+          <text class="t-num" x="60" y="372" text-anchor="middle" dominant-baseline="central">6</text>
+        </svg>
+        <canvas id="stack-3d" aria-hidden="true"></canvas>
+        <div class="stack-labels" id="stack-labels" aria-hidden="true">
+          <div class="lbl" data-at="3.6,0,-1.5"><span class="num">1</span><span class="txt">tables, sharded</span></div>
+          <div class="lbl" data-at="3.6,1.9,-1.5"><span class="num">2</span><span class="txt">isomer extension</span></div>
+          <div class="lbl" data-at="3.6,3.8,-1.5"><span class="num">3</span><span class="txt">projections</span></div>
+          <div class="lbl" data-at="3.6,5.7,-1.5"><span class="num">4</span><span class="txt">SQL · MongoDB · HTTP</span></div>
+          <div class="lbl" data-at="3.6,7.6,-1.5"><span class="num">5</span><span class="txt">your apps</span></div>
+          <div class="lbl" data-at="-5.6,0.75,0" data-align="center"><span class="num">6</span><span class="txt">your Postgres</span></div>
+        </div>
+      </div>
+      <ol class="legend">
+        <li><div class="balloon">1</div><div><strong>Tables</strong><span>PostgreSQL 18 with Citus. The single source of truth: full SQL, joins and transactions, sharded across nodes.</span></div></li>
+        <li><div class="balloon">2</div><div><strong>The isomer extension</strong><span>Captures the keys each write touches, maintains projections, holds freshness, audits for drift and proposes what to build.</span></div></li>
+        <li><div class="balloon">3</div><div><strong>Projections</strong><span>Documents, search, vectors, caches, events and analytics, each declared as a query over the tables.</span></div></li>
+        <li><div class="balloon">4</div><div><strong>Interfaces</strong><span>Postgres wire, MongoDB wire and HTTP. A write token makes any of them read your writes.</span></div></li>
+        <li><div class="balloon">5</div><div><strong>Your apps</strong><span>Ordinary drivers, unchanged. A MongoDB session reads its own SQL writes.</span></div></li>
+        <li><div class="balloon">6</div><div><strong>Attach</strong><span>Follows the Postgres you already run, with no migration, until you decide to cut over.</span></div></li>
+      </ol>
+    </figure>
+  </section>
+</div>
+
+<section class="sheet" id="why">
+  <div class="wrap">
+    <div class="sheet-head">
+      <p class="eyebrow">sheet 2 of 6 · the problem</p>
+      <h2>Five stores, and a pipeline for each</h2>
+      <p class="lede">Products start on Postgres. Then come MongoDB for nested documents, Elasticsearch for search, Redis for hot keys and a vector store for embeddings. Every sync job between them is a place where data goes missing or stale, and no transaction spans them.</p>
+    </div>
+    <div class="two">
+      <figure class="panel">
+        <svg id="today" class="sketch c-ink" viewBox="0 0 460 300" role="img" aria-label="Postgres with four sync jobs to MongoDB, Elasticsearch, Redis and a vector store, crossed out">
+          <g class="strokes"></g>
+          <text class="t-box" x="80" y="155" text-anchor="middle">Postgres</text>
+          <text class="t-box" x="370" y="41" text-anchor="middle">MongoDB</text>
+          <text class="t-box" x="370" y="113" text-anchor="middle">Elasticsearch</text>
+          <text class="t-box" x="370" y="185" text-anchor="middle">Redis</text>
+          <text class="t-box" x="370" y="257" text-anchor="middle">Vector store</text>
+          <text class="t-hand c-pencil" x="214" y="84" text-anchor="middle">CDC job</text>
+          <text class="t-hand c-pencil" x="226" y="124" text-anchor="middle">ETL</text>
+          <text class="t-hand c-pencil" x="226" y="160" text-anchor="middle">invalidation</text>
+          <text class="t-hand c-pencil" x="210" y="214" text-anchor="middle">embed script</text>
+          <text class="t-hand c-red" x="455" y="76" text-anchor="end">stale?</text>
+          <text class="t-hand c-red" x="80" y="214" text-anchor="middle">no transaction</text>
+          <text class="t-hand c-red" x="80" y="233" text-anchor="middle">spans these</text>
+        </svg>
+        <figcaption class="bad">Today: four copies, four ways to drift.</figcaption>
+      </figure>
+      <figure class="panel">
+        <svg id="after" class="sketch c-ink" viewBox="0 0 460 300" role="img" aria-label="IsomerDB: SQL tables feed document, search, vector and cache projections inside one database, read over SQL, MongoDB and HTTP">
+          <g class="strokes"></g>
+          <text class="t-num" x="26" y="50">ISOMERDB</text>
+          <text class="t-box" x="80" y="155" text-anchor="middle">SQL tables</text>
+          <text class="t-box" x="235" y="87" text-anchor="middle">documents</text>
+          <text class="t-box" x="235" y="135" text-anchor="middle">search</text>
+          <text class="t-box" x="235" y="183" text-anchor="middle">vectors</text>
+          <text class="t-box" x="235" y="231" text-anchor="middle">cache</text>
+          <text class="t-hand" x="362" y="114">SQL</text>
+          <text class="t-hand" x="362" y="155">MongoDB</text>
+          <text class="t-hand" x="362" y="196">HTTP</text>
+          <text class="t-hand c-red" x="160" y="270" text-anchor="middle">every write, one transaction</text>
+        </svg>
+        <figcaption>With IsomerDB: one store, projections kept by the database.</figcaption>
+      </figure>
+    </div>
+  </div>
+</section>
+
+<section class="sheet" id="how">
+  <div class="wrap">
+    <div class="sheet-head">
+      <p class="eyebrow">sheet 3 of 6 · how it works</p>
+      <h2>From the Postgres you run today to one database</h2>
+      <p class="lede">You don't migrate on day one. IsomerDB follows your existing database, builds what you read, and takes over as the primary only when you decide to cut over.</p>
+    </div>
+    <ol class="steps">
+      <li class="step">
+        <div class="step-n" aria-hidden="true">1</div>
+        <div class="step-text"><h3>Attach</h3><p>Point IsomerDB at your Postgres. It checks every table for keys and replica identity, copies it, then follows the change stream. Table names stay the same, and nothing is migrated.</p></div>
+        <pre><span class="k">SELECT</span> * <span class="k">FROM</span> isomer.attach(
+  'shop', 'host=... dbname=... user=...');</pre>
+      </li>
+      <li class="step">
+        <div class="step-n" aria-hidden="true">2</div>
+        <div class="step-text"><h3>Declare a projection</h3><p>Write the shape you want to read as a SQL query. The database builds it, shards it beside the rows it comes from, and certifies it.</p></div>
+        <pre><span class="k">SELECT</span> isomer.create_projection(
+  name =&gt; 'customer_profile', kind =&gt; 'document',
+  key  =&gt; 'id', query =&gt; $$
+    <span class="k">SELECT</span> c.id, jsonb_build_object('name', c.name,
+      'orders', (<span class="k">SELECT</span> jsonb_agg(o.status)
+                 <span class="k">FROM</span> orders o <span class="k">WHERE</span> o.customer_id = c.id)) <span class="k">AS</span> doc
+    <span class="k">FROM</span> customers c $$);</pre>
+      </li>
+      <li class="step">
+        <div class="step-n" aria-hidden="true">3</div>
+        <div class="step-text"><h3>Write as usual</h3><p>Each write re-derives only the keys it touches. Aggregates across shards are maintained incrementally from row deltas, and a cost model picks the strategy.</p></div>
+        <pre><span class="k">UPDATE</span> customers <span class="k">SET</span> name = 'Asha' <span class="k">WHERE</span> id = 42;
+<span class="k">SELECT</span> isomer.last_write_token();  <span class="c">-- carry it to the read</span></pre>
+      </li>
+      <li class="step">
+        <div class="step-n" aria-hidden="true">4</div>
+        <div class="step-text"><h3>Read it anywhere</h3><p>Read the projection from SQL, as a MongoDB collection, or over HTTP. Pass the write token and the read waits for exactly that write. Causally consistent MongoDB sessions do it with no code changes.</p></div>
+        <pre><span class="c"># MongoDB driver, unchanged</span>
+db.customer_profile.findOne({ _id: 42 })
+
+<span class="c"># HTTP, waiting for your write</span>
+curl -H "X-Isomer-After: $TOKEN" \
+  localhost:8080/v1/projections/customer_profile/docs/42</pre>
+      </li>
+      <li class="step">
+        <div class="step-n" aria-hidden="true">5</div>
+        <div class="step-text"><h3>Cut over</h3><p>When you're ready, IsomerDB freezes the source, catches up, copies sequences and defaults, and becomes the primary. It can replicate back for a rollback. A cutover plan lists everything left to recreate first.</p></div>
+        <pre><span class="k">SELECT</span> * <span class="k">FROM</span> isomer.cutover('shop',
+  rollback_conninfo =&gt; 'host=... user=...');
+<span class="k">SELECT</span> isomer.alter_projection('customer_profile',
+  freshness =&gt; 'sync');</pre>
+      </li>
+    </ol>
+  </div>
+</section>
+
+<section class="sheet" id="freshness">
+  <div class="wrap">
+    <div class="gauge-row">
+      <div class="prose">
+        <p class="eyebrow">sheet 4 of 6 · freshness</p>
+        <h2>Every projection has a speed limit</h2>
+        <p class="lede">You choose how fresh each projection must be, and the database holds to it.</p>
+        <div class="modes">
+          <div class="mode"><h3>Sync</h3><p>Updated inside the writing transaction. A read never sees the table and the projection disagree. Available once IsomerDB is the primary.</p></div>
+          <div class="mode bounded"><h3>Bounded</h3><p>Maintained right after the write, within a lag budget such as 2 seconds. A breach raises an alert, and a read that passes a write token waits until that write has landed.</p></div>
+        </div>
+      </div>
+      <figure class="panel">
+        <svg id="gauge" class="sketch c-ink" viewBox="0 0 380 250" role="img" aria-label="A sketched gauge reading lag in seconds from 0 to 5, with the budget marked at 2 seconds and the needle at 0.6 seconds">
+          <g class="strokes"></g>
+          <text class="t-num" x="190" y="234" text-anchor="middle" font-size="20">LAG · SECONDS</text>
+          <text class="t-hand c-red" x="132" y="26" text-anchor="end">budget 2 s</text>
+          <text class="t-hand" x="236" y="168">0.6 s now</text>
+        </svg>
+        <figcaption>order_search: bounded, budget 2 s</figcaption>
+      </figure>
+    </div>
+  </div>
+</section>
+
+<section class="sheet" id="projections">
+  <div class="wrap">
+    <div class="sheet-head">
+      <p class="eyebrow">sheet 5 of 6 · projections</p>
+      <h2>Seven kinds of projection, one set of tables</h2>
+      <p class="lede">Each one is a query over the same tables. Drop it and the data is still there; change the query and it is rebuilt.</p>
+    </div>
+    <div class="kinds">
+      <div class="kind"><h3>Document</h3><p class="via">read as a MongoDB collection</p><p>Nested documents built with joins and subqueries, kept current on every write.</p></div>
+      <div class="kind"><h3>Search</h3><p class="via">BM25 from SQL</p><p>Full-text search ranked with BM25, over joins across sharded tables.</p></div>
+      <div class="kind"><h3>Vector</h3><p class="via">nearest neighbour in SQL</p><p>Only rows whose text changed are re-embedded, with a hosted model or bge-small on your own CPU.</p></div>
+      <div class="kind"><h3>Cache</h3><p class="via">hot keys, by key</p><p>Key-value entries derived from the tables, so there is nothing to invalidate by hand.</p></div>
+      <div class="kind"><h3>Event</h3><p class="via">a change feed, or live over HTTP</p><p>Domain events from row changes, such as order_paid, in commit order per row.</p></div>
+      <div class="kind"><h3>Analytics</h3><p class="via">columnar tables</p><p>Aggregates maintained incrementally: a change rewrites only the days or groups it reaches.</p></div>
+      <div class="kind"><h3>Edge</h3><p class="via">replicas close to your users</p><p>Projections served from memory over HTTP and MongoDB, fed by the change feed.</p></div>
+      <div class="kind"><h3>Proposed</h3><p class="via">by the database itself</p><p>It reads its own query log, proposes the projections and shard keys it should have, and routes a slow query only after checking the rows match.</p></div>
+    </div>
+  </div>
+</section>
+
+<section class="sheet" id="proof">
+  <div class="wrap">
+    <div class="sheet-head">
+      <p class="eyebrow">sheet 6 of 6 · crash test</p>
+      <h2>Proven, not trusted</h2>
+      <p class="lede">A projection that is silently wrong looks like data loss. So every one is checked three ways, all the time.</p>
+    </div>
+    <div class="two">
+      <div class="stamp-wrap">
+        <span class="stamp" aria-hidden="true">Valid</span>
+        <div class="table-scroll">
+          <table class="report">
+            <thead><tr><th>Workload</th><th>What it checks</th><th>Result</th></tr></thead>
+            <tbody>
+              <tr><td>append</td><td>Isolation across shards, analysed with Elle</td><td class="pass">valid</td></tr>
+              <tr><td>ryw</td><td>Read-your-writes through projections over SQL</td><td class="pass">valid</td></tr>
+              <tr><td>mongo</td><td>Read-your-writes over the MongoDB wire protocol</td><td class="pass">valid</td></tr>
+              <tr><td>incremental</td><td>Incrementally maintained projections</td><td class="pass">valid</td></tr>
+              <tr><td>subqueries</td><td>Anchored subqueries under concurrent moves</td><td class="pass">valid</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="muted">Jepsen, nightly run of 23 October 2026, with worker nodes paused, killed and cut off from the network. The workloads have found and fixed three bugs so far.</p>
+      </div>
+      <div class="proofs">
+        <div class="proof"><h3>Live auditor</h3><p>Recomputes samples from the tables and compares them with each projection. Any drift is pinned for reproduction and pages on-call.</p></div>
+        <div class="proof"><h3>Certificates</h3><p>Every projection carries the rules it relies on, checked live, so you can see why it is correct.</p></div>
+        <pre><span class="k">SELECT</span> * <span class="k">FROM</span> isomer.drift_report;
+<span class="c">-- drift 0 rows · N checks · since ...</span>
+<span class="k">SELECT</span> isomer.certificate('customer_profile');</pre>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="sheet" id="start">
+  <div class="wrap start">
+    <div class="prose">
+      <p class="eyebrow">take it for a drive</p>
+      <h2>Running in one command</h2>
+      <p class="lede">Pull the released images and you have Postgres, the MongoDB gateway and the console on your machine. For production, the Kubernetes operator runs hot standbys, fails over, backs up and upgrades.</p>
+      <div class="ctas">
+        <a class="btn primary" href="https://github.com/Ash20pk/IsomerDB/blob/main/docs/self-hosting.md">Self-hosting guide</a>
+        <a class="btn" href="https://github.com/Ash20pk/IsomerDB">Read the code</a>
+      </div>
+    </div>
+    <div>
+      <pre id="quick"><span class="c"># needs Docker with Compose v2</span>
+git clone https://github.com/Ash20pk/IsomerDB.git &amp;&amp; cd IsomerDB
+ISOMER_REGISTRY=ghcr.io/ash20pk/ ISOMER_TAG=0.28.0 \
+  docker compose up -d --no-build
+./scripts/smoke.sh
+psql postgres://postgres:isomer@localhost:5432/postgres</pre>
+      <div class="copy-row"><span class="copy-note" id="copy-note" aria-live="polite"></span><button class="btn" id="copy" type="button">Copy commands</button></div>
+    </div>
+  </div>
+</section>
+
+<footer>
+  <div class="wrap foot">
+    <span>IsomerDB 0.28.0 · AGPL-3.0, clients Apache-2.0 · built by Aswin Kumar</span>
+    <span><a href="https://github.com/Ash20pk/IsomerDB">GitHub</a> · <a href="https://github.com/Ash20pk/IsomerDB/releases/tag/v0.28.0">Releases</a> · <a href="https://github.com/Ash20pk/IsomerDB/blob/main/CONTRIBUTING.md">Contributing</a></span>
+  </div>
+</footer>
+
+<script src="https://cdn.jsdelivr.net/npm/roughjs@4.6.6/bundled/rough.js"></script>
+<script>
+// The 2D sketches, drawn with rough.js (or plain strokes if it didn't load).
+(function () {
+  var NS = 'http://www.w3.org/2000/svg';
+  var seed = 3;
+
+  function shim() {
+    function mk(d, o) {
+      var p = document.createElementNS(NS, 'path');
+      p.setAttribute('d', d);
+      p.setAttribute('fill', o.fill && o.fillStyle === 'solid' ? o.fill : 'none');
+      p.setAttribute('stroke', o.stroke || 'currentColor');
+      p.setAttribute('stroke-width', o.strokeWidth || 1);
+      return p;
+    }
+    function ellipse(cx, cy, w, h, o) {
+      return mk('M' + (cx - w / 2) + ' ' + cy + 'a' + w / 2 + ' ' + h / 2 + ' 0 1 0 ' + w + ' 0a' + w / 2 + ' ' + h / 2 + ' 0 1 0 ' + (-w) + ' 0', o);
+    }
+    return {
+      line: function (x1, y1, x2, y2, o) { return mk('M' + x1 + ' ' + y1 + 'L' + x2 + ' ' + y2, o); },
+      rectangle: function (x, y, w, h, o) { return mk('M' + x + ' ' + y + 'h' + w + 'v' + h + 'h' + (-w) + 'Z', o); },
+      ellipse: ellipse,
+      circle: function (cx, cy, d, o) { return ellipse(cx, cy, d, d, o); },
+      path: function (d, o) { return mk(d, o); },
+      arc: function (cx, cy, w, h, a0, a1, closed, o) {
+        var rx = w / 2, ry = h / 2;
+        return mk('M' + (cx + rx * Math.cos(a0)) + ' ' + (cy + ry * Math.sin(a0)) + 'A' + rx + ' ' + ry + ' 0 ' + (a1 - a0 > Math.PI ? 1 : 0) + ' 1 ' + (cx + rx * Math.cos(a1)) + ' ' + (cy + ry * Math.sin(a1)), o);
+      }
+    };
+  }
+
+  function sketch(id, fn) {
+    var svg = document.getElementById(id);
+    if (!svg) return;
+    var layer = svg.querySelector('.strokes');
+    var rc = window.rough ? window.rough.svg(svg) : shim();
+    function o(extra) {
+      var base = { stroke: 'currentColor', strokeWidth: 1.4, roughness: 1.1, bowing: 1.2, seed: (seed += 7) };
+      for (var k in extra) base[k] = extra[k];
+      return base;
+    }
+    function put(cls, node) { node.setAttribute('class', cls); layer.appendChild(node); return node; }
+    function arrow(x1, y1, x2, y2, cls, extra) {
+      var a = Math.atan2(y2 - y1, x2 - x1), L = 9;
+      put(cls, rc.line(x1, y1, x2, y2, o(extra)));
+      put(cls, rc.line(x2, y2, x2 - L * Math.cos(a - 0.45), y2 - L * Math.sin(a - 0.45), o(extra)));
+      put(cls, rc.line(x2, y2, x2 - L * Math.cos(a + 0.45), y2 - L * Math.sin(a + 0.45), o(extra)));
+    }
+    fn(rc, o, put, arrow);
+  }
+
+  var hatch = { stroke: 'none', fill: 'currentColor', fillStyle: 'hachure', hachureGap: 7, fillWeight: 1.6 };
+
+  // Sheet 1: the stack, flat (shown when WebGL can't run)
+  sketch('flat', function (rc, o, put, arrow) {
+    [300, 940].forEach(function (x) { put('c-pencil soft', rc.line(x, 6, x, 480, o({ strokeWidth: 0.7, roughness: 0.5 }))); });
+    put('c-pencil', rc.rectangle(300, 20, 640, 56, o({ strokeWidth: 1.6, strokeLineDash: [8, 6] })));
+    [300, 520, 740].forEach(function (x) { put('c-ink', rc.rectangle(x, 110, 200, 56, o({ strokeWidth: 1.8 }))); });
+    for (var i = 0; i < 6; i++) {
+      var x = 300 + i * 108.4;
+      put('c-marker', rc.rectangle(x, 200, 98, 56, o(hatch)));
+      put('c-ink', rc.rectangle(x, 200, 98, 56, o({ strokeWidth: 1.6 })));
+    }
+    put('c-marker', rc.rectangle(300, 300, 640, 56, o(hatch)));
+    put('c-ink', rc.rectangle(300, 300, 640, 56, o({ strokeWidth: 2.2 })));
+    [300, 520, 740].forEach(function (x) {
+      put('c-marker', rc.rectangle(x, 400, 200, 56, o(hatch)));
+      put('c-ink', rc.rectangle(x, 400, 200, 56, o({ strokeWidth: 2.2 })));
+    });
+    [78, 168, 258, 358].forEach(function (y) { arrow(620, y + 18, 620, y + 2, 'c-pencil', { strokeWidth: 1, roughness: 0.6 }); });
+    put('c-ink', rc.ellipse(140, 400, 140, 30, o({ strokeWidth: 1.8 })));
+    put('c-ink', rc.path('M 70 400 L 70 470 A 70 15 0 0 0 210 470 L 210 400', o({ strokeWidth: 1.8 })));
+    put('c-ink', rc.path('M 70 435 A 70 15 0 0 0 210 435', o({ strokeWidth: 1 })));
+    arrow(214, 428, 296, 428, 'c-red', { strokeWidth: 2.4, roughness: 0.8 });
+    [[975, 429], [975, 329], [975, 229], [975, 139], [975, 49], [60, 372]].forEach(function (b) {
+      put('c-paper', rc.circle(b[0], b[1], 32, o({ stroke: 'none', fill: 'currentColor', fillStyle: 'solid', roughness: 0.2 })));
+      put('c-ink', rc.circle(b[0], b[1], 32, o({ strokeWidth: 1.6, roughness: 0.8 })));
+    });
+  });
+
+  // Sheet 2: today
+  sketch('today', function (rc, o, put, arrow) {
+    put('c-marker', rc.rectangle(20, 118, 120, 64, o({ stroke: 'none', fill: 'currentColor', fillStyle: 'hachure', hachureGap: 6, fillWeight: 1.6 })));
+    put('c-ink', rc.rectangle(20, 118, 120, 64, o({ strokeWidth: 2 })));
+    [14, 86, 158, 230].forEach(function (y) {
+      put('c-ink', rc.rectangle(300, y, 140, 44, o({ strokeWidth: 1.6 })));
+      arrow(140, 150, 298, y + 22, 'c-pencil', { strokeWidth: 1.2, roughness: 1.8, bowing: 3 });
+    });
+    put('c-red soft', rc.line(176, 26, 452, 288, o({ strokeWidth: 3.5, roughness: 1.4 })));
+    put('c-red soft', rc.line(452, 22, 180, 286, o({ strokeWidth: 3.5, roughness: 1.4 })));
+  });
+
+  // Sheet 2: with IsomerDB
+  sketch('after', function (rc, o, put, arrow) {
+    put('c-ink', rc.rectangle(12, 18, 300, 266, o({ strokeWidth: 2.2 })));
+    put('c-marker', rc.rectangle(30, 120, 100, 60, o({ stroke: 'none', fill: 'currentColor', fillStyle: 'hachure', hachureGap: 6, fillWeight: 1.6 })));
+    put('c-ink', rc.rectangle(30, 120, 100, 60, o({ strokeWidth: 2 })));
+    [64, 112, 160, 208].forEach(function (y) {
+      put('c-ink', rc.rectangle(180, y, 110, 36, o({ strokeWidth: 1.4 })));
+      arrow(132, 150, 178, y + 18, 'c-ink', { strokeWidth: 1.1, roughness: 0.8 });
+    });
+    [110, 151, 192].forEach(function (y) { arrow(292, 150, 354, y - 5, 'c-ink', { strokeWidth: 1.1, roughness: 0.8 }); });
+    put('c-red', rc.path('M 66 278 Q 160 288 256 276', o({ strokeWidth: 2.4, roughness: 0.8 })));
+  });
+
+  // Sheet 4: the lag gauge, 0 to 5 seconds
+  sketch('gauge', function (rc, o, put) {
+    var cx = 190, cy = 200, r = 150;
+    function ang(v) { return Math.PI + (v / 5) * Math.PI; }
+    put('c-marker', rc.arc(cx, cy, 2 * r, 2 * r, Math.PI, 2 * Math.PI, true, o({ stroke: 'none', fill: 'currentColor', fillStyle: 'hachure', hachureGap: 9, fillWeight: 1.2 })));
+    put('c-ink', rc.arc(cx, cy, 2 * r, 2 * r, Math.PI, 2 * Math.PI, false, o({ strokeWidth: 2.4 })));
+    put('c-red', rc.arc(cx, cy, 2 * (r - 14), 2 * (r - 14), ang(2), 2 * Math.PI, false, o({ strokeWidth: 7, roughness: 0.6 })));
+    put('c-ink', rc.line(cx - r - 6, cy, cx + r + 6, cy, o({ strokeWidth: 1.4 })));
+    for (var v = 0; v <= 5.001; v += 0.5) {
+      var a = ang(v), major = Math.abs(v - Math.round(v)) < 0.01, len = major ? 18 : 9;
+      put('c-ink', rc.line(cx + r * Math.cos(a), cy + r * Math.sin(a), cx + (r - len) * Math.cos(a), cy + (r - len) * Math.sin(a), o({ strokeWidth: major ? 2 : 1.2, roughness: 0.4 })));
+    }
+    var svg = document.getElementById('gauge');
+    for (var s = 0; s <= 5; s++) {
+      var t = document.createElementNS(NS, 'text'), aa = ang(s);
+      t.setAttribute('x', (cx + (r - 36) * Math.cos(aa)).toFixed(1));
+      t.setAttribute('y', (cy + (r - 36) * Math.sin(aa) + 7).toFixed(1));
+      t.setAttribute('text-anchor', 'middle');
+      t.setAttribute('class', 't-num');
+      t.setAttribute('font-size', '20');
+      t.textContent = s;
+      svg.appendChild(t);
+    }
+    var n = ang(0.6);
+    put('c-ink', rc.line(cx, cy, cx + (r - 26) * Math.cos(n), cy + (r - 26) * Math.sin(n), o({ strokeWidth: 3.2, roughness: 0.5 })));
+    put('c-ink', rc.circle(cx, cy, 20, o({ fill: 'currentColor', fillStyle: 'solid', roughness: 0.4 })));
+    put('c-red', rc.line(cx + (r + 4) * Math.cos(ang(2)), cy + (r + 4) * Math.sin(ang(2)), 138, 32, o({ strokeWidth: 1.2, roughness: 0.6 })));
+  });
+
+  // copy button
+  var btn = document.getElementById('copy'), note = document.getElementById('copy-note'), pre = document.getElementById('quick');
+  btn.addEventListener('click', function () {
+    function selectIt() {
+      var range = document.createRange(); range.selectNodeContents(pre);
+      var sel = window.getSelection(); sel.removeAllRanges(); sel.addRange(range);
+      note.textContent = 'selected: press Ctrl+C or Cmd+C';
+    }
+    try {
+      navigator.clipboard.writeText(pre.innerText).then(function () { note.textContent = 'copied'; }, selectIt);
+    } catch (e) { selectIt(); }
+  });
+})();
+</script>
+<script type="module">
+// Sheet 1 in 3D: the stack as an exploded drawing, hand-drawn strokes, writes traced in red.
+import * as THREE from 'https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js';
+
+const box = document.getElementById('stack');
+const canvas = document.getElementById('stack-3d');
+const reduce = matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+let renderer = null;
+try { renderer = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: true }); } catch (e) { renderer = null; }
+if (renderer) start();
+
+function start() {
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+  const scene = new THREE.Scene();
+  const camera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0.1, 100);
+  const V = (x, y, z) => new THREE.Vector3(x, y, z);
+
+  let s = 20261024;
+  const rnd = () => (s = (Math.imul(s, 1664525) + 1013904223) >>> 0) / 4294967296;
+
+  const mats = {
+    ink: new THREE.LineBasicMaterial({ transparent: true, opacity: 0.95 }),
+    pencil: new THREE.LineBasicMaterial({ transparent: true, opacity: 0.5 }),
+    red: new THREE.LineBasicMaterial(),
+    fill: new THREE.MeshBasicMaterial({ transparent: true, opacity: 0.45, depthWrite: false, side: THREE.DoubleSide }),
+    hatch: new THREE.LineBasicMaterial({ transparent: true, opacity: 0.6 }),
+    dot: new THREE.MeshBasicMaterial(),
+  };
+  const flash = [];
+  const css = (n) => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+  function paint() {
+    const ink = new THREE.Color(css('--ink')), red = new THREE.Color(css('--red'));
+    mats.ink.color.copy(ink);
+    mats.pencil.color.set(css('--pencil'));
+    mats.red.color.copy(red);
+    mats.fill.color.set(css('--marker'));
+    mats.hatch.color.set(css('--pencil'));
+    mats.dot.color.copy(red);
+    flash.forEach((f) => { f.base = ink.clone(); f.hot = red.clone(); f.mat.color.copy(ink); });
+  }
+
+  // A line as a sketch: two passes, each overshooting a little and bowing in the middle.
+  function strokes(pairs, passes = 2, wobble = 0.03) {
+    const pts = [];
+    const j = (k) => V(rnd() - 0.5, rnd() - 0.5, rnd() - 0.5).multiplyScalar(k);
+    for (const [a, b] of pairs) {
+      const dir = b.clone().sub(a).normalize(), len = a.distanceTo(b);
+      for (let p = 0; p < passes; p++) {
+        const A = a.clone().addScaledVector(dir, -0.08 * rnd()).add(j(wobble));
+        const B = b.clone().addScaledVector(dir, 0.08 * rnd()).add(j(wobble));
+        const M = A.clone().lerp(B, 0.4 + rnd() * 0.2).add(j(wobble * Math.min(2, len / 2)));
+        pts.push(A, M, M, B);
+      }
+    }
+    return new THREE.BufferGeometry().setFromPoints(pts);
+  }
+  function edges(c, size) {
+    const h = size.clone().multiplyScalar(0.5), v = [];
+    for (const x of [-1, 1]) for (const y of [-1, 1]) for (const z of [-1, 1]) v.push(V(c.x + x * h.x, c.y + y * h.y, c.z + z * h.z));
+    return [[0, 1], [2, 3], [4, 5], [6, 7], [0, 2], [1, 3], [4, 6], [5, 7], [0, 4], [1, 5], [2, 6], [3, 7]].map(([i, k]) => [v[i], v[k]]);
+  }
+  function hatchTop(c, size, gap = 0.24) {
+    const y = c.y + size.y / 2 + 0.003, x0 = c.x - size.x / 2, x1 = c.x + size.x / 2, z0 = c.z - size.z / 2, z1 = c.z + size.z / 2, out = [];
+    for (let k = x0 - z1 + gap / 2; k < x1 - z0; k += gap) {
+      const lo = Math.max(z0, x0 - k), hi = Math.min(z1, x1 - k);
+      if (hi - lo > 0.05) out.push([V(lo + k, y, lo), V(hi + k, y, hi)]);
+    }
+    return out;
+  }
+  function block(c, size, { mat = mats.ink, shade = true } = {}) {
+    if (shade) {
+      const m = new THREE.Mesh(new THREE.BoxGeometry(size.x, size.y, size.z), mats.fill);
+      m.position.copy(c); scene.add(m);
+      scene.add(new THREE.LineSegments(strokes(hatchTop(c, size), 1, 0.01), mats.hatch));
+    }
+    scene.add(new THREE.LineSegments(strokes(edges(c, size)), mat));
+  }
+  function ring(cx, cy, cz, r, n = 32) {
+    const out = [];
+    for (let i = 0; i < n; i++) {
+      const a0 = (i / n) * Math.PI * 2, a1 = ((i + 1) / n) * Math.PI * 2;
+      out.push([V(cx + r * Math.cos(a0), cy, cz + r * Math.sin(a0)), V(cx + r * Math.cos(a1), cy, cz + r * Math.sin(a1))]);
+    }
+    return out;
+  }
+
+  // 1 tables on three nodes, 2 the extension, 3 projections, 4 interfaces, 5 your apps
+  const XS = [-2.3, 0, 2.3];
+  XS.forEach((x) => block(V(x, 0, 0), V(2, 0.3, 3)));
+  block(V(0, 1.9, 0), V(6.6, 0.3, 3));
+  const targets = [];
+  for (const z of [-0.8, 0.8]) for (const x of XS) {
+    const mat = mats.ink.clone();
+    block(V(x, 3.8, z), V(2, 0.3, 1.3), { mat });
+    const f = { c: V(x, 3.8, z), mat, at: -10 };
+    flash.push(f); targets.push(f);
+  }
+  XS.forEach((x) => block(V(x, 5.7, 0), V(2, 0.3, 3)));
+  block(V(0, 7.6, 0), V(6.6, 0.3, 3), { mat: mats.pencil, shade: false });
+
+  // construction lines through the corners
+  const verts = [];
+  for (const x of [-3.3, 3.3]) for (const z of [-1.5, 1.5]) verts.push([V(x, -0.7, z), V(x, 8.3, z)]);
+  verts.push([V(-6.8, -0.15, 0), V(4.6, -0.15, 0)]);
+  scene.add(new THREE.LineSegments(strokes(verts, 1, 0.01), mats.pencil));
+
+  // 6 your Postgres, attached
+  const pg = [...ring(-5.6, 0.45, 0, 0.75), ...ring(-5.6, -0.45, 0, 0.75), ...ring(-5.6, 0, 0, 0.75, 24)];
+  for (const a of [0, Math.PI / 2, Math.PI, Math.PI * 1.5]) pg.push([V(-5.6 + 0.75 * Math.cos(a), -0.45, 0.75 * Math.sin(a)), V(-5.6 + 0.75 * Math.cos(a), 0.45, 0.75 * Math.sin(a))]);
+  scene.add(new THREE.LineSegments(strokes(pg, 1, 0.008), mats.ink));
+  scene.add(new THREE.LineSegments(strokes([[V(-4.7, 0, 0), V(-3.45, 0, 0)], [V(-3.45, 0, 0), V(-3.7, 0.16, 0)], [V(-3.45, 0, 0), V(-3.7, -0.16, 0)]], 2, 0.01), mats.red));
+
+  // writes: from a shard, through the extension, into the projection they touch
+  const dots = [], dotGeo = new THREE.SphereGeometry(0.09, 12, 8);
+  function spawn(t) {
+    const sx = XS[Math.floor(rnd() * 3)] + (rnd() - 0.5) * 1.2, sz = (rnd() - 0.5) * 2;
+    const f = targets[Math.floor(rnd() * targets.length)];
+    const mid = V(sx * 0.5 + f.c.x * 0.5, 1.9, sz * 0.5 + f.c.z * 0.5);
+    const path = [V(sx, 0.16, sz), mid, V(f.c.x, 3.62, f.c.z)];
+    const mesh = new THREE.Mesh(dotGeo, mats.dot);
+    scene.add(mesh);
+    dots.push({ mesh, path, t0: t, dur: 1.9, f });
+  }
+  function along(path, u) {
+    const lens = [];
+    let total = 0;
+    for (let i = 0; i < path.length - 1; i++) { const l = path[i].distanceTo(path[i + 1]); lens.push(l); total += l; }
+    let d = u * total;
+    for (let i = 0; i < lens.length; i++) { if (d <= lens[i]) return path[i].clone().lerp(path[i + 1], d / lens[i]); d -= lens[i]; }
+    return path[path.length - 1].clone();
+  }
+
+  // labels follow their anchor points
+  const labels = [...document.querySelectorAll('#stack-labels .lbl')].map((el) => ({
+    el, at: V(...el.dataset.at.split(',').map(Number)), center: el.dataset.align === 'center',
+  }));
+  const target = V(0.57, 3.4, 0);
+  function resize() {
+    const w = box.clientWidth, h = box.clientHeight;
+    if (!w || !h) return;
+    renderer.setSize(w, h, false);
+    const aspect = w / h, narrow = w < 700;
+    const vh = Math.max(10.6, (narrow ? 12.6 : 11.8) / aspect);
+    camera.left = -vh * aspect / 2; camera.right = vh * aspect / 2; camera.top = vh / 2; camera.bottom = -vh / 2;
+    camera.updateProjectionMatrix();
+  }
+
+  const clock = new THREE.Clock();
+  let next = 0.3;
+  function frame() {
+    const t = clock.getElapsedTime();
+    const az = (38 + (reduce ? 0 : 7 * Math.sin(t * 0.25))) * Math.PI / 180, el = 26 * Math.PI / 180, d = 30;
+    camera.position.set(target.x + d * Math.sin(az) * Math.cos(el), target.y + d * Math.sin(el), target.z + d * Math.cos(az) * Math.cos(el));
+    camera.lookAt(target);
+    if (!reduce && t > next) { spawn(t); next = t + 0.45 + rnd() * 0.55; }
+    for (let i = dots.length - 1; i >= 0; i--) {
+      const p = dots[i], u = (t - p.t0) / p.dur;
+      if (u >= 1) { p.f.at = t; scene.remove(p.mesh); dots.splice(i, 1); continue; }
+      p.mesh.position.copy(along(p.path, u * u * (3 - 2 * u)));
+    }
+    for (const f of flash) {
+      const k = Math.max(0, 1 - (t - f.at) / 0.7);
+      if (f.base) f.mat.color.copy(f.base).lerp(f.hot, k);
+    }
+    renderer.render(scene, camera);
+    const w = box.clientWidth, h = box.clientHeight;
+    for (const l of labels) {
+      const p = l.at.clone().project(camera);
+      const x = ((p.x + 1) / 2) * w, y = ((1 - p.y) / 2) * h;
+      l.el.style.transform = l.center
+        ? `translate(${x.toFixed(1)}px, ${y.toFixed(1)}px) translate(-50%, -100%)`
+        : `translate(${(x + 10).toFixed(1)}px, ${y.toFixed(1)}px) translateY(-50%)`;
+    }
+  }
+
+  paint();
+  resize();
+  frame();
+  box.classList.add('is-3d');
+  new ResizeObserver(() => { resize(); frame(); }).observe(box);
+  const repaint = () => { paint(); frame(); };
+  matchMedia('(prefers-color-scheme: dark)').addEventListener('change', repaint);
+  new MutationObserver(repaint).observe(document.documentElement, { attributes: true, attributeFilter: ['data-theme'] });
+
+  if (!reduce) {
+    let visible = true;
+    new IntersectionObserver((e) => { visible = e[0].isIntersecting; }).observe(box);
+    renderer.setAnimationLoop(() => { if (visible) frame(); });
+  }
+}
+</script>
+</body>
+</html>
