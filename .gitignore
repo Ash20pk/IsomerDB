@@ -10,3 +10,5 @@ __pycache__/
 *.o
 *.so
 *.bc
+.vercel
+.env.local
