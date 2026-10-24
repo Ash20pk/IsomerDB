@@ -1,4 +1,4 @@
-# The website in site/, published to GitHub Pages whenever it changes on main.
+# The website in site/, published to GitHub Pages at isomerdb.com whenever it changes on main.
 name: Site
 
 on:
