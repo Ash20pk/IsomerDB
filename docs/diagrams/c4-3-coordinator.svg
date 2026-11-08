@@ -171,12 +171,8 @@
 <rect x="1096.2" y="971.0" width="57.5" height="36" rx="4" fill="#ffffff" opacity="0.94"/>
 <text x="1125.0" y="986.0" text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" fill="#1b2430">Pages</text>
 <text x="1125.0" y="1001.0" text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" fill="#5f6b78" font-style="italic">[HTTPS]</text>
-<rect x="1103.3" y="30" width="22" height="16" rx="4" fill="#eaf0fd" stroke="#2f5bd3" stroke-width="1.5"/>
-<text x="1133.3" y="42.5" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12.5" fill="#5f6b78">Built and tested</text>
-<rect x="1265.7" y="30" width="22" height="16" rx="4" fill="#fff4e0" stroke="#b26a00" stroke-width="1.5"/>
-<text x="1295.7" y="42.5" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12.5" fill="#5f6b78">Partly built</text>
-<rect x="1400.5" y="30" width="22" height="16" rx="4" fill="#ffffff" stroke="#8a96a3" stroke-width="1.5" stroke-dasharray="6 4"/>
-<text x="1430.5" y="42.5" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12.5" fill="#5f6b78">Planned</text>
+<rect x="1393.6" y="30" width="22" height="16" rx="4" fill="#eaf0fd" stroke="#2f5bd3" stroke-width="1.5"/>
+<text x="1423.6" y="42.5" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12.5" fill="#5f6b78">IsomerDB</text>
 <rect x="1500.8" y="30" width="22" height="16" rx="4" fill="#f1f3f5" stroke="#9aa4ae" stroke-width="1.5"/>
 <text x="1530.8" y="42.5" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12.5" fill="#5f6b78">External</text>
 </svg>
