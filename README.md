@@ -1,6 +1,6 @@
 # IsomerDB
 
-**One database. Write once, read in any projection.**
+**One database. Write once, read in any projection.** · [isomerdb.com](https://isomerdb.com)
 
 Products start on Postgres. As they grow, teams add MongoDB for nested documents, Elasticsearch for
 search, Redis for hot keys and a vector store for embeddings, and a sync pipeline for each. Every
@@ -21,10 +21,9 @@ What sets it apart is the combination:
 - **Self-tuning:** the database reads its own query log and proposes the projections and shard keys
   it should have.
 
-> **Status.** Phases 0 to 3 of the [PRD](docs/PRD.md) are built, and parts of the roadmap after
-> them: event, analytics and edge projections. The diagrams
-> below show the whole system as designed. Each part is marked **built** (implemented and covered by
-> acceptance tests), **partly built** or **planned**. [What's left](#whats-left) lists the gaps.
+IsomerDB is free to self-host, including commercially, under the [license](#license). The
+[quick start](#quick-start) runs it on one machine with Docker; [self-hosting](docs/self-hosting.md)
+covers running it on Kubernetes.
 
 ---
 
@@ -50,26 +49,26 @@ for billing, and pages on-call when a projection drifts or falls behind its lag 
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/diagrams/c4-2-containers-dark.svg">
-  <img alt="Containers: a MongoDB gateway, an HTTP API, the console and CLI, a coordinator and worker nodes (PostgreSQL 18, Citus, the isomer extension), an embedder, the Kubernetes operator, the cloud control plane and edge replicas are built." src="docs/diagrams/c4-2-containers.svg">
+  <img alt="Containers: a MongoDB gateway, an HTTP API, the console and CLI, a coordinator and worker nodes (PostgreSQL 18, Citus, the isomer extension), an embedder, the Kubernetes operator, the cloud control plane and edge replicas." src="docs/diagrams/c4-2-containers.svg">
 </picture>
 
-| Container | What it does | Status |
-|---|---|---|
-| **Coordinator** | PostgreSQL 18 with Citus and the `isomer` extension. Plans and routes SQL, holds the projection catalog, attaches to existing Postgres, maintains projections (by key, or incrementally from row deltas when they aggregate across shards, with a cost model choosing), issues write tokens, audits for drift, proposes projections, meters usage. | Built |
-| **Worker nodes** | Hold shards of tables and projections; capture changes (keys, or row deltas pulled exactly once) where each row is written. | Built |
-| **MongoDB gateway** | MongoDB wire protocol. Projections read as collections; causal reads wait for the writes they depend on. | Built |
-| **HTTP API** | Documents by key, time travel, change feeds and live streams (SSE); the admin and usage endpoints. | Built |
-| **Console and CLI** | Lag against budget, drift, alerts, proposals, routes, usage. | Built |
-| **Embedder** | Computes embeddings for vector projections, from a hosted API or bge-small on its own CPU. | Built |
-| **Kubernetes operator** | Provisions and scales clusters, fails over to standbys, backs up and restores to a point in time, rolls upgrades, issues node certificates. | Built |
-| **Cloud control plane** | Managed IsomerDB: a sign-up page, regions, plans, provisioning through the operator, usage collected from each cluster and priced on invoices. | Built |
-| **Edge replicas** | Projections served from memory close to users, over HTTP and MongoDB, fed by the change feed and kept on disk across restarts; access and read-your-writes as at the origin. | Built |
+| Container | What it does |
+|---|---|
+| **Coordinator** | PostgreSQL 18 with Citus and the `isomer` extension. Plans and routes SQL, holds the projection catalog, attaches to existing Postgres, maintains projections (by key, or incrementally from row deltas when they aggregate across shards, with a cost model choosing), issues write tokens, audits for drift, proposes projections, meters usage. |
+| **Worker nodes** | Hold shards of tables and projections; capture changes (keys, or row deltas pulled exactly once) where each row is written. |
+| **MongoDB gateway** | MongoDB wire protocol. Projections read as collections; causal reads wait for the writes they depend on. |
+| **HTTP API** | Documents by key, time travel, change feeds and live streams (SSE); the admin and usage endpoints. |
+| **Console and CLI** | Lag against budget, drift, alerts, proposals, routes, usage. |
+| **Embedder** | Computes embeddings for vector projections, from a hosted API or bge-small on its own CPU. |
+| **Kubernetes operator** | Provisions and scales clusters, fails over to standbys, backs up and restores to a point in time, rolls upgrades, issues node certificates. |
+| **Cloud control plane** | For running IsomerDB as a hosted service: sign-up, regions, plans, provisioning through the operator, usage collected from each cluster and priced on invoices. |
+| **Edge replicas** | Projections served from memory close to users, over HTTP and MongoDB, fed by the change feed and kept on disk across restarts; access and read-your-writes as at the origin. |
 
 ### Level 3: inside the coordinator
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/diagrams/c4-3-coordinator-dark.svg">
-  <img alt="Components of the coordinator: attach, cutover, catalog and compiler, change capture, maintenance, query router, freshness, history and change feed, auditor, certificates, proposer and shard advisor, metering and admin, alert delivery, the cutover planner, the incremental engine and the strategy chooser are built." src="docs/diagrams/c4-3-coordinator.svg">
+  <img alt="Components of the coordinator: attach, cutover, catalog and compiler, change capture, maintenance, query router, freshness, history and change feed, auditor, certificates, proposer and shard advisor, metering and admin, alert delivery, the cutover planner, the incremental engine and the strategy chooser." src="docs/diagrams/c4-3-coordinator.svg">
 </picture>
 
 Writes flow down the middle. **Change capture** queues the keys each write touches, on whichever node
@@ -347,7 +346,7 @@ SELECT * FROM isomer.alert_deliveries ORDER BY id DESC LIMIT 20;   -- what was s
 | [`controlplane/`](controlplane/) | The cloud control plane: accounts, regions, plans, clusters, usage, invoices (Go) |
 | [`docker/`](docker/) | The database image and its node scripts |
 | [`tests/`](tests/), [`scripts/`](scripts/), [`jepsen/`](jepsen/) | Acceptance tests, the runner, and Jepsen |
-| [`docs/`](docs/) | The [PRD](docs/PRD.md), [engineering notes](docs/engineering-notes.md), research, and these diagrams |
+| [`docs/`](docs/) | [Self-hosting](docs/self-hosting.md), [engineering notes](docs/engineering-notes.md), [Jepsen reports](docs/jepsen/) and these diagrams |
 
 ## Tests
 
@@ -362,20 +361,7 @@ SELECT * FROM isomer.alert_deliveries ORDER BY id DESC LIMIT 20;   -- what was s
 
 The Jepsen workloads check isolation across shards (Elle), read-your-writes through projections over
 SQL and MongoDB, and incrementally maintained projections, with faults on the workers, on the
-coordinator, and on every node's clock. They have found and fixed three bugs so far; see the
-[engineering notes](docs/engineering-notes.md) and each release's report in [`docs/jepsen/`](docs/jepsen/).
-
-## What's left
-
-| Area | Not built yet | PRD |
-|---|---|---|
-| Adoption | Attach and cutover run against each real managed provider in CI: the provider check and a run as a non-superuser role are done, real providers need their accounts | FR-A11 |
-| Product | Trademark clearance, ParadeDB HA licensing, design partners | PRD §15 |
-
-IsomerDB is self-hosted for now: free to run, including commercially, under the license below.
-The [cloud control plane](controlplane/) is built (sign-up, plans, provisioning, usage, invoices),
-but a managed IsomerDB is on hold until there is demand for one, so charging cards and running
-regions in other clouds are left until then (FR-CL1, CL2).
+coordinator, and on every node's clock. Each release's report is in [`docs/jepsen/`](docs/jepsen/).
 
 ## License
 

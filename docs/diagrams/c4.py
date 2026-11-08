@@ -265,12 +265,14 @@ class Diagram:
         return "\n".join(parts)
 
     def _legend(self, t: dict) -> str:
-        items = [
-            ("Built and tested", t["accent_fill"], t["accent"], ""),
-            ("Partly built", t["partial_fill"], t["partial"], ""),
-            ("Planned", t["planned_fill"], t["planned_line"], ' stroke-dasharray="6 4"'),
-            ("External", t["ext_fill"], t["ext_line"], ""),
-        ]
+        # Partly built and planned are shown only when a diagram has such a part.
+        used = {el.status for el in self.elements.values()} | {r.status for r in self.rels}
+        items = [("IsomerDB", t["accent_fill"], t["accent"], "")]
+        if "partial" in used:
+            items.append(("Partly built", t["partial_fill"], t["partial"], ""))
+        if "planned" in used:
+            items.append(("Planned", t["planned_fill"], t["planned_line"], ' stroke-dasharray="6 4"'))
+        items.append(("External", t["ext_fill"], t["ext_line"], ""))
         widths = [30 + len(label) * 6.9 + 22 for label, *_ in items]
         x, y = self.width - 32 - sum(widths), 30
         parts = []
